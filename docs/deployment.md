@@ -8,6 +8,10 @@ The authoritative runbook is
 `../ventuno-collision-avoidance/.claude/skills/ventuno-setup/references/executorch-qnn.md`.
 This document covers only what is specific to this project.
 
+For the *other* end of the pipeline — the NVIDIA host that trains the policy this
+document deploys — see [`training_host_setup.md`](training_host_setup.md). The two
+halves meet at the spec fingerprint and nowhere else.
+
 ---
 
 ## Inherited facts
@@ -114,6 +118,10 @@ The explicit flow does `torch.export` → `prepare_pt2e` → calibrate →
 
 **No robot run happens before this passes.** Budget half a day; the reference
 projects lost considerably more to skipping the equivalent.
+
+Step 1 needs neither the board nor ExecuTorch — it compiles the preprocessing
+translation unit with plain `g++` and is also run by `tests/test_cpp_parity.py`.
+Run it on the training host before copying anything.
 
 ```bash
 # 1. Preprocessing: Python vs C++, on adversarial raw sensor data

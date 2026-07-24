@@ -50,6 +50,35 @@ Randomization ranges are deliberately excluded from the hash: they describe how
 a policy was trained, not how its inputs are constructed at runtime, and the
 evaluation harness legitimately varies them.
 
+### What the fingerprint does not catch
+
+The fingerprint proves two components agree on *what the contract says*. It
+cannot prove they implement it the same way. That gap has produced two bugs so
+far, both the same shape:
+
+In lidar-only mode the depth channel is still fed to the network — the exported
+graph's signature must not change between configurations — filled with
+`DepthSpec.invalid_fill = 1.0`, meaning "no return". Two components filled it with
+`0.0` instead. Zero is not a neutral value: it denormalizes to `min_m`, an
+obstacle 0.3 m dead ahead filling the entire frame. The offenders were
+`Demonstrations.dequantized` (BC trained on one constant and rolled out on
+another: validation loss fell fourfold at a 0% success rate) and
+`isaaclab_env/nav_task.py::_get_observations`.
+
+The structural problem is that this constant must agree across **four**
+implementations — the numpy reference env, the Isaac Lab adapter, ManiSkill, and
+the C++ node — and only two of the four are covered by an automated check
+(`tests/test_cpp_parity.py` for C++, `test_lidar_only_placeholder_matches_the_env`
+for storage). The Isaac adapter reimplements the spec's normalization in torch,
+because its data is a GPU batch while `sim2edge/preprocess.py` is numpy, and
+nothing yet verifies the two agree.
+
+The generalizable lesson is narrower than "share constants" — the constant *was*
+shared, and read from the spec, in three of four places. It is: **a placeholder
+for absent data must be the same value the live path produces for absent data**,
+and the way to enforce that is a test that reads both rather than asserting a
+literal.
+
 ---
 
 ## 2. Why the preprocessing algorithms are what they are

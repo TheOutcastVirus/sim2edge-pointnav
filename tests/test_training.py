@@ -45,6 +45,30 @@ def tiny_demos():
     return demos
 
 
+def test_lidar_only_placeholder_matches_the_env(tiny_demos):
+    """The depth channel BC trains on must equal the one it is evaluated on.
+
+    In lidar-only mode the env still emits a depth tensor, filled with
+    ``invalid_fill`` ("no return"). Storage elides it and synthesizes it back on
+    demand. If the two constants disagree the depth encoder's BatchNorm sees one
+    distribution during training and another at rollout, the trunk it feeds is
+    miscalibrated, and the symptom is a policy with a beautiful validation loss
+    and a 0% success rate — which is exactly what happened.
+    """
+    from sim2edge.envs.reference_env import NavEnv
+
+    assert not tiny_demos.has_depth, "fixture should be lidar-only"
+
+    env_depth = NavEnv(CFG, seed=0).reset(seed=0)["depth"]
+    stored_depth = tiny_demos.dequantized(np.arange(4))["depth"]
+
+    assert env_depth.shape == stored_depth.shape[1:]
+    assert np.array_equal(stored_depth,
+                          np.broadcast_to(env_depth, stored_depth.shape)), \
+        f"env emits {np.unique(env_depth)}, storage synthesizes " \
+        f"{np.unique(stored_depth)}"
+
+
 def test_bc_reduces_loss_and_moves_only_the_actor(tiny_demos):
     torch.manual_seed(0)
     policy = build_policy(S)

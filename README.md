@@ -12,6 +12,17 @@ Lite depth camera, and wheel odometry.
 See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the full design
 rationale and the two-week schedule.
 
+**Setting this up?** The pipeline splits across two machines and neither needs the
+other present:
+
+| | Guide |
+|---|---|
+| NVIDIA GPU host — trains the policy that ships | [`docs/training_host_setup.md`](docs/training_host_setup.md) |
+| Ventuno Q board + robot — runs it | [`docs/deployment.md`](docs/deployment.md) |
+
+Everything except `isaaclab_env/` runs on a CPU-only laptop, including the tests,
+the oracle, BC, and the parity gate.
+
 ---
 
 ## The one thing to understand first
@@ -72,7 +83,7 @@ maniskill_env/              secondary env (ManiSkill/ROCm) — interop story
 tools/                      export, calibration, parity, benchmarking
 ros_ws/src/nav_policy_node/ C++ inference node (ExecuTorch, QNN + XNNPACK)
 ros_ws/src/nav_safety/      classical safety layer — owns /cmd_vel
-tests/                      pytest suite (66 tests, no GPU or ROS required)
+tests/                      pytest suite (75 tests, no GPU or ROS required)
 ```
 
 ### Three simulators, one task
@@ -82,9 +93,15 @@ so they are three renderings of one task rather than three similar tasks.
 
 | Environment | Role | Requirements |
 |---|---|---|
-| `sim2edge/envs/reference_env.py` | Portable reference; runs the whole pipeline in CI | numpy only |
-| `isaaclab_env/` | **Primary** — trains the deployed policy, 2–4k parallel envs | Isaac Lab, CUDA |
-| `maniskill_env/` | Secondary — AMD/ROCm iteration, interop claim | ManiSkill |
+| `sim2edge/envs/reference_env.py` | Portable reference; runs the whole pipeline in CI | numpy only — **working** |
+| `isaaclab_env/` | **Primary** — trains the deployed policy, 2–4k parallel envs | Isaac Lab, RTX — **draft, never run** |
+| `maniskill_env/` | Secondary — AMD/ROCm iteration, interop claim | ManiSkill — **not yet run** |
+
+The reference env is *not* a substitute for Isaac Lab: it is kinematic (unicycle
+model with motor lag, no rigid bodies or contacts) and will not close the
+sim-to-real gap on its own. Its job is making the pipeline — oracle, BC, PPO,
+eval, export, parity — runnable and testable without a 40 GB install, so that a
+bug in shared code is found on a laptop rather than at 2048 environments.
 
 ---
 
@@ -182,7 +199,12 @@ trust region. BatchNorm statistics are frozen before RL starts.
 **Demonstrations are stored quantized** (depth `uint8`, lidar `uint16`). A 10k-
 episode float32 dataset would be ~200 GB. The precision loss is smaller than the
 depth sensor's own noise, and smaller than what INT8 inference does to the same
-tensor anyway.
+tensor anyway. In lidar-only mode the depth channel is elided entirely and
+synthesized on read as `invalid_fill` — the *same* constant the env and the C++
+node emit. Getting that constant wrong (zero, i.e. "0.3 m dead ahead") cost a
+full training run: validation loss fell fourfold while the success rate stayed at
+zero, because BC trained on one constant and rolled out on another.
+`test_lidar_only_placeholder_matches_the_env` now pins the two together.
 
 ---
 
@@ -197,7 +219,7 @@ tensor anyway.
 | BC + DAgger, PPO | Implemented; BC verified end to end on the reference env |
 | Export / calibration / parity / benchmark tooling | Complete — **untested against real QNN hardware** |
 | ROS 2 node + safety layer | Complete — **compiles only the parity path here; not yet built against ExecuTorch or run on the board** |
-| Isaac Lab adapter | Written against the shared spec — **requires validation on the training host** |
+| Isaac Lab adapter | Written against the shared spec — **never executed.** Four known defects, incl. a raycaster that sees no obstacles and an unimplemented rsl_rl policy registration. See [`docs/training_host_setup.md` §4](docs/training_host_setup.md) |
 | ManiSkill adapter | Written against the shared spec — **not yet run** |
 
 Anything marked in bold needs hardware or a simulator install that this

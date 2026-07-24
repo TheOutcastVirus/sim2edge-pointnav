@@ -286,15 +286,20 @@ def test_quantized_storage_round_trips_within_tolerance():
     assert batch["depth"].shape[1:] == S.obs.depth.shape
 
 
-def test_lidar_only_datasets_do_not_materialize_zero_depth():
+def test_lidar_only_datasets_do_not_materialize_constant_depth():
     """A 10k-episode lidar-only dataset would otherwise spend ~70 GB of RAM
-    storing zeros."""
+    storing one repeated constant.
+
+    The synthesized constant is ``invalid_fill``, matching what the env emits;
+    ``test_lidar_only_placeholder_matches_the_env`` in ``test_training.py`` is
+    the end that pins the two together.
+    """
     demos, _ = collect_episodes(2, _lidar_only(), S, seed_base=0)
     assert not demos.has_depth
     assert demos.depth.nbytes == 0
     batch = demos.dequantized(np.arange(4))
     assert batch["depth"].shape == (4,) + S.obs.depth.shape
-    assert np.all(batch["depth"] == 0.0)
+    assert np.all(batch["depth"] == S.obs.depth.invalid_fill)
 
 
 def test_concat_refuses_to_mix_incompatible_datasets():

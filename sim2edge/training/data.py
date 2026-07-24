@@ -53,15 +53,22 @@ def _dq16(x: np.ndarray) -> np.ndarray:
 class Demonstrations:
     """A flat, quantized set of (observation, expert action) pairs.
 
-    ``depth`` may be stored with a leading dimension of 0, which means "constant
-    zeros" — the lidar-only configuration. That configuration still feeds a
+    ``depth`` may be stored with a leading dimension of 0, which means "no depth
+    sensor" — the lidar-only configuration. That configuration still feeds a
     depth tensor to the network (the exported graph's signature must never
-    change between configurations), but materializing 15 KB of zeros per sample
-    would cost ~70 GB of RAM for a 10k-episode dataset to store no information
-    at all. :meth:`dequantized` synthesizes the zeros on demand instead.
+    change between configurations), but materializing 15 KB of a constant per
+    sample would cost ~70 GB of RAM for a 10k-episode dataset to store no
+    information at all. :meth:`dequantized` synthesizes the constant on demand.
+
+    The constant is ``DepthSpec.invalid_fill``, i.e. exactly what
+    :class:`~sim2edge.envs.reference_env.NavEnv` and the C++ node produce when
+    there is no depth return — *not* zero. Zero means "0.3 m away, dead ahead",
+    which is the opposite. Training on one constant and evaluating on another
+    silently miscalibrates the depth encoder's BatchNorm and the trunk that
+    consumes it; see ``test_lidar_only_placeholder_matches_the_env``.
     """
 
-    depth: np.ndarray        # (N, 1, H, W) uint8, or (0, 1, H, W) for "zeros"
+    depth: np.ndarray        # (N, 1, H, W) uint8, or (0, 1, H, W) for "no depth"
     lidar: np.ndarray        # (N, bins)    uint16
     goal: np.ndarray         # (N, 3)       float32
     last_action: np.ndarray  # (N, 2)       float32
@@ -115,7 +122,12 @@ class Demonstrations:
             depth = _dq8(self.depth[idx])
         else:
             n = len(idx) if hasattr(idx, "__len__") else 1
-            depth = np.zeros((n,) + self.depth.shape[1:], dtype=np.float32)
+            # invalid_fill, not zero: this must equal what the env and the C++
+            # node emit with no depth sensor, or BC trains on one constant and
+            # runs on another.
+            depth = np.full((n,) + self.depth.shape[1:],
+                            DEFAULT_SPEC.obs.depth.invalid_fill,
+                            dtype=np.float32)
         return {
             "depth": depth,
             "lidar": _dq16(self.lidar[idx]),

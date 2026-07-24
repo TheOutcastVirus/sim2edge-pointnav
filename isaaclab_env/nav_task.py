@@ -290,7 +290,13 @@ class Sim2EdgeNavEnv(DirectRLEnv):
             depth = torch.where(valid, depth,
                                 torch.full_like(depth, d.invalid_fill))
         else:
-            depth = torch.zeros((n, 1, d.height, d.width), device=self.device)
+            # invalid_fill ("no return"), never zero. Zero normalizes back to
+            # min_m -- an obstacle 0.3 m dead ahead, filling the frame. The
+            # graph signature must not change between configurations, but the
+            # constant fed into it must match what NavEnv, ManiSkill, and the
+            # C++ node emit with no depth sensor.
+            depth = torch.full((n, 1, d.height, d.width), d.invalid_fill,
+                               device=self.device)
 
         # ── Goal, in the robot frame ─────────────────────────────────────────
         pos = self.robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
