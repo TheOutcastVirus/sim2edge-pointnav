@@ -72,7 +72,7 @@ maniskill_env/              secondary env (ManiSkill/ROCm) — interop story
 tools/                      export, calibration, parity, benchmarking
 ros_ws/src/nav_policy_node/ C++ inference node (ExecuTorch, QNN + XNNPACK)
 ros_ws/src/nav_safety/      classical safety layer — owns /cmd_vel
-tests/                      pytest suite (64 tests, no GPU or ROS required)
+tests/                      pytest suite (66 tests, no GPU or ROS required)
 ```
 
 ### Three simulators, one task

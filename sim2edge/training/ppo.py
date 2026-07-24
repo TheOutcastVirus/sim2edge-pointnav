@@ -307,12 +307,12 @@ class PPOTrainer:
                     kl = float((old_log_probs[idx] - log_prob).mean())
                     clip_frac = float(((ratio - 1.0).abs()
                                        > cfg.clip_range).float().mean())
-                stats["policy_loss"] += float(policy_loss)
-                stats["value_loss"] += float(value_loss)
-                stats["entropy"] += float(entropy.mean())
-                stats["kl"] += kl
-                stats["anchor_loss"] += float(anchor_loss)
-                stats["clip_frac"] += clip_frac
+                    stats["policy_loss"] += float(policy_loss.detach())
+                    stats["value_loss"] += float(value_loss.detach())
+                    stats["entropy"] += float(entropy.mean().detach())
+                    stats["kl"] += kl
+                    stats["anchor_loss"] += float(anchor_loss.detach())
+                    stats["clip_frac"] += clip_frac
                 count += 1
 
                 if cfg.max_kl is not None and kl > cfg.max_kl and not warming_up:

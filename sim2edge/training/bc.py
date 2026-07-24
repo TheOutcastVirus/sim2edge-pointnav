@@ -177,7 +177,7 @@ def run_bc_pipeline(
 
     all_demos = demos
     for round_idx, (n_eps, beta) in enumerate(
-            zip(cfg.dagger_rounds + [], cfg.dagger_beta + [])):
+            zip(cfg.dagger_rounds, cfg.dagger_beta)):
         print(f"[BC] training on {len(all_demos)} samples "
               f"(round {round_idx})")
         history = train_bc(policy, all_demos, cfg, spec)
