@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Artifacts
+runs/
+models/*.pte
+models/*.json
+calib/
+datasets/
+*.npz
+*.pth
+*.pt
+
+# ROS 2 / colcon
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/

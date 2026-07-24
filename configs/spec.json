@@ -1,0 +1,167 @@
+{
+  "action": {
+    "accel_max": 0.6,
+    "alpha_max": 3.0,
+    "control_rate_hz": 20.0,
+    "omega_max": 1.5,
+    "v_max": 0.3,
+    "v_min": 0.0
+  },
+  "obs": {
+    "actor_inputs": [
+      "depth",
+      "lidar",
+      "goal",
+      "last_action"
+    ],
+    "depth": {
+      "height": 96,
+      "invalid_fill": 1.0,
+      "max_m": 6.0,
+      "min_m": 0.3,
+      "raw_scale_to_m": 0.001,
+      "width": 160
+    },
+    "goal": {
+      "max_distance_m": 8.0
+    },
+    "last_action": {},
+    "lidar": {
+      "angle_max": 3.141592653589793,
+      "angle_min": -3.141592653589793,
+      "bins": 180,
+      "invalid_fill": 1.0,
+      "max_m": 8.0,
+      "min_m": 0.15
+    },
+    "privileged": {
+      "dim": 8,
+      "max_geodesic_m": 20.0,
+      "max_obstacle_m": 5.0
+    }
+  },
+  "randomization": {
+    "action_delay_steps": [
+      1,
+      3
+    ],
+    "depth_height_noise_m": [
+      -0.015,
+      0.015
+    ],
+    "depth_hole_fraction": [
+      0.0,
+      0.12
+    ],
+    "depth_noise_coeff": [
+      0.0,
+      0.01
+    ],
+    "depth_pitch_noise_rad": [
+      -0.035,
+      0.035
+    ],
+    "depth_scale_jitter": [
+      0.97,
+      1.03
+    ],
+    "depth_speckle_fraction": [
+      0.0,
+      0.02
+    ],
+    "enabled": true,
+    "friction": [
+      0.6,
+      1.2
+    ],
+    "lidar_angular_offset_rad": [
+      -0.0175,
+      0.0175
+    ],
+    "lidar_dropout": [
+      0.0,
+      0.05
+    ],
+    "lidar_range_noise_m": [
+      0.0,
+      0.03
+    ],
+    "mass_scale": [
+      0.8,
+      1.2
+    ],
+    "motor_tau_s": [
+      0.05,
+      0.15
+    ],
+    "odom_drift_rate": [
+      0.0,
+      0.02
+    ],
+    "odom_noise_m": [
+      0.0,
+      0.02
+    ],
+    "odom_yaw_drift_rate": [
+      0.0,
+      0.02
+    ],
+    "scale": 1.0,
+    "velocity_tracking_gain": [
+      0.9,
+      1.1
+    ],
+    "wheel_slip": [
+      0.0,
+      0.05
+    ]
+  },
+  "reward": {
+    "collision_penalty": 10.0,
+    "goal_bonus": 10.0,
+    "goal_radius_m": 0.35,
+    "max_episode_steps": 1200,
+    "progress": 3.0,
+    "smoothness": 0.05,
+    "time_penalty": 0.005
+  },
+  "robot": {
+    "camera_height_m": 0.19,
+    "camera_hfov_rad": 1.204,
+    "camera_pitch_rad": 0.0,
+    "camera_vfov_rad": 0.767,
+    "height_m": 0.31,
+    "lidar_height_m": 0.175,
+    "radius_m": 0.175,
+    "wheel_base_m": 0.235
+  },
+  "room": {
+    "arena_max_m": 10.0,
+    "arena_min_m": 4.0,
+    "goal_distance_m": [
+      2.0,
+      8.0
+    ],
+    "grid_resolution_m": 0.05,
+    "n_obstacles": [
+      5,
+      20
+    ],
+    "obstacle_size_m": [
+      0.15,
+      1.2
+    ],
+    "planning_margin_m": 0.06,
+    "spawn_clearance_m": 0.15
+  },
+  "safety": {
+    "depth_max_age_s": 0.2,
+    "forward_sector_rad": 0.61,
+    "lidar_max_age_s": 0.15,
+    "odom_max_age_s": 0.2,
+    "policy_timeout_s": 0.5,
+    "slow_distance_m": 0.6,
+    "stop_distance_m": 0.3
+  },
+  "version": "1.0.0"
+}

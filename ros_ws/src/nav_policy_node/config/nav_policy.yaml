@@ -1,0 +1,45 @@
+# Runtime configuration for the navigation policy node.
+#
+# Preprocessing constants are NOT here on purpose. They live in sim2edge/spec.py
+# and are compiled in via spec_generated.hpp, so they cannot be changed at
+# runtime to something the model was not quantized for. Only deployment
+# plumbing is configurable.
+/**:
+  ros__parameters:
+    # 'npu' = QNN/HTP, 'cpu' = XNNPACK fallback.
+    backend: npu
+    model_path: ""          # default depends on backend
+    qnn_lib_dir: ""         # empty = rely on LD_LIBRARY_PATH
+
+    # Verify the .pte sidecar's spec fingerprint against the compiled-in one.
+    # Leave this true. A mismatch is silent garbage, not an error.
+    strict_fingerprint: true
+
+    # Topics. CHECK THESE ON DAY 1 with `ros2 topic list`: the two reference
+    # projects saw different Create3 namespaces, one of them needing
+    # create3_republisher. "Everything looks healthy but the robot doesn't move"
+    # is the symptom of getting this wrong.
+    scan_topic: /scan
+    depth_topic: /oak/stereo/image_raw
+    odom_topic: /odom
+    goal_topic: ~/goal
+    cmd_topic: ~/cmd_raw
+    debug_topic: ~/debug
+
+    # Goal as (x, y) metres relative to the robot's pose at startup.
+    # Keep within ~8 m: Create3 odometry drifts 1-2%/m and there is no SLAM
+    # correction in this system.
+    goal_x: 3.0
+    goal_y: 0.0
+    goal_is_relative: true
+
+    # Staleness limits. Exceeding one means "sensor loss", not "use it anyway".
+    lidar_max_age: 0.15
+    depth_max_age: 0.20
+    odom_max_age: 0.20
+
+    # false => degrade to lidar-only when depth goes stale instead of stopping.
+    # Only safe if the policy was trained with an uninformative depth channel.
+    require_depth: true
+
+    control_rate: 20.0
