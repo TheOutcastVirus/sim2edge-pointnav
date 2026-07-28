@@ -344,8 +344,8 @@ would have surfaced on an NVIDIA host as "PPO won't learn":
    `torch.zeros` in lidar-only mode. Fixed, but *not* covered by a test, because
    testing it needs Isaac Lab — which is the argument for §4.5.
 
-The pattern: a constant that must agree across four implementations (numpy env,
-Isaac, ManiSkill, C++ node) and disagreed in two of them. When you touch
+The pattern: a constant that must agree across three implementations (numpy env,
+Isaac, C++ node) and disagreed in two of them. When you touch
 `_get_observations`, assume this class of bug is present until a test says
 otherwise.
 
@@ -359,5 +359,4 @@ otherwise.
 | Oracle, BC, DAgger, reference-env PPO, eval | `.venv` | no |
 | `smoke_export.py` stages 1/2/5, `calib_dataset.py` | `.venv` | no |
 | Isaac Lab task, rsl_rl PPO at scale | `~/isaac-venv` | **yes, RTX** |
-| ManiSkill adapter | separate ROCm/CUDA env | yes |
 | ExecuTorch lowering, QNN export, robot | the board | no (NPU) |

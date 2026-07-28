@@ -68,7 +68,7 @@ Three mechanisms enforce it, and none of them rely on anyone remembering:
 sim2edge/                   platform-agnostic core (numpy + torch only)
 ├── spec.py                 obs/action/reward/randomization contract — stdlib only
 ├── preprocess.py           Python reference preprocessing
-├── rooms.py                procedural layout generator (shared by all 3 sims)
+├── rooms.py                procedural layout generator (shared by both envs)
 ├── sensors.py              raycast lidar + 2.5D depth renderer
 ├── randomization.py        per-episode domain randomization
 ├── safety.py               classical safety layer (Python twin of nav_safety)
@@ -78,24 +78,22 @@ sim2edge/                   platform-agnostic core (numpy + torch only)
 ├── training/               BC + DAgger, PPO with the BC handoff
 └── eval/                   evaluation harness and policy adapters
 
-isaaclab_env/               PRIMARY training env (Isaac Lab, RTX 4090)
-maniskill_env/              secondary env (ManiSkill/ROCm) — interop story
+isaaclab_env/               training env (Isaac Lab, RTX 4090)
 tools/                      export, calibration, parity, benchmarking
 ros_ws/src/nav_policy_node/ C++ inference node (ExecuTorch, QNN + XNNPACK)
 ros_ws/src/nav_safety/      classical safety layer — owns /cmd_vel
 tests/                      pytest suite (75 tests, no GPU or ROS required)
 ```
 
-### Three simulators, one task
+### Two environments, one task
 
-`sim2edge/spec.py` and `sim2edge/rooms.py` are shared by all three environments,
-so they are three renderings of one task rather than three similar tasks.
+`sim2edge/spec.py` and `sim2edge/rooms.py` are shared by both environments, so
+they are two renderings of one task rather than two similar tasks.
 
 | Environment | Role | Requirements |
 |---|---|---|
 | `sim2edge/envs/reference_env.py` | Portable reference; runs the whole pipeline in CI | numpy only — **working** |
-| `isaaclab_env/` | **Primary** — trains the deployed policy, 2–4k parallel envs | Isaac Lab, RTX — **draft, never run** |
-| `maniskill_env/` | Secondary — AMD/ROCm iteration, interop claim | ManiSkill — **not yet run** |
+| `isaaclab_env/` | Trains the deployed policy, 2–4k parallel envs | Isaac Lab, RTX — **draft, never run** |
 
 The reference env is *not* a substitute for Isaac Lab: it is kinematic (unicycle
 model with motor lag, no rigid bodies or contacts) and will not close the
@@ -220,7 +218,6 @@ zero, because BC trained on one constant and rolled out on another.
 | Export / calibration / parity / benchmark tooling | Complete — **untested against real QNN hardware** |
 | ROS 2 node + safety layer | Complete — **compiles only the parity path here; not yet built against ExecuTorch or run on the board** |
 | Isaac Lab adapter | Written against the shared spec — **never executed.** Four known defects, incl. a raycaster that sees no obstacles and an unimplemented rsl_rl policy registration. See [`docs/training_host_setup.md` §4](docs/training_host_setup.md) |
-| ManiSkill adapter | Written against the shared spec — **not yet run** |
 
 Anything marked in bold needs hardware or a simulator install that this
 development machine does not have.

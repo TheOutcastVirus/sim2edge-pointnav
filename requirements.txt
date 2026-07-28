@@ -13,5 +13,4 @@ pytest>=7.4
 #   executorch     — build from source on the Ventuno; see docs/deployment.md.
 #                    Pin the exact commit: the board bring-up patches
 #                    /opt/executorch in two places and both break on upgrade.
-#   isaaclab       — primary training env, installed via Isaac Sim.
-#   mani_skill     — secondary env, AMD/ROCm host.
+#   isaaclab       — the training env, installed via Isaac Sim.

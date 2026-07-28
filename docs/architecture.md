@@ -9,9 +9,9 @@ code; the why is what gets lost.
 
 `sim2edge/spec.py` holds every constant that has to be agreed on by simulation,
 quantization calibration, and the robot. It is stdlib-only — no numpy, no torch,
-no simulator — because it must be importable from four very different
-environments: the Isaac Lab CUDA stack, a ROCm host, the board's minimal
-ExecuTorch export venv, and a code generator.
+no simulator — because it must be importable from three very different
+environments: the Isaac Lab CUDA stack, the board's minimal ExecuTorch export
+venv, and a code generator.
 
 Everything else is an implementation of that contract:
 
@@ -65,19 +65,19 @@ obstacle 0.3 m dead ahead filling the entire frame. The offenders were
 another: validation loss fell fourfold at a 0% success rate) and
 `isaaclab_env/nav_task.py::_get_observations`.
 
-The structural problem is that this constant must agree across **four**
-implementations — the numpy reference env, the Isaac Lab adapter, ManiSkill, and
-the C++ node — and only two of the four are covered by an automated check
+The structural problem is that this constant must agree across **three**
+implementations — the numpy reference env, the Isaac Lab adapter, and the C++
+node — and only two of the three are covered by an automated check
 (`tests/test_cpp_parity.py` for C++, `test_lidar_only_placeholder_matches_the_env`
 for storage). The Isaac adapter reimplements the spec's normalization in torch,
 because its data is a GPU batch while `sim2edge/preprocess.py` is numpy, and
 nothing yet verifies the two agree.
 
 The generalizable lesson is narrower than "share constants" — the constant *was*
-shared, and read from the spec, in three of four places. It is: **a placeholder
-for absent data must be the same value the live path produces for absent data**,
-and the way to enforce that is a test that reads both rather than asserting a
-literal.
+shared, and read from the spec, nearly everywhere it appeared. It is: **a
+placeholder for absent data must be the same value the live path produces for
+absent data**, and the way to enforce that is a test that reads both rather than
+asserting a literal.
 
 ---
 

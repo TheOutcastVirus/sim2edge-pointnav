@@ -1,16 +1,15 @@
 """Isaac Lab task: goal-conditioned navigation on a TB4 Lite / Create3.
 
-This is the **primary training environment** for the deployed policy. It runs on
-the 4090 with 2-4k parallel environments for the lidar-only configuration, and
-a few hundred with tiled-rendered depth.
+This is the **training environment** for the deployed policy. It runs on the
+4090 with 2-4k parallel environments for the lidar-only configuration, and a few
+hundred with tiled-rendered depth.
 
-The adapter contract (§4 of the implementation plan) is what keeps this honest:
-this file may import Isaac Lab freely, but it owns **no task definition**. Every
+This file may import Isaac Lab freely, but it owns **no task definition**. Every
 observation shape, normalization constant, action limit, reward coefficient and
 randomization range is read from ``sim2edge.spec``, and the layouts come from
-``sim2edge.rooms``, which is pure numpy and shared with the reference env and
-ManiSkill. A change to the task is a change to the spec, and it lands in all
-three simulators plus the C++ node at once.
+``sim2edge.rooms``, which is pure numpy and shared with the reference env. A
+change to the task is a change to the spec, and it lands in both environments
+plus the C++ node at once.
 
 Requires Isaac Lab; import fails cleanly elsewhere, so the rest of the repo
 (tests, export, ROS) never depends on a 40 GB install being present.
@@ -190,8 +189,8 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         """Instantiate one procedurally generated room per environment.
 
         Obstacles come from ``sim2edge.rooms.sample_room``, the same generator
-        the reference env and ManiSkill use, so the three simulators train on
-        the same layout distribution rather than three similar-looking ones.
+        the reference env uses, so both environments train on the same layout
+        distribution rather than two similar-looking ones.
         """
         rng = np.random.default_rng(self.cfg.seed if hasattr(self.cfg, "seed")
                                     else 0)
@@ -293,8 +292,8 @@ class Sim2EdgeNavEnv(DirectRLEnv):
             # invalid_fill ("no return"), never zero. Zero normalizes back to
             # min_m -- an obstacle 0.3 m dead ahead, filling the frame. The
             # graph signature must not change between configurations, but the
-            # constant fed into it must match what NavEnv, ManiSkill, and the
-            # C++ node emit with no depth sensor.
+            # constant fed into it must match what NavEnv and the C++ node emit
+            # with no depth sensor.
             depth = torch.full((n, 1, d.height, d.width), d.invalid_fill,
                                device=self.device)
 

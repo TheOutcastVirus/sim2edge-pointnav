@@ -9,7 +9,6 @@ randomization ranges.
 imports. It has to be importable from:
 
 * the Isaac Lab training environment (heavy CUDA stack),
-* the ManiSkill environment (ROCm stack),
 * the board's ExecuTorch export venv (pinned torch, no torchvision, minimal deps),
 * ``tools/gen_spec_header.py``, which emits the C++ header the ROS node compiles
   against.

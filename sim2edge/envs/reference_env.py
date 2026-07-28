@@ -1,19 +1,19 @@
 """Reference navigation environment — pure numpy, no simulator dependency.
 
-This is the third adapter of the spec, alongside Isaac Lab and ManiSkill, and it
-exists for reasons the other two cannot serve:
+This is the second implementation of the spec, alongside Isaac Lab, and it
+exists for reasons Isaac Lab cannot serve:
 
 * it runs anywhere (CI, a laptop, the board) with no GPU and no simulator
   install, so the *pipeline* — spec, preprocessing, oracle, BC, PPO, eval,
   export, parity — is testable end to end without a 40 GB dependency;
-* it is the reference the other two adapters are validated against: same rooms,
-  same reward, same observation construction, so a disagreement is a bug in an
-  adapter rather than a property of a simulator.
+* it is the reference the Isaac Lab task is validated against: same rooms, same
+  reward, same observation construction, so a disagreement is a bug in the
+  adapter rather than a property of the simulator.
 
 It is deliberately **not** the training environment for the deployed policy —
-Isaac Lab is (§3, §4 of the implementation plan). Physics here is a
-kinematic differential-drive model with first-order motor lag, which is a good
-match for a Create3 on flat floor but is not a rigid-body simulation.
+Isaac Lab is (§3 of the implementation plan). Physics here is a kinematic
+differential-drive model with first-order motor lag, which is a good match for a
+Create3 on flat floor but is not a rigid-body simulation.
 
 Conventions: world frame x-right/y-up, robot frame x-forward/y-left, yaw CCW.
 Actions are **physical** ``(v, omega)`` in m/s and rad/s, matching the exported

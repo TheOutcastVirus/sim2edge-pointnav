@@ -1,6 +1,6 @@
 # Sim2Edge: End-to-End PyTorch Deployment Pipeline for Arduino Ventuno Q
 
-**Goal:** Train a goal-conditioned navigation policy in simulation (Isaac Lab primary, ManiSkill-compatible) and deploy it end-to-end on a Turtlebot 4 Lite whose compute has been replaced with an Arduino Ventuno Q (QCS8275, HTP V75 NPU), running inference through ExecuTorch's QNN backend.
+**Goal:** Train a goal-conditioned navigation policy in simulation (Isaac Lab) and deploy it end-to-end on a Turtlebot 4 Lite whose compute has been replaced with an Arduino Ventuno Q (QCS8275, HTP V75 NPU), running inference through ExecuTorch's QNN backend.
 
 **Task:** Navigate to a coordinate specified relative to the robot's starting pose while avoiding obstacles, using onboard sensing only (2D lidar + OAK-D Lite + odometry).
 
@@ -15,7 +15,7 @@
 | Export path | `torch.export` → ExecuTorch QNN directly | **ONNX and TensorRT are dropped.** ExecuTorch consumes `torch.export` output natively; ONNX added a conversion/debugging surface with zero benefit for this target. TensorRT is Jetson-only. The proven flow already exists in the reference repos (see §6). |
 | Distributed RL | Dropped (was DD-PPO/Habitat) | Habitat isn't in the stack. Isaac Lab gives 2–4k parallel envs on the single 4090 — single-GPU PPO is more than enough throughput for this task. |
 | Observation space | Depth image + 2D lidar + goal vector + last action; RGB as a stretch add-on | You chose full vision + lidar. Within "vision," **depth is the primary visual channel**: it closes most of the sim-to-real visual gap for free (geometry transfers; textures/lighting don't), and it's what catches obstacles the lidar plane misses. RGB adds texture cues but brings the hardest sim-to-real problem in the project — it is staged last and cuttable (§9). |
-| Sim split | Isaac Lab primary, ManiSkill secondary via a thin interop layer | Training runs happen on the 4090. ManiSkill port shares the task/obs/action spec so you can iterate on the AMD 6900 XT (§4). |
+| Simulator | Isaac Lab only | Training runs happen on the 4090. A ManiSkill port for the AMD 6900 XT was planned and cut: a second simulator means a second task definition to keep in sync forever, for no deployment benefit. The portable numpy reference env (§4) already covers "iterate without a CUDA box." |
 | BC→PPO handoff | Explicit stabilization phase | Naive BC-init + PPO destroys the pretrained actor (random critic → garbage advantages). Fixed with critic warmup + annealed BC auxiliary loss (§3.3). |
 | Quantization | PTQ INT8 (8a8w), same as reference repos | QAT only if PTQ measurably degrades the policy (§6.2). |
 
@@ -122,14 +122,14 @@ Use **geodesic** distance (from the oracle's distance field) for the progress te
 
 ---
 
-## 4. Isaac Lab ↔ ManiSkill interop layer
+## 4. The spec / adapter split
 
 Keep this thin or it eats the schedule:
 
 - `sim2edge/spec.py` — single source of truth: observation spec (names, shapes, dtypes, normalization constants), action spec (limits, rate), reward coefficients, randomization ranges. Plain dataclasses, no sim imports.
-- Each platform implements one adapter that maps its native env to the spec (Isaac Lab `DirectRLEnv` subclass; ManiSkill `BaseEnv` subclass with the same procedural room generator, which is pure numpy and shared).
+- The Isaac Lab `DirectRLEnv` subclass is an adapter over that spec: it owns no task definition, and it takes its layouts from `sim2edge/rooms.py`, which is pure numpy and simulator-free.
+- The portable numpy env (`sim2edge/envs/reference_env.py`) is the second implementation of the same spec. Its job is running the pipeline — oracle, BC, PPO, eval, export, parity — on a laptop with no GPU, so a bug in shared code is found there rather than at 2048 environments. It is not a training environment for the deployed policy.
 - Training code (BC dataset writer, PPO configs, eval harness) consumes only the spec — never a platform API.
-- **ManiSkill's role:** iteration on the AMD 6900 XT (ROCm PyTorch) and the interoperability story for the writeup. It is **not** on the critical path; the deployed policy trains in Isaac Lab. Port it in the Week-2 parallel track (§8), cut it first if behind (§9).
 
 ---
 
@@ -202,10 +202,10 @@ sim2edge-ventuno/
 │   ├── spec.py                # obs/action/preprocess/reward spec — single source of truth
 │   ├── models/nav_policy.py   # dependency-free model (train + calibrate + export)
 │   ├── oracle/                # occupancy grid, A*/FMM, pure-pursuit expert
-│   ├── rooms.py               # procedural layout generator (pure numpy, shared by both sims)
+│   ├── rooms.py               # procedural layout generator (pure numpy, shared by both envs)
+│   ├── envs/reference_env.py  # portable numpy env — same spec, no simulator
 │   └── eval/                  # sim eval harness, parity tests
 ├── isaaclab_env/              # Isaac Lab task + BC collection + rsl_rl configs
-├── maniskill_env/             # ManiSkill adapter (secondary)
 ├── tools/                     # export_qnn.py, export_cpu.py, calib_dataset.py, parity_check.py
 ├── ros_ws/src/
 │   ├── nav_policy_node/       # C++ inference node (cloned pattern from collision_classifier)
@@ -232,7 +232,6 @@ Two parallel tracks — **Track A (training, lab 4090)** and **Track B (deployme
 **Days 6–9 — Add depth (the "vision" upgrade)**
 - A: Enable tiled-rendered depth camera in the env; retrain BC→PPO with depth+lidar (init what transfers from the lidar-only run); depth randomization tuned against real OAK-D bags.
 - B: Depth preprocessing in C++ + parity test; re-export/re-calibrate; on-robot A/B vs. lidar-only, especially on low/overhanging obstacles the lidar plane misses (the reason depth is in the obs).
-- Parallel (AMD desktop): ManiSkill adapter over the shared spec + rooms generator; sanity-train lidar-only BC there for the interop claim.
 - **Gate C (end Day 9):** depth+lidar policy ≥ lidar-only on the robot benchmark.
 
 **Days 10–12 — Hardening + evaluation**
@@ -251,7 +250,7 @@ Two parallel tracks — **Track A (training, lab 4090)** and **Track B (deployme
 | Gate A | Fall back to XNNPACK CPU `.pte` (policy is small; CPU may hit 20 Hz anyway) and debug QNN in parallel — don't block training on the NPU. |
 | Gate B | Ship BC-only (skip PPO) — with DAgger, BC alone is usually demo-grade. |
 | Gate C | Demo lidar-only as primary, show depth policy in sim; frame depth as "validated in sim, deployment in progress." |
-| Any point | Cut order: RGB → ManiSkill parity → DR ablations → PPO (keep BC+DAgger) → depth. The lidar-only BC policy on the NPU is the minimum viable capstone and it exists by Day 5. |
+| Any point | Cut order: RGB → DR ablations → PPO (keep BC+DAgger) → depth. The lidar-only BC policy on the NPU is the minimum viable capstone and it exists by Day 5. |
 
 ## 10. Top risks
 

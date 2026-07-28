@@ -192,6 +192,5 @@ rescuing it is a finding, not a success.
 | B (Day 5) | PPO not converging | Ship BC-only. With DAgger it is usually demo-grade. |
 | C (Day 9) | Depth policy underperforms | Demo lidar-only; present depth as validated in sim. |
 
-Cut order if the schedule slips: RGB → ManiSkill parity → DR ablations → PPO
-(keep BC+DAgger) → depth. The lidar-only BC policy on the NPU is the minimum
-viable capstone.
+Cut order if the schedule slips: RGB → DR ablations → PPO (keep BC+DAgger) →
+depth. The lidar-only BC policy on the NPU is the minimum viable capstone.

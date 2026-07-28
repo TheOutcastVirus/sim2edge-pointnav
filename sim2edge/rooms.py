@@ -1,9 +1,8 @@
-"""Procedural room generation — pure numpy, shared by every simulator.
+"""Procedural room generation — pure numpy, shared by both environments.
 
-This module is the shared half of the Isaac Lab / ManiSkill interop story: both
-adapters call :func:`sample_room` and instantiate the *same* layout, so a policy
-can be trained on one and evaluated on the other without the layout distribution
-silently changing underneath it.
+The Isaac Lab task and the reference env both call :func:`sample_room` and
+instantiate the *same* layout, so a policy trained in one and evaluated in the
+other sees one layout distribution rather than two similar-looking ones.
 
 Nothing here imports a simulator. The output is a :class:`Room` — an analytic
 obstacle list (for a simulator to turn into prims) plus rasterized grids (for
