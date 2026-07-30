@@ -57,7 +57,8 @@ class Shard:
         return self
 
     def batches(self, batch_size: int, noise_scale: float = 1.0,
-                shuffle: bool = True, generator: torch.Generator | None = None):
+                shuffle: bool = True, generator: torch.Generator | None = None,
+                drop_last: bool = False):
         """Yield ``(observation, action)`` with a fresh noise draw every pass.
 
         Because corruption happens here and not in the simulator, two epochs
@@ -71,6 +72,8 @@ class Shard:
 
         for i in range(0, n, batch_size):
             sel = order[i:i + batch_size]
+            if drop_last and sel.numel() < batch_size:
+                break
             ranges = self.ranges[sel].float()
 
             r, a = noise_mod.corrupt_lidar(ranges, self.angles, noise_scale,
@@ -136,17 +139,21 @@ def load_shard(path, device="cpu") -> Shard:
     looking shapes right until it doesn't, and the resulting failure presents as
     a training problem. Refusing here is the cheapest place to catch it.
     """
-    z = np.load(Path(path), allow_pickle=False)
-    got, want = str(z["fingerprint"]), fingerprint()
-    if got != want:
-        raise ValueError(
-            f"shard {path} was collected under spec {got}, this process is "
-            f"{want}. The observation contract changed; recollect or check out "
-            f"the spec that produced it."
+    # ``np.load`` owns a ZipFile. Keeping it alive until garbage collection is
+    # harmless for one shard and exhausts file descriptors in a 623-shard
+    # training pass, so every array is materialized inside the context manager.
+    with np.load(Path(path), allow_pickle=False) as z:
+        got, want = str(z["fingerprint"]), fingerprint()
+        if got != want:
+            raise ValueError(
+                f"shard {path} was collected under spec {got}, this process is "
+                f"{want}. The observation contract changed; recollect or check "
+                f"out the spec that produced it."
+            )
+        t = lambda k, d=torch.float32: torch.from_numpy(z[k]).to(
+            device=device, dtype=d)
+        return Shard(
+            ranges=t("ranges", torch.float16), angles=t("angles"), pose=t("pose"),
+            goal=t("goal"), action=t("action"), prev_action=t("prev_action"),
+            episode=t("episode", torch.int32),
         )
-    t = lambda k, d=torch.float32: torch.from_numpy(z[k]).to(device=device, dtype=d)
-    return Shard(
-        ranges=t("ranges", torch.float16), angles=t("angles"), pose=t("pose"),
-        goal=t("goal"), action=t("action"), prev_action=t("prev_action"),
-        episode=t("episode", torch.int32),
-    )

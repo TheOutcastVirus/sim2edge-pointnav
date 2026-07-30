@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-105 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
+124 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -150,20 +150,83 @@ Progress is reported as a quality warning rather than a hard failure: collision-
 
 # Phase 2 — BC training
 
-```python
-from sim2edge.dataset import load_shard
+The full corpus is 623 compressed shards, 124.5 million state/action pairs and
+104 GB. The trainer streams one shard to the GPU while one background thread
+inflates its successor into host RAM; it never concatenates the corpus.
 
-shard = load_shard("data/bc_000.npz", device="cuda")
-for obs, act in shard.batches(512, noise_scale=1.0):
-    ...
+## 1. Pipeline smoke test
+
+```bash
+.venv/bin/python scripts/train_bc.py data/overnight_v2 \
+    --out runs/bc_smoke --epochs 1 --max-train-shards 2 \
+    --val-shards 1 --no-compile
 ```
 
-Noise and binning happen at load, so two epochs over the same states show two
-different corruptions. `noise_scale=0.0` is exactly clean and reproducible, which
-is what evaluation baselines need. A fingerprint mismatch raises rather than
-warns.
+This exercises real NPZ decompression, GPU preprocessing, fresh corruption,
+backpropagation, validation and checkpoint reload. Delete or retain the smoke
+directory as desired; a full run uses a different output directory.
 
-*(Training script not yet written.)*
+## 2. Full 4090 run
+
+```bash
+.venv/bin/python scripts/train_bc.py data/overnight_v2 --out runs/bc_v1
+```
+
+Defaults are for the 24 GB RTX 4090: batch 8192, BF16 autocast, compiled model,
+fused AdamW, one-shard prefetch and two complete corpus passes (~15,000 optimizer
+updates each). Four whole shards are held out. Training uses fresh 1x sensor and
+odometry corruption; validation reports both exact-clean and deterministic 1x
+losses.
+
+The run directory is deliberately self-describing:
+
+| File | Meaning |
+|---|---|
+| `config.json` | Every training hyperparameter. |
+| `dataset.json` | Exact train/validation shard split and manifest digest. |
+| `metrics.jsonl` | One machine-readable record per completed epoch. |
+| `latest.pt` | Resumable model, optimizer, scheduler and shard cursor. |
+| `best.pt` | Lowest clean offline validation loss. |
+| `final.pt` | Final completed epoch. |
+
+Resume after an interruption (at most one shard is replayed):
+
+```bash
+.venv/bin/python scripts/train_bc.py data/overnight_v2 \
+    --out runs/bc_v1 --resume runs/bc_v1/latest.pt
+```
+
+Resume refuses a changed spec, dataset split or training configuration rather
+than silently changing the run. Use a new output directory for a new experiment.
+
+## 3. Closed-loop evaluation
+
+Offline loss does not establish navigation quality. Run the best candidate in
+Isaac on layouts generated from a seed disjoint from collection:
+
+```bash
+~/isaac-venv/bin/python scripts/eval_bc.py runs/bc_v1/best.pt \
+    --episodes 512 --layout-seed 10000000 --out runs/bc_v1/eval.json
+```
+
+Each environment contributes exactly one episode, so the 0x, 1x and 2x noise
+tiers see the identical initial layout vector. The report includes success rate,
+SPL, collision rate, timeout rate, time-to-goal, command jerk and inference
+latency. Use these closed-loop metrics—not the smallest MSE—to select the policy.
+
+## Implementation map
+
+```text
+sim2edge/models/nav_policy.py  fixed-shape deployable actor
+sim2edge/training/data.py      corpus manifest, split and prefetch
+sim2edge/training/bc.py        normalized loss, trainer and checkpoints
+scripts/train_bc.py            simulator-free training CLI
+scripts/eval_bc.py             held-out closed-loop Isaac evaluation
+```
+
+The old shards do not contain layout IDs, so the offline split prevents temporal
+episode leakage but cannot measure new-layout generalization. The held-out
+`layout_seed` in the closed-loop evaluator is the generalization test.
 
 ---
 
