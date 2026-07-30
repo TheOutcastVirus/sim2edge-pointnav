@@ -125,6 +125,13 @@ def main() -> None:
         run_checks(env, torch)
         _finish(simulation_app)
 
+    # Do not rely on a separate manual --check invocation. Every collection is
+    # gated on physical command tracking before a single sample can be written.
+    print("[collect] drive-response preflight ...", flush=True)
+    run_drive_checks(env, torch)
+    env.reset()
+    print("[collect] drive-response preflight passed", flush=True)
+
     collector = Collector(args.out, args.shard_steps, args.num_envs,
                           max_steps=int(env.max_episode_length),
                           n_beams=int(env._beam_angles.shape[0]),
@@ -530,40 +537,112 @@ def run_checks(env, torch) -> None:
     print(f"spinning in place   {spinning:.1%}")
     assert spinning < 0.5, "most robots are pinned at max spin; oracle is stranded"
 
-    # Command a moderate in-place turn and prove the articulation actually
-    # follows it.  A well-formed oracle is irrelevant if wheel/suspension
-    # configuration turns differential wheel targets into lateral sliding.
-    from isaaclab_env.nav_task import normalize_action
-    spin_cmd = torch.zeros(env.num_envs, 2, device=env.device)
-    spin_cmd[:, 1] = 0.8
-    # Let suspension/contact settle before measuring. Including the reset drop
-    # made this check sensitive to transient contact rather than drive response.
-    for _ in range(10):
-        env.step(normalize_action(torch.zeros_like(spin_cmd)))
-    start_yaw = env._robot_pose()[:, 2].clone()
-    for _ in range(20):
-        env.step(normalize_action(spin_cmd))
-    yaw_1s = env._robot_pose()[:, 2].clone()
-    turned_1s = torch.atan2(torch.sin(yaw_1s - start_yaw),
-                            torch.cos(yaw_1s - start_yaw))
-    for _ in range(20):
-        env.step(normalize_action(spin_cmd))
-    turned_2s = torch.atan2(torch.sin(env._robot_pose()[:, 2] - start_yaw),
-                            torch.cos(env._robot_pose()[:, 2] - start_yaw))
-    wheel_vel = env.robot.data.joint_vel[:, env._wheel_ids]
-    suspension_pos = env.robot.data.joint_pos[:, env._suspension_ids]
-    print(f"spin response       {turned_1s.abs().median().item():.3f} rad in 1 s; "
-          f"{turned_2s.abs().median().item():.3f} rad in 2 s")
-    print(f"wheel velocity      L {wheel_vel[:, 0].median().item():.2f}  "
-          f"R {wheel_vel[:, 1].median().item():.2f} rad/s")
-    print(f"base z / suspension {env.robot.data.root_pos_w[:, 2].median().item():.3f} m  "
-          f"L {suspension_pos[:, 0].median().item():.3f}  "
-          f"R {suspension_pos[:, 1].median().item():.3f} m")
-    assert turned_1s.abs().median() > 0.1, (
-        "wheel targets barely rotate the base; check joint signs, suspension "
-        "and wheel contact material")
+    run_drive_checks(env, torch)
 
     print("--- all checks passed ---\n")
+
+
+def run_drive_checks(env, torch) -> None:
+    """Prove that fixed physical commands produce the requested base motion."""
+    # A valid oracle is irrelevant unless the base tracks the commands used as
+    # labels. Measure pose deltas after the drive has settled, rather than only
+    # checking that the oracle emits varied commands. The old free-suspension
+    # failure passed every check above while achieving almost no commanded yaw.
+    spin = _measure_drive_response(env, torch, (0.0, 1.0))
+    env.reset()
+    straight = _measure_drive_response(env, torch, (0.3, 0.0))
+
+    _assert_tracks("angular velocity", spin["yaw_rate"], 1.0)
+    assert spin["planar_speed"] < 0.05, (
+        f"spin command translated at {spin['planar_speed']:.3f} m/s; check "
+        "suspension and wheel contact")
+    _assert_tracks("forward velocity", straight["forward_speed"], 0.3)
+    assert abs(straight["lateral_speed"]) < 0.05, (
+        f"straight command slipped laterally at "
+        f"{straight['lateral_speed']:.3f} m/s; check suspension and wheel contact")
+    assert abs(straight["yaw_rate"]) < 0.10, (
+        f"straight command yawed at {straight['yaw_rate']:.3f} rad/s; check "
+        "wheel signs and left/right drive gains")
+
+
+def _measure_drive_response(env, torch, command: tuple[float, float],
+                            *, settle_steps: int = 10,
+                            command_steps: int = 50,
+                            measure_steps: int = 20) -> dict[str, float]:
+    """Return median achieved base velocities for one fixed physical command.
+
+    The command runs for 50 control ticks. Only the final 20 are measured so
+    motor/contact transients cannot make a healthy drive fail. Environments that
+    terminate during the probe are excluded: their post-step pose has already
+    been reset by ``DirectRLEnv`` and is not a drive-response measurement.
+    """
+    from isaaclab_env.nav_task import normalize_action
+    from sim2edge.spec import DT
+
+    assert 0 < measure_steps <= command_steps
+    cmd = torch.tensor(command, device=env.device).expand(env.num_envs, -1)
+    zero = torch.zeros_like(cmd)
+    for _ in range(settle_steps):
+        env.step(normalize_action(zero))
+
+    valid = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    forward, lateral, planar, yaw_rate = [], [], [], []
+    for tick in range(command_steps):
+        before = env._robot_pose().clone()
+        _, _, terminated, truncated, _ = env.step(normalize_action(cmd))
+        after = env._robot_pose().clone()
+        valid &= ~(terminated | truncated)
+        if tick >= command_steps - measure_steps:
+            delta = after[:, :2] - before[:, :2]
+            heading = before[:, 2]
+            forward.append(
+                (delta[:, 0] * torch.cos(heading)
+                 + delta[:, 1] * torch.sin(heading)) / DT)
+            lateral.append(
+                (-delta[:, 0] * torch.sin(heading)
+                 + delta[:, 1] * torch.cos(heading)) / DT)
+            planar.append(torch.linalg.vector_norm(delta, dim=1) / DT)
+            dyaw = torch.atan2(torch.sin(after[:, 2] - before[:, 2]),
+                               torch.cos(after[:, 2] - before[:, 2]))
+            yaw_rate.append(dyaw / DT)
+
+    assert valid.any(), (
+        f"every environment terminated during drive probe {command}; use more "
+        "bring-up environments or inspect spawn clearance")
+    forward_speed = torch.stack(forward, dim=1)[valid].median().item()
+    lateral_speed = torch.stack(lateral, dim=1)[valid].median().item()
+    planar_speed = torch.stack(planar, dim=1)[valid].median().item()
+    achieved_yaw = torch.stack(yaw_rate, dim=1)[valid].median().item()
+    print(f"drive response      cmd v={command[0]:.2f} w={command[1]:.2f}  "
+          f"achieved v={forward_speed:.3f} lateral={lateral_speed:.3f} "
+          f"w={achieved_yaw:.3f}  "
+          f"({int(valid.sum())}/{env.num_envs} envs valid)")
+    if hasattr(env, "robot"):
+        wheel = env._wheel_ids
+        suspension = env._suspension_ids
+        wheel_target = env.robot.data.joint_vel_target[:, wheel].median(dim=0).values
+        wheel_velocity = env.robot.data.joint_vel[:, wheel].median(dim=0).values
+        suspension_target = env.robot.data.joint_pos_target[:, suspension].median(dim=0).values
+        suspension_position = env.robot.data.joint_pos[:, suspension].median(dim=0).values
+        print(f"                    wheel target/actual L "
+              f"{wheel_target[0].item():.2f}/{wheel_velocity[0].item():.2f} "
+              f"R {wheel_target[1].item():.2f}/{wheel_velocity[1].item():.2f} rad/s; "
+              f"suspension target/actual L "
+              f"{suspension_target[0].item():.3f}/{suspension_position[0].item():.3f} "
+              f"R {suspension_target[1].item():.3f}/{suspension_position[1].item():.3f} m")
+    return {"forward_speed": forward_speed, "lateral_speed": lateral_speed,
+            "planar_speed": planar_speed, "yaw_rate": achieved_yaw}
+
+
+def _assert_tracks(name: str, achieved: float, commanded: float,
+                   *, tolerance: float = 0.20) -> None:
+    """Assert signed steady-state response is within a relative tolerance."""
+    error = abs(achieved - commanded)
+    allowed = tolerance * abs(commanded)
+    assert error <= allowed, (
+        f"{name} response {achieved:.3f} does not track command "
+        f"{commanded:.3f} within {tolerance:.0%}; check joint signs, "
+        "suspension, drive gains and wheel contact")
 
 
 if __name__ == "__main__":

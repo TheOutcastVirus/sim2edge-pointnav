@@ -73,7 +73,17 @@ If absent:
 ```
 
 Asserts rays hit geometry, bins carry returns, robots spawn in free space,
-layouts differ per environment, and the oracle is not pinned at max spin.
+layouts differ per environment, and the oracle is not pinned at max spin. It
+also commands a fixed `1.0 rad/s` turn and `0.3 m/s` straight drive for 50 ticks
+each, and requires the measured base response to track both within 20%.
+The drive-response probe also runs automatically before every collection and
+must pass before the collector allocates buffers or writes any samples.
+
+The adapter integrates the commanded planar Twist directly at the 200 Hz
+physics rate. Wheel joints are still animated, but the imported cylinder
+contacts are not used as a tire model: they track straight commands yet scrub
+unpredictably under opposing wheel speeds. Collision termination continues to
+use the same body-radius occupancy grid as the oracle.
 
 GUI: right-drag orbits, middle-drag pans, `F` frames a selected prim. Add
 `--dump-scene` for env origins, camera pose and prim world positions when the

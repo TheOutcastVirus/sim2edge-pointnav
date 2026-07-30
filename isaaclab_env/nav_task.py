@@ -167,10 +167,10 @@ class NavEnvCfg(DirectRLEnvCfg):
             # missed wheel-ground contact, so the dynamics stop being
             # trustworthy while the run appears to continue normally.
             #
-            # 2**22 = 4.19M, against the 3.33M PhysX asked for at 4096 envs.
+            # 2**23 = 8.39M, against the 6.67M PhysX requested at 16,384 envs.
             # Raise further if it complains again; the message states the
             # number it wants.
-            gpu_found_lost_pairs_capacity=2 ** 22,
+            gpu_found_lost_pairs_capacity=2 ** 23,
         ),
     ) if _HAVE_ISAACLAB else None
 
@@ -209,27 +209,29 @@ class NavEnvCfg(DirectRLEnvCfg):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.05),
-            # The URDF's Gazebo extension gives these prismatic joints a
-            # spring reference of 0.03 m.  USD does not carry that extension,
-            # so state and actuator targets must state it explicitly here.
-            joint_pos={".*wheel_drop.*": 0.03, ".*wheel_joint": 0.0},
+            # Wheel-drop travel is irrelevant to planar navigation and its
+            # Gazebo-only spring model is not preserved faithfully in USD.
+            # Hold both carriers at the nominal chassis height: a compliant
+            # spring unloaded one wheel under differential torque, so straight
+            # commands worked while in-place turns barely moved the base.
+            joint_pos={".*wheel_drop.*": 0.0, ".*wheel_joint": 0.0},
         ),
         actuators={
-            # Velocity control: the task's action is a wheel speed target, and
-            # first-order motor lag is what the real base does anyway.
+            # Track the wheel speeds implied by the planar Twist for coherent
+            # joint state and visualization. Base propulsion is applied below;
+            # these imported cylinder contacts are not a usable tire model.
             "wheels": ImplicitActuatorCfg(
                 joint_names_expr=[".*wheel_joint"],
                 velocity_limit_sim=V_MAX / WHEEL_RADIUS_M * 1.5,
                 effort_limit_sim=10.0, stiffness=0.0, damping=800.0,
             ),
-            # These joints were previously unactuated (and Isaac warned
-            # "2 != 4").  The wheels then moved freely in suspension, causing
-            # ~0.2 m/s lateral slip and almost no commanded yaw response.  The
-            # stiffness/damping are the spring values in the source URDF.
+            # These joints must be held, not left free and not approximated as
+            # soft suspension. Either failure unloads a wheel under opposing
+            # motor torque and destroys commanded yaw response.
             "suspension": ImplicitActuatorCfg(
                 joint_names_expr=[".*wheel_drop.*"],
-                velocity_limit_sim=1.0, effort_limit_sim=100.0,
-                stiffness=450.0, damping=50.0,
+                velocity_limit_sim=0.2, effort_limit_sim=1000.0,
+                stiffness=10_000.0, damping=1_000.0,
             ),
         },
     ) if _HAVE_ISAACLAB else None
@@ -337,6 +339,9 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         # Allocated here because reset() builds an observation before any
         # action has been applied.
         self._action = torch.zeros(n, 2, device=self.device)
+        # Planar command integration is kept separate from the contact-solver
+        # state so tire scrub cannot erase commanded yaw between substeps.
+        self._planar_pose_target = torch.zeros(n, 3, device=self.device)
 
         # Beam bearings, rotated from the sensor frame into base_link once.
         # Doing it here rather than per step keeps the hot path a single add.
@@ -451,6 +456,8 @@ class Sim2EdgeNavEnv(DirectRLEnv):
 
         self._goal_w[env_ids] = self._room_goal[layout] + origins[:, :2]
         self._action[env_ids] = 0.0
+        self._planar_pose_target[env_ids, :2] = root[:, :2]
+        self._planar_pose_target[env_ids, 2] = start[:, 2]
 
     def _write_obstacle_poses(self, env_ids, world_xyz, yaw):
         """One batched PhysX write for every obstacle in the given envs.
@@ -475,8 +482,34 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._action = denormalize_action(actions)
 
     def _apply_action(self):
-        """Differential-drive inverse kinematics: (v, omega) -> wheel speeds."""
+        """Apply the planar Twist and animate its differential wheel speeds.
+
+        The imported finite-width cylinder contacts do not implement a tire
+        model: opposing wheel speeds freely scrub while same-sign speeds drive
+        correctly. Base yaw was therefore unrelated to commanded yaw even with
+        held suspension and exact wheel-speed tracking. The task's action is a
+        base Twist, so impose that contract directly and leave PhysX to resolve
+        contacts during the following substeps.
+        """
         v, w = self._action[:, 0], self._action[:, 1]
+        target = self._planar_pose_target
+        yaw = target[:, 2]
+        target[:, 0] += v * torch.cos(yaw) * self.physics_dt
+        target[:, 1] += v * torch.sin(yaw) * self.physics_dt
+        target[:, 2] = torch.atan2(torch.sin(yaw + w * self.physics_dt),
+                                   torch.cos(yaw + w * self.physics_dt))
+
+        root_pose = self.robot.data.root_pose_w.clone()
+        root_pose[:, :2] = target[:, :2]
+        root_pose[:, 3:7] = _yaw_to_quat(target[:, 2])
+        self.robot.write_root_pose_to_sim(root_pose)
+
+        root_velocity = self.robot.data.root_vel_w.clone()
+        root_velocity[:, 0] = v * torch.cos(target[:, 2])
+        root_velocity[:, 1] = v * torch.sin(target[:, 2])
+        root_velocity[:, 5] = w
+        self.robot.write_root_velocity_to_sim(root_velocity)
+
         half = 0.5 * WHEEL_SEPARATION_M
         left = (v - w * half) / WHEEL_RADIUS_M
         right = (v + w * half) / WHEEL_RADIUS_M

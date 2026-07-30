@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,44 @@ def expand_xacro(xacro_path: Path) -> str:
     except subprocess.CalledProcessError as exc:
         sys.exit(f"xacro failed:\n{exc.stderr}")
     return out.stdout
+
+
+def resolve_package_uris(urdf_text: str, share: Path | None = None) -> str:
+    """Rewrite ``package://pkg/path`` to absolute filesystem paths.
+
+    Isaac's URDF importer resolves relative mesh paths against the directory
+    holding the URDF. We hand it a file in a ``TemporaryDirectory``, which has
+    no ROS package context, so every ``package://`` mesh silently fails to
+    resolve and the importer drops the geometry without erroring.
+
+    The result looked harmless for a long time because of *which* geometry is
+    affected. Collision is primitives everywhere that matters -- base_link is a
+    cylinder, the wheels are cylinders, the caster is a sphere -- so physics,
+    the drive check and the ray-cast lidar all behaved correctly. Only the
+    visuals and the bumper's collision mesh went missing, and nothing in BC
+    collection reads either. The robot was simply invisible, and stayed that
+    way until someone tried to take a screenshot.
+
+    ``AMENT_PREFIX_PATH`` fixes the *xacro* stage, which is a different problem
+    -- ``$(find pkg)`` at expansion time, not ``package://`` at import time.
+    Setting it does not help here, which is why this looks like it should
+    already work.
+    """
+    share = share or Path("/opt/ros/jazzy/share")
+
+    def sub(m: re.Match) -> str:
+        pkg, rest = m.group(1), m.group(2)
+        path = share / pkg / rest
+        if not path.exists():
+            sys.exit(
+                f"{m.group(0)} does not resolve to a file ({path}). The "
+                f"description references a package that is not installed."
+            )
+        return str(path)
+
+    out, n = re.subn(r"package://([^/]+)/([^\"'\s]+)", sub, urdf_text)
+    print(f"resolved {n} package:// reference(s) against {share}")
+    return out
 
 
 def check_mount_poses(urdf_text: str) -> None:
@@ -181,7 +220,10 @@ def main() -> None:
         print(f"wrote {out} ({len(urdf_text)} bytes)")
         return
 
-    convert(urdf_text, args.output, fix_base=args.fix_base,
+    # Only on the conversion path: the --urdf-only artifact stays a faithful
+    # record of what xacro emitted, absolute paths being an Isaac-importer
+    # requirement rather than part of the description.
+    convert(resolve_package_uris(urdf_text), args.output, fix_base=args.fix_base,
             headless=not args.gui)
 
 

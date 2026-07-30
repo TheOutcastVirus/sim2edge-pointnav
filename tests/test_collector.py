@@ -1,9 +1,63 @@
 """BC recorder policy without launching Isaac."""
 
 import numpy as np
+import pytest
 import torch
 
 from scripts.collect_bc import Collector
+from scripts.collect_bc import _assert_tracks, _measure_drive_response
+from sim2edge.spec import DT
+
+
+@pytest.mark.parametrize(
+    ("achieved", "commanded"),
+    [(0.8, 1.0), (1.2, 1.0), (0.24, 0.3), (0.36, 0.3), (-0.8, -1.0)],
+)
+def test_drive_response_accepts_twenty_percent_error(achieved, commanded):
+    _assert_tracks("test axis", achieved, commanded)
+
+
+@pytest.mark.parametrize(
+    ("achieved", "commanded"),
+    [(0.79, 1.0), (1.21, 1.0), (0.23, 0.3), (-0.79, -1.0)],
+)
+def test_drive_response_rejects_more_than_twenty_percent_error(
+        achieved, commanded):
+    with pytest.raises(AssertionError, match="does not track"):
+        _assert_tracks("test axis", achieved, commanded)
+
+
+class _TrackingEnv:
+    """Minimal kinematic stand-in for the Isaac drive-response measurement."""
+
+    device = "cpu"
+    num_envs = 2
+
+    def __init__(self):
+        self.pose = torch.zeros(self.num_envs, 3)
+
+    def _robot_pose(self):
+        return self.pose
+
+    def step(self, normalized_action):
+        from isaaclab_env.nav_task import denormalize_action
+        command = denormalize_action(normalized_action)
+        heading = self.pose[:, 2].clone()
+        self.pose[:, 0] += command[:, 0] * torch.cos(heading) * DT
+        self.pose[:, 1] += command[:, 0] * torch.sin(heading) * DT
+        self.pose[:, 2] += command[:, 1] * DT
+        done = torch.zeros(self.num_envs, dtype=torch.bool)
+        return {}, torch.zeros(self.num_envs), done, done, {}
+
+
+@pytest.mark.parametrize("command", [(0.0, 1.0), (0.3, 0.0)])
+def test_drive_response_measurement_recovers_kinematic_command(command):
+    result = _measure_drive_response(_TrackingEnv(), torch, command,
+                                     settle_steps=1, command_steps=3,
+                                     measure_steps=2)
+    assert result["forward_speed"] == pytest.approx(command[0], abs=1e-5)
+    assert result["lateral_speed"] == pytest.approx(0.0, abs=1e-5)
+    assert result["yaw_rate"] == pytest.approx(command[1], abs=1e-5)
 
 
 def _record(c, steps, *, moving=True):
