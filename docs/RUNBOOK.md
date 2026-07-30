@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-100 pass, 1 skips without Isaac. No GPU or simulator required — keep it that way.
+105 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -83,10 +83,11 @@ viewport is unreadable.
 
 ```bash
 ~/isaac-venv/bin/python scripts/collect_bc.py \
-    --num_envs 8192 --episodes 20000 --num_layouts 512 --sigma 0.15 --out data
+    --num_envs 512 --episodes 500000 --num_layouts 512 --seed 24680 \
+    --sigma 0.15 --out data/overnight
 ```
 
-Appends after any existing `bc_*.npz` in `--out`. `Ctrl-C` writes buffered
+Appends after any existing `bc_*.npz` in `--out`. Pre-collision prefixes are retained by default; add `--filter-failures` only for the legacy progress filter. `Ctrl-C` writes buffered
 episodes and exits cleanly; a second `Ctrl-C` abandons them.
 
 Progress line:
@@ -109,11 +110,11 @@ there; `ms/step` should stay flat; no `foundLostPairsCapacity` error in the firs
 | Flag | Default | Notes |
 |---|---|---|
 | `--num_envs` | 256 | Raises throughput; **lowers** GPU utilisation, which is expected — the ceiling is a serial CPU section, not the GPU. Do not run multiple collectors on one GPU. |
-| `--episodes` | 2000 | Successful episodes, not attempts. Overshoots by up to one wave at high `num_envs`. |
+| `--episodes` | 2000 | Retained episode prefixes, not attempts. Overshoots by at most one episode. |
 | `--num_layouts` | 512 | Pool size. ~21 ms each, built once. |
 | `--sigma` | 0.15 | Execution noise as a fraction of each axis limit. `0` collects pure on-policy expert data — the distribution BC fails on. |
 | `--shard_steps` | 200000 | ~160 MB per shard. |
-| `--keep_failures` | off | Keeps short and no-progress episodes too. |
+| `--filter-failures` | off | Legacy mode: drops short or low-progress prefixes. |
 
 Memory scales as `num_envs × 900 × 720 × 2 B`: **5.4 GB at 4096, 10.9 GB at
 8192**, plus a transient spike when many environments finish on the same step.
@@ -133,9 +134,7 @@ Runs without Isaac. Checks structure, that storage is raw metres and not
 pre-binned, that labels sit inside the Create3's envelope, that perturbation is
 live, that observations assemble correctly, and that noise is fresh per epoch.
 
-The check that matters is **progress**: every episode must end closer to its goal
-than it started. Well-formed arrays of a robot spinning in place pass everything
-else.
+Progress is reported as a quality warning rather than a hard failure: collision-truncated prefixes still contain valid oracle labels, but a high warning count means the drive dynamics need more work.
 
 ---
 

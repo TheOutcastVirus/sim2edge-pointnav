@@ -32,6 +32,20 @@ def test_obstacle_prim_count_matches_the_slot_table():
     assert len(_slot_table()) == MAX_OBSTACLES
 
 
+def test_every_moving_joint_has_an_actuator_when_isaac_is_available():
+    """Free wheel suspension destroys differential-drive command tracking."""
+    m = importlib.import_module("isaaclab_env.nav_task")
+    if not m._HAVE_ISAACLAB:
+        pytest.skip("cfg objects need isaaclab")
+    expressions = {
+        expr
+        for actuator in m.NavEnvCfg.robot_cfg.actuators.values()
+        for expr in actuator.joint_names_expr
+    }
+    assert ".*wheel_joint" in expressions
+    assert ".*wheel_drop.*" in expressions
+
+
 def test_env_spacing_exceeds_the_largest_arena():
     """Rooms are tiled at fixed origins. If spacing were smaller than an arena,
     a neighbouring room would appear inside this one's lidar scan."""

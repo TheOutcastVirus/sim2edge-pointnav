@@ -10,7 +10,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from sim2edge import oracle as oracle_mod
-from sim2edge.oracle import LayoutPool, oracle_action
+from sim2edge.oracle import LayoutPool, oracle_action, perturb_action
 from sim2edge.rooms import sample_room
 from sim2edge.spec import ACCEL_MAX, ALPHA_MAX, DT, OMEGA_MAX, V_MAX
 
@@ -82,6 +82,22 @@ def test_commands_obey_the_acceleration_limit(pool, rooms):
         assert torch.all((a[:, 0] - prev[:, 0]).abs() <= ACCEL_MAX * DT + 1e-6)
         assert torch.all((a[:, 1] - prev[:, 1]).abs() <= ALPHA_MAX * DT + 1e-6)
         prev = a
+
+
+def test_perturbed_execution_obeys_the_acceleration_limit():
+    """Exploration must not create commands the physical base cannot make."""
+    prev = torch.tensor([[0.2, -0.3], [0.1, 0.4]])
+    label = torch.tensor([[V_MAX, OMEGA_MAX], [0.0, -OMEGA_MAX]])
+    out = perturb_action(label, sigma=2.0, prev_action=prev,
+                         generator=torch.Generator().manual_seed(4))
+
+    assert torch.all((out[:, 0] - prev[:, 0]).abs() <= ACCEL_MAX * DT + 1e-6)
+    assert torch.all((out[:, 1] - prev[:, 1]).abs() <= ALPHA_MAX * DT + 1e-6)
+
+
+def test_zero_perturbation_keeps_the_oracle_command():
+    action = torch.tensor([[0.2, -0.3]])
+    assert perturb_action(action, 0.0, prev_action=torch.zeros_like(action)) is action
 
 
 def test_it_turns_in_place_rather_than_arcing_backwards(pool, rooms):

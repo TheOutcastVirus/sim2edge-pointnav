@@ -171,7 +171,8 @@ def oracle_action(pool: LayoutPool, layout: torch.Tensor, pose: torch.Tensor,
 
 
 def perturb_action(action: torch.Tensor, sigma: float,
-                   generator: torch.Generator | None = None) -> torch.Tensor:
+                   generator: torch.Generator | None = None,
+                   prev_action: torch.Tensor | None = None) -> torch.Tensor:
     """Add exploration noise to the command that gets *executed*.
 
     The label recorded for a state stays the oracle's unperturbed command; only
@@ -185,6 +186,9 @@ def perturb_action(action: torch.Tensor, sigma: float,
     problem, not a sample-count one.
 
     Scaled by each axis's own limit so one sigma means the same thing for both.
+    The perturbed command is rate-limited too: otherwise independent 20 Hz
+    noise bypasses the Create3 acceleration envelope that the oracle itself is
+    carefully constrained to, producing trajectories no real base can execute.
     """
     if sigma <= 0.0:
         return action
@@ -193,5 +197,12 @@ def perturb_action(action: torch.Tensor, sigma: float,
     noise = torch.randn(action.shape, generator=generator, device=action.device,
                         dtype=action.dtype) * sigma * scale
     out = action + noise
+    if prev_action is not None:
+        out[:, 0] = torch.clamp(out[:, 0],
+                                prev_action[:, 0] - ACCEL_MAX * DT,
+                                prev_action[:, 0] + ACCEL_MAX * DT)
+        out[:, 1] = torch.clamp(out[:, 1],
+                                prev_action[:, 1] - ALPHA_MAX * DT,
+                                prev_action[:, 1] + ALPHA_MAX * DT)
     return torch.stack([out[:, 0].clamp(0.0, V_MAX),
                         out[:, 1].clamp(-OMEGA_MAX, OMEGA_MAX)], dim=1)

@@ -6,10 +6,11 @@ No Isaac needed -- that is the point. Collection is the expensive, hard-to-debug
 half; verification should be runnable anywhere, immediately, before anyone spends
 GPU hours on a dataset that is subtly wrong.
 
-The checks are ordered from cheap and structural to the ones that actually prove
-the demonstrations are demonstrations *of the task*. The important one is
-PROGRESS: if goal distance does not fall over an episode, the labels are not
-goal-reaching behaviour no matter how well-formed the arrays are.
+The checks are ordered from cheap and structural to behavioural diagnostics.
+Collision and timeout prefixes are intentionally retained: their executed
+trajectory failed, but every stored label is the oracle's recovery command at a
+clean pre-collision state.  Outcome metadata keeps those distinct from episodes
+that reached the goal, which are held to the stronger convergence checks.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ def main() -> None:
 
     print(f"\n=== {args.shard} ===")
     shard = load_shard(args.shard)          # raises on fingerprint mismatch
+    with np.load(args.shard, allow_pickle=False) as raw:
+        outcome = raw["outcome"] if "outcome" in raw.files else None
     n = len(shard)
     ep = shard.episode.numpy()
     ids = np.unique(ep)
@@ -99,8 +102,8 @@ def main() -> None:
         print("         --sigma was 0: every state is one the oracle put itself")
         print("         in, which is the distribution BC is known to fail on.")
 
-    # ── PROGRESS: the labels are goal-reaching behaviour ───────────────────
-    print("\nprogress toward the goal (the check that matters)")
+    # ── rollout outcomes and progress ──────────────────────────────────────
+    print("\nrollout outcomes and progress")
     dist = torch.linalg.vector_norm(shard.goal - shard.pose[:, :2], dim=1).numpy()
     starts, ends, lengths, improved = [], [], [], 0
     for e in ids:
@@ -111,7 +114,7 @@ def main() -> None:
 
     starts, ends, lengths = np.array(starts), np.array(ends), np.array(lengths)
     check(improved == len(ids), "every episode ends closer than it started",
-          f"{improved}/{len(ids)}")
+          f"{improved}/{len(ids)}", warn_only=True)
     # The last *recorded* sample is one control step short of the terminal
     # state. Collection stores (state, action) pairs and evaluates success after
     # stepping, so the pose that actually satisfies the goal condition is never
@@ -120,17 +123,35 @@ def main() -> None:
     # not by the tolerance itself. Asserting the tighter bound fails on
     # perfectly good data, which is what it did.
     reach_bound = args.goal_tolerance + V_MAX * DT
-    check(float(np.median(ends)) < reach_bound,
-          "median episode ends within one step of the goal tolerance",
-          f"median final distance {np.median(ends):.3f} m "
-          f"(tol {args.goal_tolerance} + one step {V_MAX * DT:.3f} "
-          f"= {reach_bound:.3f})")
-    check(float(np.percentile(ends, 90)) < reach_bound + 0.1,
-          "the tail also converges, not just the median",
-          f"p90 final distance {np.percentile(ends, 90):.3f} m")
+    if outcome is not None:
+        episode_outcomes = np.array([int(outcome[ep == e][0]) for e in ids])
+        consistent = all(np.unique(outcome[ep == e]).size == 1 for e in ids)
+        check(consistent, "one outcome value per episode")
+        reached = episode_outcomes == 0
+        collided = episode_outcomes == 1
+        timed_out = episode_outcomes == 2
+        check(bool(np.isin(episode_outcomes, [0, 1, 2]).all()),
+              "outcome codes are known")
+        print(f"         reached {reached.sum()}  collided {collided.sum()}  "
+              f"timed out {timed_out.sum()}")
+        if reached.any():
+            check(float(np.median(ends[reached])) < reach_bound,
+                  "reached episodes end within one step of goal tolerance",
+                  f"median final distance {np.median(ends[reached]):.3f} m")
+            check(float(np.percentile(ends[reached], 90)) < reach_bound + 0.1,
+                  "reached-episode tail converges",
+                  f"p90 final distance {np.percentile(ends[reached], 90):.3f} m")
+    else:
+        # Legacy filtered shards had no outcome metadata and admitted only
+        # progressing prefixes, but mixed successes, collision truncations and
+        # timeouts without recording which was which.
+        check(float(np.median(ends)) < reach_bound,
+              "median episode ends within one step of the goal tolerance",
+              f"median final distance {np.median(ends):.3f} m",
+              warn_only=True)
     check(float(starts.mean()) > 1.0, "episodes started a useful distance out",
           f"mean start {starts.mean():.2f} m")
-    check(int(lengths.min()) > 3, "no degenerate one-step episodes",
+    check(int(lengths.min()) > 0, "no empty episodes",
           f"lengths min {lengths.min()} median {int(np.median(lengths))} "
           f"max {lengths.max()}")
 

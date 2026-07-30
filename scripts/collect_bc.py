@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--num_envs", type=int, default=256)
     ap.add_argument("--episodes", type=int, default=2000,
-                    help="successful episodes to collect, not episodes attempted")
+                    help="episode prefixes to retain, not episodes attempted")
     ap.add_argument("--num_layouts", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=Path("data"))
@@ -52,8 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="execution noise as a fraction of each axis limit. "
                          "0 collects pure on-policy expert data, which is the "
                          "distribution BC fails on -- see the module docstring")
-    ap.add_argument("--keep_failures", action="store_true",
-                    help="keep collided and timed-out episodes")
+    filtering = ap.add_mutually_exclusive_group()
+    filtering.add_argument(
+        "--filter-failures", action="store_true",
+        help="drop episodes shorter than 20 steps or with under 0.5 m net "
+             "Euclidean progress. Off by default: pre-collision states have "
+             "valid oracle labels regardless of the rollout outcome")
+    filtering.add_argument(
+        "--keep_failures", action="store_false", dest="filter_failures",
+        help=argparse.SUPPRESS)
+    ap.set_defaults(filter_failures=False)
     ap.add_argument("--gui", action="store_true")
     ap.add_argument("--dump-scene", action="store_true",
                     help="print env origins, camera pose and sample prim world "
@@ -90,6 +98,8 @@ def main() -> None:
     cfg.scene.num_envs = args.num_envs
     cfg.num_layouts = args.num_layouts
     cfg.layout_seed = args.seed
+    cfg.seed = args.seed
+    cfg.collection_mode = True
 
     # Progress markers. Isaac Lab initializes sensors lazily on first `.data`
     # access, so a stall inside reset() is really a stall inside sensor setup --
@@ -146,43 +156,38 @@ def main() -> None:
         pose = env._robot_pose()
         ranges, angles = env.raw_scan()
 
-        label = env.oracle_command()                 # unperturbed: this is the label
-        executed = perturb_action(label, args.sigma, generator=gen)
+        label = env.oracle_command(pose)             # unperturbed: this is the label
+        executed = perturb_action(label, args.sigma, generator=gen,
+                                  prev_action=env._action)
 
         _t = time.perf_counter()
         collector.record(ranges, pose, env._goal_w - env.scene.env_origins[:, :2],
                          label, env._action)
         t_rec += time.perf_counter() - _t
 
-        # Collision verdict BEFORE stepping. DirectRLEnv.step() resets finished
-        # environments internally, which reassigns env._layout -- pairing the
-        # new layout with this pose would classify against the wrong room and
-        # silently drop good episodes.
-        #
-        # An episode is worth keeping only if it ended at the goal without the
-        # body ever overlapping an obstacle: imitating a trajectory that ends in
-        # a wall teaches ending in walls.
-        collector.mark_collisions(~env.pool.is_free(env._layout, pose[:, :2]))
-
         _, _, terminated, truncated, _ = env.step(normalize_action(executed))
 
         done = terminated | truncated
         if done.any():
-            collector.flush(done, terminated, angles,
-                            keep_failures=args.keep_failures)
+            collector.flush(done, env._reached, env._collided, angles,
+                            filter_failures=args.filter_failures)
 
         step += 1
         if step % 50 == 0:
             wall = time.perf_counter() - t0
-            t_sim = wall - t_rec
+            t_sim = wall - t_rec - collector.write_seconds
+            useful = collector.steps_kept / wall
             print(f"step {step:6d}  kept {collector.episodes_kept:5d} "
                   f"(full {collector.kept_complete:5d} "
                   f"trunc {collector.kept_truncated:5d} "
                   f"part {collector.kept_partial:5d})  "
                   f"dropped {collector.episodes_dropped:5d}  "
                   f"| {wall / step * 1000:6.1f} ms/step "
-                  f"(sim {t_sim / step * 1000:6.1f}  rec {t_rec / step * 1000:5.1f})  "
-                  f"| {args.num_envs * step / wall:7.0f} env-steps/s")
+                  f"(sim {t_sim / step * 1000:6.1f}  "
+                  f"rec {t_rec / step * 1000:5.1f}  "
+                  f"write {collector.write_seconds / step * 1000:5.1f})  "
+                  f"| {args.num_envs * step / wall:7.0f} env-steps/s  "
+                  f"{useful:7.0f} kept-samples/s")
 
     collector.close(angles)
     if stopping["now"]:
@@ -198,6 +203,10 @@ def main() -> None:
     print(f"  kept, ran out of clock   : {collector.kept_partial}")
     print(f"  dropped, too short       : {collector.dropped_short}")
     print(f"  dropped, no net progress : {collector.dropped_no_progress}")
+    print(f"  samples kept / filtered  : {collector.steps_kept} / "
+          f"{collector.steps_dropped}")
+    print(f"  retained diagnostic only : {collector.kept_short} short, "
+          f"{collector.kept_no_progress} under 0.5 m net progress")
     if yield_pct < 60:
         print("  NOTE: a low yield both wastes compute and biases the set -- the "
               "filter\n        correlates with difficulty, so survivors skew easy.")
@@ -217,11 +226,11 @@ def _finish(simulation_app) -> None:
     """
     sys.stdout.flush()
     sys.stderr.flush()
-    try:
-        simulation_app.close()
-    except Exception as exc:                     # pragma: no cover
-        print(f"[collect] ignoring error during shutdown: {exc}")
-        sys.stdout.flush()
+    # This is a standalone worker process and all durable state is already on
+    # disk.  Kit's close() has repeatedly remained in native cleanup for many
+    # minutes while retaining CPU, RAM and GPU memory; calling it before
+    # os._exit() therefore defeated the bounded-shutdown guarantee entirely.
+    # The OS releases the process-owned resources more reliably here.
     os._exit(0)
 
 
@@ -267,13 +276,16 @@ class Collector:
               flush=True)
 
         self.t = np.zeros(num_envs, np.int32)          # steps buffered per env
-        self.collide_at = np.full(num_envs, -1, np.int32)   # first collision step
         self.env_idx = np.arange(num_envs)
 
         self.episode_id = 0
         self.total_steps = 0
         self.kept_complete = self.kept_truncated = self.kept_partial = 0
         self.dropped_short = self.dropped_no_progress = 0
+        self.steps_kept = self.steps_dropped = 0
+        self.kept_short = self.kept_no_progress = 0
+        self.write_seconds = 0.0
+        self.filter_failures = False
         self.pending: list[dict] = []
         self.pending_steps = 0
 
@@ -290,7 +302,7 @@ class Collector:
     # ── per-step, O(1) Python ───────────────────────────────────────────────
 
     def record(self, ranges, pose, goal, label, prev_action):
-        """One host transfer per field, then one vectorized scatter."""
+        """Two host transfers total, then one vectorized scatter."""
         t = self.t
         room = t < self.max_steps                    # ignore overflow, if any
         i, j = self.env_idx[room], t[room]
@@ -299,60 +311,62 @@ class Collector:
         # (which main() imports only after AppLauncher). Casting on device
         # also halves the host transfer.
         self.b_ranges[i, j] = ranges.half().cpu().numpy()[room]
-        self.b_pose[i, j] = pose.cpu().numpy()[room]
-        self.b_goal[i, j] = goal.cpu().numpy()[room]
-        self.b_action[i, j] = label.cpu().numpy()[room]
-        self.b_prev[i, j] = prev_action.cpu().numpy()[room]
+        # Pack the four small tensors into one transfer.  Calling .cpu() on
+        # each field separately introduced four CUDA synchronizations per
+        # control tick; the scan transfer is the only other synchronization.
+        features = np.asarray(
+            __import__("torch").cat((pose, goal, label, prev_action), dim=1)
+            .cpu())
+        self.b_pose[i, j] = features[room, :3]
+        self.b_goal[i, j] = features[room, 3:5]
+        self.b_action[i, j] = features[room, 5:7]
+        self.b_prev[i, j] = features[room, 7:9]
         self.t[room] += 1
-
-    def mark_collisions(self, hit):
-        """Remember *when* an environment first collided, not just whether.
-
-        The step index is what makes truncation possible: everything before a
-        collision is clean expert data, and discarding it threw away most of the
-        dataset -- including precisely the off-path recovery states that action
-        perturbation exists to create.
-        """
-        h = hit.cpu().numpy()
-        first = h & (self.collide_at < 0)
-        self.collide_at[first] = np.maximum(self.t[first] - 1, 0)
 
     # ── episode end ─────────────────────────────────────────────────────────
 
-    def flush(self, done, terminated, angles, *, keep_failures: bool):
-        reached = terminated.cpu().numpy()
+    def flush(self, done, reached, collided, angles, *, filter_failures: bool):
+        self.filter_failures = filter_failures
+        reached = reached.cpu().numpy()
+        collided = collided.cpu().numpy()
         for i in np.flatnonzero(done.cpu().numpy()):
-            n, c = int(self.t[i]), int(self.collide_at[i])
-            # Truncate before the collision instead of discarding the episode.
-            upto = c if c >= 0 else n
+            upto = int(self.t[i])
+            d = np.linalg.norm(
+                self.b_goal[i, :upto] - self.b_pose[i, :upto, :2], axis=1)
+            progress = float(d[0] - d[-1]) if upto else 0.0
+            too_short = upto < self.MIN_STEPS
+            no_progress = progress < self.MIN_PROGRESS_M
 
-            if upto >= self.MIN_STEPS:
-                d = np.linalg.norm(self.b_goal[i, :upto] - self.b_pose[i, :upto, :2],
-                                   axis=1)
-                progress = float(d[0] - d[-1])
-                if progress >= self.MIN_PROGRESS_M or keep_failures:
-                    self._emit(i, upto)
-                    if c >= 0:
-                        self.kept_truncated += 1
-                    elif reached[i]:
-                        self.kept_complete += 1
-                    else:
-                        # Timed out, but every label is the oracle's action at
-                        # the state it was in, so the supervision is still
-                        # correct -- only the outcome is missing.
-                        self.kept_partial += 1
-                else:
-                    self.dropped_no_progress += 1
-            else:
+            if filter_failures and too_short:
                 self.dropped_short += 1
+                self.steps_dropped += upto
+            elif filter_failures and no_progress:
+                self.dropped_no_progress += 1
+                self.steps_dropped += upto
+            elif upto:
+                outcome = 1 if collided[i] else (0 if reached[i] else 2)
+                self._emit(i, upto, outcome)
+                self.steps_kept += upto
+                self.kept_short += int(too_short)
+                self.kept_no_progress += int(no_progress)
+                if collided[i]:
+                    self.kept_truncated += 1
+                elif reached[i]:
+                    self.kept_complete += 1
+                else:
+                    # Timed out, but every label is the oracle's action at the
+                    # state it was in, so the supervision is still correct.
+                    self.kept_partial += 1
+
+                # Check after each episode, not after an entire synchronized
+                # reset wave.  At 8192 envs the old placement overshot a 200k
+                # target by millions of samples and caused a large copy spike.
+                if self.pending_steps >= self.shard_steps:
+                    self._write(angles)
 
             self.t[i] = 0
-            self.collide_at[i] = -1
 
-        if self.pending_steps >= self.shard_steps:
-            self._write(angles)
-
-    def _emit(self, i: int, upto: int) -> None:
+    def _emit(self, i: int, upto: int, outcome: int) -> None:
         self.pending.append({
             "ranges": self.b_ranges[i, :upto].copy(),
             "pose": self.b_pose[i, :upto].copy(),
@@ -360,6 +374,10 @@ class Collector:
             "action": self.b_action[i, :upto].copy(),
             "prev_action": self.b_prev[i, :upto].copy(),
             "episode": np.full(upto, self.episode_id, np.int32),
+            # 0 reached, 1 collision, 2 timeout.  Keeping this per sample is a
+            # small cost and makes every independently loaded shard self-
+            # describing even when an episode straddles no external index.
+            "outcome": np.full(upto, outcome, np.uint8),
         })
         self.pending_steps += upto
         self.episode_id += 1
@@ -375,14 +393,20 @@ class Collector:
     def _write(self, angles):
         from sim2edge.dataset import save_shard
 
+        started = time.perf_counter()
         path = self.out / f"bc_{self.shards_written:03d}.npz"
         cat = lambda k: np.concatenate([e[k] for e in self.pending])
         save_shard(path, ranges=cat("ranges"), angles=angles.cpu().numpy(),
                    pose=cat("pose"), goal=cat("goal"), action=cat("action"),
-                   prev_action=cat("prev_action"), episode=cat("episode"))
+                   prev_action=cat("prev_action"), episode=cat("episode"),
+                   outcome=cat("outcome"),
+                   filter_failures=np.array(self.filter_failures, dtype=np.bool_))
         self.total_steps += self.pending_steps
         self.shards_written += 1
-        print(f"  wrote {path} ({self.pending_steps} steps)", flush=True)
+        elapsed = time.perf_counter() - started
+        self.write_seconds += elapsed
+        print(f"  wrote {path} ({self.pending_steps} steps in {elapsed:.1f} s)",
+              flush=True)
         self.pending, self.pending_steps = [], 0
 
     def close(self, angles):
@@ -505,6 +529,39 @@ def run_checks(env, torch) -> None:
     spinning = ((cmd[:, 0] == 0) & (cmd[:, 1].abs() > 1.8)).float().mean().item()
     print(f"spinning in place   {spinning:.1%}")
     assert spinning < 0.5, "most robots are pinned at max spin; oracle is stranded"
+
+    # Command a moderate in-place turn and prove the articulation actually
+    # follows it.  A well-formed oracle is irrelevant if wheel/suspension
+    # configuration turns differential wheel targets into lateral sliding.
+    from isaaclab_env.nav_task import normalize_action
+    spin_cmd = torch.zeros(env.num_envs, 2, device=env.device)
+    spin_cmd[:, 1] = 0.8
+    # Let suspension/contact settle before measuring. Including the reset drop
+    # made this check sensitive to transient contact rather than drive response.
+    for _ in range(10):
+        env.step(normalize_action(torch.zeros_like(spin_cmd)))
+    start_yaw = env._robot_pose()[:, 2].clone()
+    for _ in range(20):
+        env.step(normalize_action(spin_cmd))
+    yaw_1s = env._robot_pose()[:, 2].clone()
+    turned_1s = torch.atan2(torch.sin(yaw_1s - start_yaw),
+                            torch.cos(yaw_1s - start_yaw))
+    for _ in range(20):
+        env.step(normalize_action(spin_cmd))
+    turned_2s = torch.atan2(torch.sin(env._robot_pose()[:, 2] - start_yaw),
+                            torch.cos(env._robot_pose()[:, 2] - start_yaw))
+    wheel_vel = env.robot.data.joint_vel[:, env._wheel_ids]
+    suspension_pos = env.robot.data.joint_pos[:, env._suspension_ids]
+    print(f"spin response       {turned_1s.abs().median().item():.3f} rad in 1 s; "
+          f"{turned_2s.abs().median().item():.3f} rad in 2 s")
+    print(f"wheel velocity      L {wheel_vel[:, 0].median().item():.2f}  "
+          f"R {wheel_vel[:, 1].median().item():.2f} rad/s")
+    print(f"base z / suspension {env.robot.data.root_pos_w[:, 2].median().item():.3f} m  "
+          f"L {suspension_pos[:, 0].median().item():.3f}  "
+          f"R {suspension_pos[:, 1].median().item():.3f} m")
+    assert turned_1s.abs().median() > 0.1, (
+        "wheel targets barely rotate the base; check joint signs, suspension "
+        "and wheel contact material")
 
     print("--- all checks passed ---\n")
 

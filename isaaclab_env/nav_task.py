@@ -207,14 +207,29 @@ class NavEnvCfg(DirectRLEnvCfg):
                 max_angular_velocity=8.0,
             ),
         ),
-        init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.05)),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.05),
+            # The URDF's Gazebo extension gives these prismatic joints a
+            # spring reference of 0.03 m.  USD does not carry that extension,
+            # so state and actuator targets must state it explicitly here.
+            joint_pos={".*wheel_drop.*": 0.03, ".*wheel_joint": 0.0},
+        ),
         actuators={
             # Velocity control: the task's action is a wheel speed target, and
             # first-order motor lag is what the real base does anyway.
             "wheels": ImplicitActuatorCfg(
                 joint_names_expr=[".*wheel_joint"],
-                velocity_limit=V_MAX / WHEEL_RADIUS_M * 1.5,
-                effort_limit=10.0, stiffness=0.0, damping=800.0,
+                velocity_limit_sim=V_MAX / WHEEL_RADIUS_M * 1.5,
+                effort_limit_sim=10.0, stiffness=0.0, damping=800.0,
+            ),
+            # These joints were previously unactuated (and Isaac warned
+            # "2 != 4").  The wheels then moved freely in suspension, causing
+            # ~0.2 m/s lateral slip and almost no commanded yaw response.  The
+            # stiffness/damping are the spring values in the source URDF.
+            "suspension": ImplicitActuatorCfg(
+                joint_names_expr=[".*wheel_drop.*"],
+                velocity_limit_sim=1.0, effort_limit_sim=100.0,
+                stiffness=450.0, damping=50.0,
             ),
         },
     ) if _HAVE_ISAACLAB else None
@@ -278,6 +293,12 @@ class NavEnvCfg(DirectRLEnvCfg):
     num_layouts: int = 512
     layout_seed: int = 0
 
+    #: Collection consumes raw scans and oracle labels, not policy
+    #: observations.  Avoid binning 720 rays into an observation that the
+    #: caller immediately discards.  PPO leaves this false and sees the full
+    #: task API.
+    collection_mode: bool = False
+
 
 class Sim2EdgeNavEnv(DirectRLEnv):
     """Direct-workflow environment. Produces observations and oracle labels."""
@@ -299,7 +320,11 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._wheel_ids, names = self.robot.find_joints(
             ["left_wheel_joint", "right_wheel_joint"], preserve_order=True)
         assert names == ["left_wheel_joint", "right_wheel_joint"], names
-
+        self._suspension_ids, suspension_names = self.robot.find_joints(
+            ["wheel_drop_left_joint", "wheel_drop_right_joint"],
+            preserve_order=True)
+        assert suspension_names == ["wheel_drop_left_joint",
+                                    "wheel_drop_right_joint"], suspension_names
         self._build_layout_pool()
 
         # Per-env episode state.
@@ -412,6 +437,18 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         root[:, 7:] = 0.0
         self.robot.write_root_state_to_sim(root, env_ids)
 
+        # Reset internal articulation state as well as the root.  Without this,
+        # wheel spin and suspension displacement leaked across episodes even
+        # though the robot pose jumped back to its start.
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel,
+                                            env_ids=env_ids)
+        self.robot.set_joint_position_target(
+            joint_pos[:, self._suspension_ids],
+            joint_ids=self._suspension_ids, env_ids=env_ids)
+        self.robot.set_joint_velocity_target(joint_vel, env_ids=env_ids)
+
         self._goal_w[env_ids] = self._room_goal[layout] + origins[:, :2]
         self._action[env_ids] = 0.0
 
@@ -463,6 +500,15 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         return torch.linalg.vector_norm(hits[..., :2] - origin[..., :2], dim=-1)
 
     def _get_observations(self) -> dict:
+        if self.cfg.collection_mode:
+            # DirectRLEnv.step() always asks for an observation.  A single
+            # cached tensor makes that request O(1) during BC collection while
+            # preserving the regular environment path for PPO and checks.
+            if not hasattr(self, "_collection_obs"):
+                self._collection_obs = torch.empty(
+                    self.num_envs, 0, device=self.device)
+            return {"policy": self._collection_obs}
+
         pose = self._robot_pose()
         obs = build_observation(
             bin_lidar(self._lidar_ranges(), self._beam_angles),
@@ -474,7 +520,7 @@ class Sim2EdgeNavEnv(DirectRLEnv):
 
     # ── the oracle, for BC collection ────────────────────────────────────────
 
-    def oracle_command(self) -> torch.Tensor:
+    def oracle_command(self, pose: torch.Tensor | None = None) -> torch.Tensor:
         """(N, 2) the expert's *commanded* (v, omega) for the current state.
 
         This is the BC label. It is the command, never the achieved velocity
@@ -482,8 +528,9 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         to emit a value the actuator will lag a second time, a systematic
         underactuation that is invisible in sim and obvious on hardware.
         """
-        return oracle_action(self.pool, self._layout, self._robot_pose(),
-                             self._action)
+        if pose is None:
+            pose = self._robot_pose()
+        return oracle_action(self.pool, self._layout, pose, self._action)
 
     def raw_scan(self):
         """What the dataset stores: raw ranges and base_link beam bearings.
@@ -498,9 +545,15 @@ class Sim2EdgeNavEnv(DirectRLEnv):
     def _get_dones(self):
         pose = self._robot_pose()
         goal = self._goal_w - self.scene.env_origins[:, :2]
-        reached = torch.linalg.vector_norm(pose[:, :2] - goal, dim=1) < 0.25
+        self._reached = (
+            torch.linalg.vector_norm(pose[:, :2] - goal, dim=1) < 0.25)
+        self._collided = ~self.pool.is_free(self._layout, pose[:, :2])
         timeout = self.episode_length_buf >= self.max_episode_length - 1
-        return reached, timeout
+        # There is no useful post-collision trajectory: collection truncates
+        # before the colliding state, and an RL episode should also end on a
+        # collision.  Resetting here avoids simulating as many as 899 steps
+        # that the collector is guaranteed to throw away.
+        return self._reached | self._collided, timeout
 
     def _get_rewards(self) -> torch.Tensor:
         """Placeholder. BC does not use it; PPO will replace this with the
