@@ -2,6 +2,8 @@
 
 import math
 from dataclasses import replace
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -62,6 +64,34 @@ def test_prefetched_corpus_yields_each_shard_once(tmp_path):
     assert all(len(shard) == 64 for _, shard in loaded)
 
 
+def test_prefetch_decompresses_multiple_shards_concurrently(tmp_path,
+                                                             monkeypatch):
+    _write_shards(tmp_path, count=6)
+    corpus = ShardCorpus(tmp_path, val_shards=1)
+    lock = threading.Lock()
+    active = peak = 0
+
+    class FakeShard:
+        def to(self, device):
+            return self
+
+    def fake_load(path, device="cpu"):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return FakeShard()
+
+    monkeypatch.setattr("sim2edge.training.data.load_shard", fake_load)
+    loaded = list(corpus.loaded(corpus.train, "cpu", workers=3,
+                                buffer_size=4))
+    assert peak >= 2
+    assert [info.path for info, _ in loaded] == [x.path for x in corpus.train]
+
+
 def test_tiny_training_run_writes_loadable_transparent_artifacts(tmp_path):
     data = tmp_path / "data"
     output = tmp_path / "run"
@@ -87,6 +117,10 @@ def test_tiny_training_run_writes_loadable_transparent_artifacts(tmp_path):
 
     # Reissuing resume after completion is idempotent, which is useful in job
     # scripts whose worker status can be lost independently of the checkpoint.
-    resumed = train_bc(data, output, config, device="cpu",
-                       resume=output / "latest.pt")
+    legacy = torch.load(output / "latest.pt", weights_only=False)
+    for key in ("prefetch_workers", "prefetch_shards"):
+        legacy["training_config"].pop(key)
+    legacy_path = output / "legacy.pt"
+    torch.save(legacy, legacy_path)
+    resumed = train_bc(data, output, config, device="cpu", resume=legacy_path)
     assert resumed["epoch"] == 1

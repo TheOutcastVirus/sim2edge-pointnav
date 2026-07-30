@@ -151,8 +151,9 @@ Progress is reported as a quality warning rather than a hard failure: collision-
 # Phase 2 — BC training
 
 The full corpus is 623 compressed shards, 124.5 million state/action pairs and
-104 GB. The trainer streams one shard to the GPU while one background thread
-inflates its successor into host RAM; it never concatenates the corpus.
+104 GB. The trainer streams one shard to the GPU while four background workers
+inflate an ordered eight-shard queue into host RAM; it never concatenates the
+corpus. The queue is bounded at roughly 2.4 GB on the 128 GB host.
 
 ## 1. Pipeline smoke test
 
@@ -173,10 +174,16 @@ directory as desired; a full run uses a different output directory.
 ```
 
 Defaults are for the 24 GB RTX 4090: batch 8192, BF16 autocast, compiled model,
-fused AdamW, one-shard prefetch and two complete corpus passes (~15,000 optimizer
-updates each). Four whole shards are held out. Training uses fresh 1x sensor and
-odometry corruption; validation reports both exact-clean and deterministic 1x
-losses.
+fused AdamW, four-worker/eight-shard prefetch and two complete corpus passes
+(~15,000 optimizer updates each). Four whole shards are held out. Training uses
+fresh 1x sensor and odometry corruption; validation reports both exact-clean and
+deterministic 1x losses.
+
+`--prefetch-workers` controls parallel NPZ decompression and
+`--prefetch-shards` bounds the ready queue. The defaults use about 2.4 GB of RAM.
+Each epoch records `train_input_wait_seconds`; if it is already near zero, more
+workers cannot improve throughput. These loader-only options may be changed when
+resuming because they do not affect sample order or optimizer state.
 
 The run directory is deliberately self-describing:
 

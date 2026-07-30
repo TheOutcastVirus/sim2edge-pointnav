@@ -1,11 +1,11 @@
 """Streaming access to a corpus of compressed demonstration shards.
 
-The collected corpus is 104 GB, while one decompressed shard is only a few
-hundred MB. The useful abstraction is therefore a shuffled stream of shards,
-not one giant ``Dataset``. One background thread decompresses the next shard
-into host RAM while the GPU trains on the current one. This overlaps the only
-meaningful CPU bottleneck without adding multiprocessing queues or duplicating
-many gigabytes of data.
+The collected corpus is 104 GB, while one decompressed shard is only about
+300 MB. The useful abstraction is therefore a shuffled stream of shards, not
+one giant ``Dataset``. A small thread pool inflates several future shards into a
+bounded RAM queue while the GPU trains on the current one. ZIP's zlib decoder
+releases the GIL, so independent shards really do decompress concurrently; a
+process pool would only add a 300 MB IPC copy per shard.
 
 Validation holds out whole shards. The collector never splits an episode across
 shards, so adjacent timesteps cannot leak across the split. It is still not a
@@ -16,11 +16,13 @@ closed-loop evaluation uses an entirely new layout seed.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
 import random
+import time
 from typing import Iterator, Sequence
 import zipfile
 
@@ -106,6 +108,10 @@ class ShardCorpus:
             train = [item for item in train if item.path in keep]
         self.train = train
         self.seed = seed
+        # Cumulative wall time spent waiting for the next decompressed shard.
+        # The trainer snapshots this around each epoch so an input bottleneck is
+        # visible in metrics rather than inferred from low GPU utilization.
+        self.input_wait_seconds = 0.0
 
         payload = self.as_dict()
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -136,29 +142,55 @@ class ShardCorpus:
         }
 
     def loaded(self, infos: Sequence[ShardInfo], device,
-               *, prefetch: bool = True) -> Iterator[tuple[ShardInfo, Shard]]:
-        """Yield shards on ``device`` while inflating one successor on CPU."""
+               *, prefetch: bool = True, workers: int = 4,
+               buffer_size: int = 8) -> Iterator[tuple[ShardInfo, Shard]]:
+        """Yield ordered shards while decompressing a bounded window in parallel.
+
+        ``workers=4, buffer_size=8`` occupies roughly 2.4 GB when the queue is
+        full--small on the 128 GB host, but deep enough to absorb variation in
+        compression ratio. Results are consumed in input order, so changing
+        worker timing cannot change training order or reproducibility.
+        """
         if not infos:
             return
         if not prefetch:
             for info in infos:
-                yield info, load_shard(info.path, device=device)
+                started = time.perf_counter()
+                shard = load_shard(info.path, device=device)
+                self.input_wait_seconds += time.perf_counter() - started
+                yield info, shard
             return
+        if workers < 1:
+            raise ValueError("prefetch workers must be positive")
+        if buffer_size < workers:
+            raise ValueError("prefetch buffer_size must be at least workers")
 
-        with ThreadPoolExecutor(max_workers=1,
-                                thread_name_prefix="shard-prefetch") as pool:
-            iterator = iter(infos)
-            current = next(iterator)
-            future = pool.submit(load_shard, current.path, "cpu")
-            while True:
-                shard = future.result()
+        pool = ThreadPoolExecutor(max_workers=workers,
+                                  thread_name_prefix="shard-prefetch")
+        pending = deque()
+        iterator = iter(infos)
+
+        def fill() -> None:
+            while len(pending) < buffer_size:
                 try:
-                    following = next(iterator)
+                    info = next(iterator)
                 except StopIteration:
-                    following = None
-                if following is not None:
-                    future = pool.submit(load_shard, following.path, "cpu")
-                yield current, shard.to(device)
-                if following is None:
                     break
-                current = following
+                pending.append((
+                    info, pool.submit(load_shard, info.path, "cpu")))
+
+        fill()
+        try:
+            while pending:
+                info, future = pending.popleft()
+                started = time.perf_counter()
+                shard = future.result()
+                self.input_wait_seconds += time.perf_counter() - started
+                # Refill before the host-to-device copy so decompression also
+                # overlaps that transfer and observation construction.
+                fill()
+                yield info, shard.to(device)
+        finally:
+            for _, future in pending:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)

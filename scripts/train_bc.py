@@ -35,6 +35,11 @@ def main() -> None:
                         default=BCConfig.compile_model)
     parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction,
                         default=BCConfig.prefetch)
+    parser.add_argument("--prefetch-workers", type=int,
+                        default=BCConfig.prefetch_workers)
+    parser.add_argument("--prefetch-shards", type=int,
+                        default=BCConfig.prefetch_shards,
+                        help="bounded number of decompressed shards held in RAM")
     parser.add_argument("--amp", choices=("bf16", "off"), default=BCConfig.amp)
     parser.add_argument("--seed", type=int, default=BCConfig.seed)
     args = parser.parse_args()
@@ -44,7 +49,8 @@ def main() -> None:
         learning_rate=args.lr, val_shards=args.val_shards,
         max_train_shards=args.max_train_shards,
         compile_model=args.compile, prefetch=args.prefetch, amp=args.amp,
-        seed=args.seed,
+        prefetch_workers=args.prefetch_workers,
+        prefetch_shards=args.prefetch_shards, seed=args.seed,
     )
     train_bc(args.data, args.out, config, device=args.device,
              resume=args.resume)

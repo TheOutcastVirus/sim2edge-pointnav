@@ -49,6 +49,8 @@ class BCConfig:
     amp: str = "bf16"
     compile_model: bool = True
     prefetch: bool = True
+    prefetch_workers: int = 4
+    prefetch_shards: int = 8
     log_every: int = 100
     checkpoint_every_shards: int = 1
     max_train_shards: int | None = None
@@ -60,6 +62,10 @@ class BCConfig:
             raise ValueError("min_learning_rate must be between zero and learning_rate")
         if self.omega_weight <= 0.0:
             raise ValueError("omega_weight must be positive")
+        if self.prefetch_workers < 1:
+            raise ValueError("prefetch_workers must be positive")
+        if self.prefetch_shards < self.prefetch_workers:
+            raise ValueError("prefetch_shards must be at least prefetch_workers")
         if self.amp not in ("bf16", "off"):
             raise ValueError("amp must be 'bf16' or 'off'")
 
@@ -147,6 +153,19 @@ def _checkpoint(policy: NavPolicy, optimizer, scheduler, config: BCConfig,
     }
 
 
+def _semantic_training_config(value: dict[str, Any]) -> dict[str, Any]:
+    """Remove throughput-only knobs before checking resume compatibility.
+
+    The first production checkpoint predates parallel prefetch. A loader tuning
+    change must remain resumable because it does not affect shard order, batch
+    seeds, numerical precision or optimizer state.
+    """
+    value = dict(value)
+    for key in ("prefetch", "prefetch_workers", "prefetch_shards"):
+        value.pop(key, None)
+    return value
+
+
 def load_policy_checkpoint(path: str | Path, device="cpu") -> NavPolicy:
     """Load an inference policy and reject a stale observation contract."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
@@ -171,7 +190,9 @@ def _validate(policy, corpus: ShardCorpus, config: BCConfig,
     totals = {scale: torch.zeros(8, device=device) for scale in scales}
 
     for info, shard in corpus.loaded(corpus.validation, device,
-                                     prefetch=config.prefetch):
+                                     prefetch=config.prefetch,
+                                     workers=config.prefetch_workers,
+                                     buffer_size=config.prefetch_shards):
         for tier, scale in enumerate(scales):
             generator = _generator(
                 device, _batch_seed(config.seed, 0, info, tier + 1))
@@ -260,7 +281,8 @@ def train_bc(data: str | Path, output: str | Path,
             raise ValueError("resume checkpoint uses a different spec")
         if saved.get("dataset_digest") != corpus.digest:
             raise ValueError("resume checkpoint uses a different dataset split")
-        if saved.get("training_config") != asdict(config):
+        if (_semantic_training_config(saved.get("training_config", {}))
+                != _semantic_training_config(asdict(config))):
             raise ValueError("resume requires the original training configuration")
         policy.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -291,6 +313,12 @@ def train_bc(data: str | Path, output: str | Path,
     print(f"[BC] device={device_obj}  parameters={policy.parameter_count:,}  "
           f"batch={config.batch_size:,}  amp={config.amp}  "
           f"compile={config.compile_model}")
+    if config.prefetch:
+        print(f"[BC] input prefetch={config.prefetch_workers} workers / "
+              f"{config.prefetch_shards} buffered shards "
+              f"(~{config.prefetch_shards * 0.3:.1f} GB RAM ceiling)")
+    else:
+        print("[BC] input prefetch=off")
     print(f"[BC] train={len(corpus.train)} shards / "
           f"{corpus.train_samples:,} samples  validation="
           f"{len(corpus.validation)} shards / {corpus.validation_samples:,} "
@@ -303,6 +331,7 @@ def train_bc(data: str | Path, output: str | Path,
     latest = output / "latest.pt"
     run_started = time.perf_counter()
     for epoch in range(start_epoch, config.epochs):
+        epoch_started = time.perf_counter()
         order = corpus.train_order(epoch)
         cursor = start_cursor if epoch == start_epoch else 0
         order = order[cursor:]
@@ -310,9 +339,12 @@ def train_bc(data: str | Path, output: str | Path,
         epoch_sum = torch.zeros(8, device=device_obj)
         window_sum = torch.zeros(8, device=device_obj)
         window_started = time.perf_counter()
+        input_wait_started = corpus.input_wait_seconds
 
         for local_index, (info, shard) in enumerate(
-                corpus.loaded(order, device_obj, prefetch=config.prefetch)):
+                corpus.loaded(order, device_obj, prefetch=config.prefetch,
+                              workers=config.prefetch_workers,
+                              buffer_size=config.prefetch_shards)):
             shard_index = cursor + local_index
             generator = _generator(
                 device_obj, _batch_seed(config.seed, epoch, info))
@@ -360,7 +392,11 @@ def train_bc(data: str | Path, output: str | Path,
                     best_validation=best_validation)
                 _atomic_torch_save(saved, latest)
 
+        train_input_wait = corpus.input_wait_seconds - input_wait_started
+        validation_wait_started = corpus.input_wait_seconds
         validation = _validate(runner, corpus, config, device_obj)
+        validation_input_wait = (
+            corpus.input_wait_seconds - validation_wait_started)
         epoch_values = epoch_sum.double().cpu().numpy()
         sample_count = max(1.0, epoch_values[7])
         record = {
@@ -375,6 +411,9 @@ def train_bc(data: str | Path, output: str | Path,
             "train_omega_saturation": float(epoch_values[6] / sample_count),
             "learning_rate": scheduler.get_last_lr()[0],
             "elapsed_seconds": time.perf_counter() - run_started,
+            "epoch_seconds": time.perf_counter() - epoch_started,
+            "train_input_wait_seconds": train_input_wait,
+            "validation_input_wait_seconds": validation_input_wait,
             **validation,
         }
         with metrics_path.open("a") as stream:
@@ -382,6 +421,9 @@ def train_bc(data: str | Path, output: str | Path,
         print("[BC] epoch summary  " + "  ".join(
             f"{key}={value:.5f}" for key, value in record.items()
             if key.endswith("loss")))
+        print(f"[BC] input wait  train={train_input_wait:.1f}s  "
+              f"validation={validation_input_wait:.1f}s  "
+              f"of {record['epoch_seconds']:.1f}s epoch wall time")
 
         clean = float(validation.get(
             "validation_clean_loss", record["train_loss"]))
