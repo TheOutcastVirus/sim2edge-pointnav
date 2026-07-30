@@ -1,6 +1,7 @@
 """Collect behaviour-cloning demonstrations in Isaac Lab.
 
-    ~/isaac-venv/bin/python scripts/collect_bc.py --num_envs 256 --episodes 2000
+    ~/isaac-venv/bin/python scripts/collect_bc.py --num_envs 8192 \
+        --episodes 65536 --num_layouts 8192 --out data/bc_diverse_v1
 
 Bring it up in the order in ``docs/RUNBOOK.md`` -- each step isolates a
 different failure. ``--num_envs 4 --gui --check`` is the first one.
@@ -11,6 +12,11 @@ Raw measurements only: ranges as the sensor reported them, beam bearings in
 base_link, true poses, and the oracle's **commanded** ``(v, omega)``. Noise and
 binning happen in the loader, so retuning either does not invalidate a run that
 took hours.
+
+By default, whole layouts are routed to separate ``train/`` and ``validation/``
+directories. Each layout has several feasible start positions and every reset
+gets a fresh yaw. This keeps geometry construction affordable without repeating
+the same fixed navigation task hundreds of times.
 
 Two label conventions that look like details and are not:
 
@@ -28,6 +34,8 @@ recovery behaviour at all.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 import os
 import signal
 import sys
@@ -44,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--episodes", type=int, default=2000,
                     help="episode prefixes to retain, not episodes attempted")
     ap.add_argument("--num_layouts", type=int, default=512)
+    ap.add_argument("--starts_per_layout", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=Path("data"))
     ap.add_argument("--shard_steps", type=int, default=200_000,
@@ -52,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="execution noise as a fraction of each axis limit. "
                          "0 collects pure on-policy expert data, which is the "
                          "distribution BC fails on -- see the module docstring")
+    ap.add_argument("--validation_fraction", type=float, default=0.05,
+                    help="fraction of layout IDs routed to validation/; 0 keeps "
+                         "the legacy single-directory format")
+    ap.add_argument("--writer_queue", type=int, default=2,
+                    help="completed shards allowed in the asynchronous writer; "
+                         "each costs roughly 300 MB decompressed")
     filtering = ap.add_mutually_exclusive_group()
     filtering.add_argument(
         "--filter-failures", action="store_true",
@@ -74,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if not 0.0 <= args.validation_fraction < 1.0:
+        raise ValueError("--validation_fraction must be in [0, 1)")
+    if args.starts_per_layout < 1 or args.writer_queue < 1:
+        raise ValueError("starts_per_layout and writer_queue must be positive")
 
     # Line-buffer stdout. Redirected to a file it is block-buffered, so progress
     # lines sit in the buffer until exit -- and a run whose shutdown wedges never
@@ -97,6 +116,7 @@ def main() -> None:
     cfg = NavEnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.num_layouts = args.num_layouts
+    cfg.starts_per_layout = args.starts_per_layout
     cfg.layout_seed = args.seed
     cfg.seed = args.seed
     cfg.collection_mode = True
@@ -135,7 +155,12 @@ def main() -> None:
     collector = Collector(args.out, args.shard_steps, args.num_envs,
                           max_steps=int(env.max_episode_length),
                           n_beams=int(env._beam_angles.shape[0]),
-                          device=device)
+                          device=device, layout_seed=args.seed,
+                          num_layouts=args.num_layouts,
+                          starts_per_layout=args.starts_per_layout,
+                          sigma=args.sigma,
+                          validation_fraction=args.validation_fraction,
+                          writer_queue=args.writer_queue)
     step = 0
     # Wall-clock per control step, split so the bottleneck is attributable
     # rather than inferred. `sim` covers observation + oracle + env.step;
@@ -168,8 +193,10 @@ def main() -> None:
                                   prev_action=env._action)
 
         _t = time.perf_counter()
-        collector.record(ranges, pose, env._goal_w - env.scene.env_origins[:, :2],
-                         label, env._action)
+        collector.record(
+            ranges, pose, env._goal_w - env.scene.env_origins[:, :2],
+            label, env._action, env._layout, env._start_id,
+            env._optimal_path_m)
         t_rec += time.perf_counter() - _t
 
         _, _, terminated, truncated, _ = env.step(normalize_action(executed))
@@ -182,7 +209,7 @@ def main() -> None:
         step += 1
         if step % 50 == 0:
             wall = time.perf_counter() - t0
-            t_sim = wall - t_rec - collector.write_seconds
+            t_sim = wall - t_rec - collector.write_wait_seconds
             useful = collector.steps_kept / wall
             print(f"step {step:6d}  kept {collector.episodes_kept:5d} "
                   f"(full {collector.kept_complete:5d} "
@@ -192,11 +219,14 @@ def main() -> None:
                   f"| {wall / step * 1000:6.1f} ms/step "
                   f"(sim {t_sim / step * 1000:6.1f}  "
                   f"rec {t_rec / step * 1000:5.1f}  "
-                  f"write {collector.write_seconds / step * 1000:5.1f})  "
+                  f"writer-wait {collector.write_wait_seconds / step * 1000:5.1f})  "
                   f"| {args.num_envs * step / wall:7.0f} env-steps/s  "
                   f"{useful:7.0f} kept-samples/s")
 
     collector.close(angles)
+    print(f"[collect] async writer busy {collector.writer.worker_seconds:.1f}s; "
+          f"simulation blocked on it for {collector.write_wait_seconds:.1f}s",
+          flush=True)
     if stopping["now"]:
         print("[collect] stopped early by request")
     attempts = collector.episodes_kept + collector.episodes_dropped
@@ -241,6 +271,68 @@ def _finish(simulation_app) -> None:
     os._exit(0)
 
 
+class AsyncShardWriter:
+    """One compression worker with bounded, failure-propagating backpressure.
+
+    NPZ deflate is CPU work and used to stop the simulation for roughly a
+    second every shard. A single worker overlaps that work with GPU simulation;
+    the bounded future queue caps transient RAM. If storage falls behind, only
+    ``submit`` blocks, and that wait is reported separately from writer work.
+    """
+
+    def __init__(self, max_pending: int = 2):
+        if max_pending < 1:
+            raise ValueError("writer_queue must be positive")
+        self.max_pending = max_pending
+        self._pool = ThreadPoolExecutor(max_workers=1,
+                                        thread_name_prefix="shard-writer")
+        self._futures = deque()
+        self.wait_seconds = 0.0
+        self.worker_seconds = 0.0
+
+    @staticmethod
+    def _write(path, episodes, angles, metadata):
+        from sim2edge.dataset import save_shard
+
+        started = time.perf_counter()
+        cat = lambda key: np.concatenate([episode[key] for episode in episodes])
+        save_shard(
+            path, ranges=cat("ranges"), angles=angles,
+            pose=cat("pose"), goal=cat("goal"), action=cat("action"),
+            prev_action=cat("prev_action"), episode=cat("episode"),
+            layout=cat("layout"), start_id=cat("start_id"),
+            path_length=cat("path_length"), outcome=cat("outcome"),
+            **metadata,
+        )
+        return path, sum(len(episode["episode"]) for episode in episodes), \
+            time.perf_counter() - started
+
+    def _reap(self, *, block: bool) -> None:
+        while self._futures and (block or self._futures[0].done()):
+            future = self._futures.popleft()
+            started = time.perf_counter()
+            path, steps, elapsed = future.result()  # re-raises worker failures
+            self.wait_seconds += time.perf_counter() - started
+            self.worker_seconds += elapsed
+            print(f"  wrote {path} ({steps} steps in {elapsed:.1f} s, async)",
+                  flush=True)
+            block = False
+
+    def submit(self, path, episodes, angles, metadata) -> None:
+        self._reap(block=False)
+        if len(self._futures) >= self.max_pending:
+            self._reap(block=True)
+        self._futures.append(self._pool.submit(
+            self._write, path, episodes, angles, metadata))
+
+    def close(self) -> None:
+        try:
+            while self._futures:
+                self._reap(block=True)
+        finally:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+
+
 class Collector:
     """Fixed-size per-environment buffers, flushed to shards on episode end.
 
@@ -267,17 +359,33 @@ class Collector:
     MIN_PROGRESS_M = 0.5
 
     def __init__(self, out: Path, shard_steps: int, num_envs: int,
-                 max_steps: int, n_beams: int, device):
+                 max_steps: int, n_beams: int, device, *, layout_seed: int = 0,
+                 num_layouts: int = 0, starts_per_layout: int = 1,
+                 sigma: float = 0.0, validation_fraction: float = 0.0,
+                 writer_queue: int = 2):
         self.out, self.shard_steps, self.device = out, shard_steps, device
         self.num_envs, self.max_steps = num_envs, max_steps
+        if not 0.0 <= validation_fraction < 1.0:
+            raise ValueError("validation_fraction must be in [0, 1)")
+        if validation_fraction and num_layouts < 2:
+            raise ValueError("layout validation split needs at least two layouts")
+        self.layout_seed = layout_seed
+        self.num_layouts = num_layouts
+        self.starts_per_layout = starts_per_layout
+        self.sigma = sigma
+        self.validation_fraction = validation_fraction
 
         self.b_ranges = np.zeros((num_envs, max_steps, n_beams), np.float16)
         self.b_pose = np.zeros((num_envs, max_steps, 3), np.float32)
         self.b_goal = np.zeros((num_envs, max_steps, 2), np.float32)
         self.b_action = np.zeros((num_envs, max_steps, 2), np.float32)
         self.b_prev = np.zeros((num_envs, max_steps, 2), np.float32)
+        self.b_layout = np.zeros((num_envs, max_steps), np.int32)
+        self.b_start_id = np.zeros((num_envs, max_steps), np.uint16)
+        self.b_path_length = np.zeros((num_envs, max_steps), np.float32)
         nbytes = sum(a.nbytes for a in (self.b_ranges, self.b_pose, self.b_goal,
-                                        self.b_action, self.b_prev))
+                                        self.b_action, self.b_prev, self.b_layout,
+                                        self.b_start_id, self.b_path_length))
         print(f"[collect] recorder buffers: {nbytes / 1e9:.2f} GB "
               f"({num_envs} envs x {max_steps} steps x {n_beams} beams), fixed",
               flush=True)
@@ -291,28 +399,76 @@ class Collector:
         self.dropped_short = self.dropped_no_progress = 0
         self.steps_kept = self.steps_dropped = 0
         self.kept_short = self.kept_no_progress = 0
-        self.write_seconds = 0.0
         self.filter_failures = False
-        self.pending: list[dict] = []
-        self.pending_steps = 0
+        self.writer = AsyncShardWriter(writer_queue)
+
+        if validation_fraction:
+            count = min(num_layouts - 1,
+                        max(1, round(num_layouts * validation_fraction)))
+            rng = np.random.default_rng(layout_seed ^ 0xA11CE)
+            self.validation_layout_ids = np.sort(
+                rng.choice(num_layouts, size=count, replace=False).astype(np.int32))
+            self._is_validation = np.zeros(num_layouts, dtype=np.bool_)
+            self._is_validation[self.validation_layout_ids] = True
+            self._stream_names = ("train", "validation")
+            print(f"[collect] layout split: {num_layouts - count} train / "
+                  f"{count} validation layouts", flush=True)
+        else:
+            self.validation_layout_ids = np.empty(0, np.int32)
+            self._is_validation = np.zeros(max(1, num_layouts), dtype=np.bool_)
+            self._stream_names = ("",)
+        self._pending = {name: [] for name in self._stream_names}
+        self._pending_steps = {name: 0 for name in self._stream_names}
 
         # Resume rather than clobber: a fresh run used to restart numbering at
         # bc_000 and overwrite an earlier run's shards in place.
         out.mkdir(parents=True, exist_ok=True)
-        existing = sorted(out.glob("bc_*.npz"))
-        self.shards_written = (
-            1 + max(int(f.stem.split("_")[1]) for f in existing) if existing else 0)
-        if existing:
-            print(f"[collect] {len(existing)} shard(s) already in {out}; "
-                  f"appending from bc_{self.shards_written:03d}", flush=True)
+        self._next_shard = {}
+        for name in self._stream_names:
+            directory = out / name if name else out
+            directory.mkdir(parents=True, exist_ok=True)
+            existing = sorted(directory.glob("bc_*.npz"))
+            next_index = (1 + max(int(f.stem.split("_")[1]) for f in existing)
+                          if existing else 0)
+            self._next_shard[name] = next_index
+            if existing:
+                print(f"[collect] {len(existing)} shard(s) already in "
+                      f"{directory}; appending from bc_{next_index:03d}",
+                      flush=True)
 
     # ── per-step, O(1) Python ───────────────────────────────────────────────
 
-    def record(self, ranges, pose, goal, label, prev_action):
+    @property
+    def pending(self):
+        """Legacy single-stream view retained for recorder unit tests."""
+        return self._pending[self._stream_names[0]]
+
+    @property
+    def pending_steps(self) -> int:
+        return sum(self._pending_steps.values())
+
+    @property
+    def shards_written(self) -> int:
+        return sum(self._next_shard.values())
+
+    @property
+    def write_wait_seconds(self) -> float:
+        return self.writer.wait_seconds
+
+    def record(self, ranges, pose, goal, label, prev_action, layout=None,
+               start_id=None, path_length=None):
         """Two host transfers total, then one vectorized scatter."""
         t = self.t
         room = t < self.max_steps                    # ignore overflow, if any
         i, j = self.env_idx[room], t[room]
+
+        torch = __import__("torch")
+        if layout is None:
+            layout = torch.zeros(self.num_envs, device=pose.device)
+        if start_id is None:
+            start_id = torch.zeros(self.num_envs, device=pose.device)
+        if path_length is None:
+            path_length = torch.zeros(self.num_envs, device=pose.device)
 
         # .half() is a Tensor method, so this needs no module-level torch
         # (which main() imports only after AppLauncher). Casting on device
@@ -322,12 +478,17 @@ class Collector:
         # each field separately introduced four CUDA synchronizations per
         # control tick; the scan transfer is the only other synchronization.
         features = np.asarray(
-            __import__("torch").cat((pose, goal, label, prev_action), dim=1)
-            .cpu())
+            torch.cat((pose, goal, label, prev_action,
+                       layout[:, None].to(pose.dtype),
+                       start_id[:, None].to(pose.dtype),
+                       path_length[:, None].to(pose.dtype)), dim=1).cpu())
         self.b_pose[i, j] = features[room, :3]
         self.b_goal[i, j] = features[room, 3:5]
         self.b_action[i, j] = features[room, 5:7]
         self.b_prev[i, j] = features[room, 7:9]
+        self.b_layout[i, j] = features[room, 9].astype(np.int32)
+        self.b_start_id[i, j] = features[room, 10].astype(np.uint16)
+        self.b_path_length[i, j] = features[room, 11]
         self.t[room] += 1
 
     # ── episode end ─────────────────────────────────────────────────────────
@@ -352,7 +513,7 @@ class Collector:
                 self.steps_dropped += upto
             elif upto:
                 outcome = 1 if collided[i] else (0 if reached[i] else 2)
-                self._emit(i, upto, outcome)
+                stream = self._emit(i, upto, outcome)
                 self.steps_kept += upto
                 self.kept_short += int(too_short)
                 self.kept_no_progress += int(no_progress)
@@ -368,26 +529,34 @@ class Collector:
                 # Check after each episode, not after an entire synchronized
                 # reset wave.  At 8192 envs the old placement overshot a 200k
                 # target by millions of samples and caused a large copy spike.
-                if self.pending_steps >= self.shard_steps:
-                    self._write(angles)
+                if self._pending_steps[stream] >= self.shard_steps:
+                    self._queue_write(stream, angles)
 
             self.t[i] = 0
 
-    def _emit(self, i: int, upto: int, outcome: int) -> None:
-        self.pending.append({
+    def _emit(self, i: int, upto: int, outcome: int) -> str:
+        layout_id = int(self.b_layout[i, 0])
+        stream = ("validation" if self.validation_fraction
+                  and self._is_validation[layout_id] else
+                  ("train" if self.validation_fraction else ""))
+        self._pending[stream].append({
             "ranges": self.b_ranges[i, :upto].copy(),
             "pose": self.b_pose[i, :upto].copy(),
             "goal": self.b_goal[i, :upto].copy(),
             "action": self.b_action[i, :upto].copy(),
             "prev_action": self.b_prev[i, :upto].copy(),
+            "layout": self.b_layout[i, :upto].copy(),
+            "start_id": self.b_start_id[i, :upto].copy(),
+            "path_length": self.b_path_length[i, :upto].copy(),
             "episode": np.full(upto, self.episode_id, np.int32),
             # 0 reached, 1 collision, 2 timeout.  Keeping this per sample is a
             # small cost and makes every independently loaded shard self-
             # describing even when an episode straddles no external index.
             "outcome": np.full(upto, outcome, np.uint8),
         })
-        self.pending_steps += upto
+        self._pending_steps[stream] += upto
         self.episode_id += 1
+        return stream
 
     @property
     def episodes_kept(self) -> int:
@@ -397,28 +566,35 @@ class Collector:
     def episodes_dropped(self) -> int:
         return self.dropped_short + self.dropped_no_progress
 
-    def _write(self, angles):
-        from sim2edge.dataset import save_shard
-
-        started = time.perf_counter()
-        path = self.out / f"bc_{self.shards_written:03d}.npz"
-        cat = lambda k: np.concatenate([e[k] for e in self.pending])
-        save_shard(path, ranges=cat("ranges"), angles=angles.cpu().numpy(),
-                   pose=cat("pose"), goal=cat("goal"), action=cat("action"),
-                   prev_action=cat("prev_action"), episode=cat("episode"),
-                   outcome=cat("outcome"),
-                   filter_failures=np.array(self.filter_failures, dtype=np.bool_))
-        self.total_steps += self.pending_steps
-        self.shards_written += 1
-        elapsed = time.perf_counter() - started
-        self.write_seconds += elapsed
-        print(f"  wrote {path} ({self.pending_steps} steps in {elapsed:.1f} s)",
-              flush=True)
-        self.pending, self.pending_steps = [], 0
+    def _queue_write(self, stream: str, angles) -> None:
+        episodes = self._pending[stream]
+        steps = self._pending_steps[stream]
+        if not episodes:
+            return
+        directory = self.out / stream if stream else self.out
+        path = directory / f"bc_{self._next_shard[stream]:03d}.npz"
+        metadata = {
+            "filter_failures": np.array(self.filter_failures, dtype=np.bool_),
+            "layout_seed": np.array(self.layout_seed, dtype=np.int64),
+            "num_layouts": np.array(self.num_layouts, dtype=np.int32),
+            "starts_per_layout": np.array(self.starts_per_layout, dtype=np.int32),
+            "sigma": np.array(self.sigma, dtype=np.float32),
+            "validation_fraction": np.array(
+                self.validation_fraction, dtype=np.float32),
+            "validation_layout_ids": self.validation_layout_ids,
+            "split": np.array(stream or "unsplit"),
+        }
+        angle_array = angles.detach().cpu().numpy().copy()
+        self.writer.submit(path, episodes, angle_array, metadata)
+        self.total_steps += steps
+        self._next_shard[stream] += 1
+        self._pending[stream] = []
+        self._pending_steps[stream] = 0
 
     def close(self, angles):
-        if self.pending:
-            self._write(angles)
+        for stream in self._stream_names:
+            self._queue_write(stream, angles)
+        self.writer.close()
 
 
 def frame_env0(env) -> None:

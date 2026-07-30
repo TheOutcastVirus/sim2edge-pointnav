@@ -30,6 +30,9 @@ def _raw(seed=0):
         action=np.stack([g.uniform(0, V_MAX, T), g.uniform(-OMEGA_MAX, OMEGA_MAX, T)], 1),
         prev_action=np.stack([g.uniform(0, V_MAX, T), g.uniform(-OMEGA_MAX, OMEGA_MAX, T)], 1),
         episode=g.integers(0, 4, T),
+        layout=g.integers(0, 8, T, dtype=np.int32),
+        start_id=g.integers(0, 32, T, dtype=np.uint16),
+        path_length=g.uniform(3.0, 8.0, T).astype(np.float32),
     )
 
 
@@ -100,6 +103,9 @@ def test_save_load_preserves_the_raw_quantities(tmp_path):
     assert np.allclose(got.ranges.float().numpy(), raw["ranges"], atol=6e-3)
     assert np.allclose(got.pose.numpy(), raw["pose"], atol=1e-5)
     assert np.allclose(got.action.numpy(), raw["action"], atol=1e-5)
+    assert np.array_equal(got.layout.numpy(), raw["layout"])
+    assert np.array_equal(got.start_id.numpy(), raw["start_id"])
+    assert np.allclose(got.path_length.numpy(), raw["path_length"])
 
 
 def test_stored_ranges_are_raw_not_preprocessed(shard):

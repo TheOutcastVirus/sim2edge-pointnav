@@ -17,7 +17,7 @@ from sim2edge.training import (BCConfig, ShardCorpus, load_policy_checkpoint,
 from sim2edge.training.bc import imitation_loss
 
 
-def _write_shards(root, count=5, steps=64, beams=90):
+def _write_shards(root, count=5, steps=64, beams=90, layout_offset=0):
     rng = np.random.default_rng(42)
     angles = np.linspace(0, 2 * math.pi, beams, endpoint=False)
     for shard_index in range(count):
@@ -34,6 +34,12 @@ def _write_shards(root, count=5, steps=64, beams=90):
             ranges=rng.uniform(0.3, 5.0, (steps, beams)), angles=angles,
             pose=pose, goal=goal, action=action, prev_action=previous,
             episode=episode, outcome=np.zeros(steps, np.uint8),
+            layout=np.full(steps, layout_offset + shard_index, np.int32),
+            start_id=np.zeros(steps, np.uint16),
+            path_length=np.full(steps, 2.0, np.float32),
+            layout_seed=np.array(42, np.int64),
+            split=np.array(root.name if root.name in ("train", "validation")
+                           else "unsplit"),
         )
 
 
@@ -54,6 +60,19 @@ def test_corpus_split_is_deterministic_and_whole_shard(tmp_path):
     assert {x.path for x in first.train}.isdisjoint(
         {x.path for x in first.validation})
     assert first.train_samples == 3 * 64
+
+
+def test_explicit_layout_split_takes_precedence_over_shard_holdout(tmp_path):
+    _write_shards(tmp_path / "train", count=3, layout_offset=0)
+    _write_shards(tmp_path / "validation", count=2, layout_offset=100)
+    corpus = ShardCorpus(tmp_path, val_shards=99, seed=7)
+    assert corpus.explicit_split
+    assert len(corpus.train) == 3
+    assert len(corpus.validation) == 2
+    assert all(item.path.parent.name == "train" for item in corpus.train)
+    assert all(item.path.parent.name == "validation"
+               for item in corpus.validation)
+    assert corpus.as_dict()["split"] == "layout"
 
 
 def test_prefetched_corpus_yields_each_shard_once(tmp_path):

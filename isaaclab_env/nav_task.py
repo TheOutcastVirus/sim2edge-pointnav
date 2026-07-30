@@ -65,8 +65,8 @@ except ImportError as exc:                       # pragma: no cover
 from sim2edge import rooms as rooms_mod
 from sim2edge.oracle import LayoutPool, oracle_action
 from sim2edge.preprocess import bin_lidar, build_observation, goal_features
-from sim2edge.rooms import MAX_OBSTACLES, sample_room
-from sim2edge.spec import (DT, GOAL_MAX_M, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
+from sim2edge.rooms import MAX_OBSTACLES, sample_room, sample_start_positions
+from sim2edge.spec import (DT, GOAL_MAX_M, GOAL_TOLERANCE_M, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
                            LIDAR_MOUNT_YAW, OBS_DIM, OMEGA_MAX, ROBOT_RADIUS_M,
                            V_MAX)
 
@@ -289,11 +289,11 @@ class NavEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     ) if _HAVE_ISAACLAB else None
 
-    #: How many distinct layouts to build. Diversity is pool size times
-    #: start/goal sampling, which is cheap; unique geometry per environment is
-    #: not, because it is a proportional number of USD prims.
+    #: How many distinct obstacle/goal/flow-field layouts to build. Each layout
+    #: has several feasible starts and reset samples yaw independently.
     num_layouts: int = 512
     layout_seed: int = 0
+    starts_per_layout: int = 32
 
     #: Collection consumes raw scans and oracle labels, not policy
     #: observations.  Avoid binning 720 rays into an observation that the
@@ -332,6 +332,8 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         # Per-env episode state.
         n = self.num_envs
         self._layout = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._start_id = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._optimal_path_m = torch.zeros(n, device=self.device)
         self._goal_w = torch.zeros(n, 2, device=self.device)
         # The last physical command issued. One buffer serves two readers: the
         # observation's last-action input, and the oracle's rate limiter. They
@@ -401,8 +403,18 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._obstacle_pos = stack("pos", torch.float32)     # (P, S, 2)
         self._obstacle_yaw = stack("yaw", torch.float32)     # (P, S)
         self._obstacle_valid = stack("valid", torch.bool)    # (P, S)
-        self._room_start = stack("start", torch.float32)     # (P, 3)
         self._room_goal = stack("goal", torch.float32)       # (P, 2)
+        # Geometry, goal and flow are the expensive objects. Starts are cheap:
+        # every reachable cell already has a route to this layout's goal.
+        start_rng = np.random.default_rng(self.cfg.layout_seed ^ 0x5EED5EED)
+        starts = [sample_start_positions(
+            room, start_rng, self.cfg.starts_per_layout) for room in self._rooms]
+        self._room_starts = torch.tensor(
+            np.stack(starts), device=self.device, dtype=torch.float32)
+        path_lengths = [[room.path_length_from(xy) for xy in candidates]
+                        for room, candidates in zip(self._rooms, starts)]
+        self._room_path_length = torch.tensor(
+            path_lengths, device=self.device, dtype=torch.float32)
 
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
@@ -432,9 +444,17 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         )
         self._write_obstacle_poses(env_ids, world, yaw)
 
-        # Robot pose. The start is guaranteed to have robot-radius clearance by
-        # construction in rooms.sample_room, so no rejection is needed here.
-        start = self._room_start[layout]
+        # Robot pose. Position is sampled from a reusable feasible table; yaw is
+        # fresh every episode. The old fixed start/yaw turned 500k episodes into
+        # repetitions of only 512 task templates and produced 95% memorized / 37%
+        # held-out success.
+        start_id = torch.randint(
+            0, self.cfg.starts_per_layout, (n,), device=self.device)
+        self._start_id[env_ids] = start_id
+        start = torch.empty(n, 3, device=self.device)
+        start[:, :2] = self._room_starts[layout, start_id]
+        start[:, 2] = torch.rand(n, device=self.device) * (2.0 * math.pi)
+        self._optimal_path_m[env_ids] = self._room_path_length[layout, start_id]
         root = self.robot.data.default_root_state[env_ids].clone()
         root[:, :2] = start[:, :2] + origins[:, :2]
         root[:, 2] = origins[:, 2] + 0.05
@@ -579,7 +599,8 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         pose = self._robot_pose()
         goal = self._goal_w - self.scene.env_origins[:, :2]
         self._reached = (
-            torch.linalg.vector_norm(pose[:, :2] - goal, dim=1) < 0.25)
+            torch.linalg.vector_norm(pose[:, :2] - goal, dim=1)
+            < GOAL_TOLERANCE_M)
         self._collided = ~self.pool.is_free(self._layout, pose[:, :2])
         timeout = self.episode_length_buf >= self.max_episode_length - 1
         # There is no useful post-collision trajectory: collection truncates

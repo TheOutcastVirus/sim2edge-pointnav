@@ -196,6 +196,26 @@ def test_start_yaw_is_a_valid_heading(sampled):
         assert 0.0 <= room.start[2] < 2 * np.pi
 
 
+def test_start_candidate_table_is_feasible_and_diverse(sampled):
+    for index, room in enumerate(sampled):
+        starts = rooms.sample_start_positions(
+            room, np.random.default_rng(index), count=32)
+        assert starts.shape == (32, 2)
+        assert len(np.unique(starts, axis=0)) > 1
+        for xy in starts:
+            r, c = grids.world_to_cell(xy[0], xy[1], room.res)
+            assert room.clearance[r, c] >= (
+                ROBOT_RADIUS_M + rooms.SPAWN_CLEARANCE_M)
+            assert rooms.GOAL_MIN_DIST_M <= room.path_length_from(xy) <= GOAL_MAX_M
+
+
+def test_start_candidates_are_seed_reproducible(sampled):
+    room = sampled[0]
+    a = rooms.sample_start_positions(room, np.random.default_rng(99), 16)
+    b = rooms.sample_start_positions(room, np.random.default_rng(99), 16)
+    assert np.array_equal(a, b)
+
+
 # ── reproducibility ──────────────────────────────────────────────────────────
 
 def test_same_seed_gives_the_same_layout():

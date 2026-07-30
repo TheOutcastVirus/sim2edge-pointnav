@@ -46,14 +46,19 @@ class Shard:
     action: torch.Tensor        # (T, 2) float32 oracle command
     prev_action: torch.Tensor   # (T, 2) float32 command issued the tick before
     episode: torch.Tensor       # (T,)   int32   episode id, for splitting
+    layout: torch.Tensor | None = None      # (T,) int32, stable within layout_seed
+    start_id: torch.Tensor | None = None    # (T,) int32 candidate within layout
+    path_length: torch.Tensor | None = None # (T,) float32 geodesic start->goal
 
     def __len__(self) -> int:
         return self.ranges.shape[0]
 
     def to(self, device) -> "Shard":
         for f in ("ranges", "angles", "pose", "goal", "action", "prev_action",
-                  "episode"):
-            setattr(self, f, getattr(self, f).to(device))
+                  "episode", "layout", "start_id", "path_length"):
+            value = getattr(self, f)
+            if value is not None:
+                setattr(self, f, value.to(device))
         return self
 
     def batches(self, batch_size: int, noise_scale: float = 1.0,
@@ -152,8 +157,12 @@ def load_shard(path, device="cpu") -> Shard:
             )
         t = lambda k, d=torch.float32: torch.from_numpy(z[k]).to(
             device=device, dtype=d)
+        optional = lambda k, d: (t(k, d) if k in z.files else None)
         return Shard(
             ranges=t("ranges", torch.float16), angles=t("angles"), pose=t("pose"),
             goal=t("goal"), action=t("action"), prev_action=t("prev_action"),
             episode=t("episode", torch.int32),
+            layout=optional("layout", torch.int32),
+            start_id=optional("start_id", torch.int32),
+            path_length=optional("path_length", torch.float32),
         )

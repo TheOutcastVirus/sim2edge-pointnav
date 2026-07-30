@@ -47,11 +47,15 @@ def main() -> None:
     shard = load_shard(args.shard)          # raises on fingerprint mismatch
     with np.load(args.shard, allow_pickle=False) as raw:
         outcome = raw["outcome"] if "outcome" in raw.files else None
+        split = str(raw["split"]) if "split" in raw.files else "legacy"
+        layout_seed = (int(raw["layout_seed"])
+                       if "layout_seed" in raw.files else None)
     n = len(shard)
     ep = shard.episode.numpy()
     ids = np.unique(ep)
 
     print(f"\nspec fingerprint {fingerprint()}   steps {n}   episodes {len(ids)}")
+    print(f"dataset split {split}   layout seed {layout_seed}")
 
     # ── structure ───────────────────────────────────────────────────────────
     print("\nstructure")
@@ -64,6 +68,17 @@ def main() -> None:
           "pose and goal shapes")
     check(shard.action.shape == (n, 2) and shard.prev_action.shape == (n, 2),
           "action shapes")
+    if shard.layout is not None:
+        check(shard.start_id is not None and shard.path_length is not None,
+              "task provenance fields travel together")
+        layout = shard.layout.numpy()
+        starts = shard.start_id.numpy()
+        one_task = all(np.unique(layout[ep == e]).size == 1
+                       and np.unique(starts[ep == e]).size == 1 for e in ids)
+        check(one_task, "one layout/start identity per episode")
+        print(f"         {np.unique(layout).size} unique layouts, "
+              f"{np.unique(np.stack((layout, starts), axis=1), axis=0).shape[0]} "
+              f"unique layout/start pairs")
 
     # ── the shard holds RAW data, not observations ──────────────────────────
     print("\nraw storage (so a spec change does not invalidate the run)")

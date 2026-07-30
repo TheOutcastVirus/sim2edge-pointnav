@@ -93,21 +93,41 @@ viewport is unreadable.
 
 ```bash
 ~/isaac-venv/bin/python scripts/collect_bc.py \
-    --num_envs 512 --episodes 500000 --num_layouts 512 --seed 24680 \
-    --sigma 0.15 --out data/overnight
+    --num_envs 8192 \
+    --episodes 65536 \
+    --num_layouts 8192 \
+    --starts_per_layout 32 \
+    --validation_fraction 0.05 \
+    --seed 13579 \
+    --sigma 0.15 \
+    --out data/bc_diverse_v1
 ```
 
-Appends after any existing `bc_*.npz` in `--out`. Pre-collision prefixes are retained by default; add `--filter-failures` only for the legacy progress filter. `Ctrl-C` writes buffered
-episodes and exits cleanly; a second `Ctrl-C` abandons them.
+This creates `data/bc_diverse_v1/train/` and `validation/`. The split owns whole
+layout IDs, so offline validation measures layout generalization instead of
+seeing new episodes from training geometry. Each layout supplies 32 feasible
+start positions and reset samples a fresh yaw, producing up to 262,144 distinct
+layout/start tasks before yaw variation. The earlier 500k-episode corpus reused
+only 512 fixed layout/start/yaw templates and should not be used for the new
+baseline.
+
+Collection appends after existing `bc_*.npz` files in each split directory.
+Use a clean output directory when changing the seed or collection parameters;
+the collector never overwrites prior shards. Pre-collision prefixes are retained
+by default; add `--filter-failures` only for the legacy progress filter. `Ctrl-C`
+writes buffered episodes and exits cleanly; a second `Ctrl-C` abandons them.
 
 Progress line:
 
 ```
-step  1200  kept  4120 (full 1840 trunc 1990 part 290)  dropped 31  | 33.4 ms/step (sim 30.9  rec 2.5)  | 7665 env-steps/s
+step  1200  kept  4120 (full 1840 trunc 1990 part 290)  dropped 31  | 33.4 ms/step (sim 30.7  rec 2.5  writer-wait 0.2)  | 7665 env-steps/s
 ```
 
 - `full` reached the goal, `trunc` was cut before a graze, `part` ran out of clock
-- `sim` is GPU, `rec` is the host recorder
+- `sim` is simulation/oracle work, `rec` is the host recorder, and
+  `writer-wait` is time actually blocked behind the asynchronous shard writer
+- shard concatenation, compression, and disk writes run on one background CPU
+  thread; `--writer_queue` bounds its decompressed RAM backlog
 - **yield is only meaningful once `kept + dropped` is several times `num_envs`** —
   below that only fast episodes have finished and it always reads high
 
@@ -119,11 +139,14 @@ there; `ms/step` should stay flat; no `foundLostPairsCapacity` error in the firs
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--num_envs` | 256 | Raises throughput; **lowers** GPU utilisation, which is expected — the ceiling is a serial CPU section, not the GPU. Do not run multiple collectors on one GPU. |
+| `--num_envs` | 256 | Raises throughput until simulation or recording saturates. The recommended 4090 run uses 8192. Do not run multiple collectors on one GPU. |
 | `--episodes` | 2000 | Retained episode prefixes, not attempts. Overshoots by at most one episode. |
-| `--num_layouts` | 512 | Pool size. ~21 ms each, built once. |
+| `--num_layouts` | 512 | Geometry/goal pool size. Use 8192 for the diverse baseline; layouts are built once. |
+| `--starts_per_layout` | 32 | Feasible start candidates per layout; yaw remains fresh on every reset. |
 | `--sigma` | 0.15 | Execution noise as a fraction of each axis limit. `0` collects pure on-policy expert data — the distribution BC fails on. |
 | `--shard_steps` | 200000 | ~160 MB per shard. |
+| `--validation_fraction` | 0.05 | Fraction of layout IDs reserved in `validation/`; `0` writes the legacy flat format. |
+| `--writer_queue` | 2 | Maximum outstanding async shards, roughly 300 MB decompressed each. Increase only if `writer-wait` is nonzero and RAM is available. |
 | `--filter-failures` | off | Legacy mode: drops short or low-progress prefixes. |
 
 Memory scales as `num_envs × 900 × 720 × 2 B`: **5.4 GB at 4096, 10.9 GB at
@@ -137,7 +160,8 @@ geometry while the run still looks healthy.
 ## 5. Verify before training
 
 ```bash
-.venv/bin/python scripts/verify_shard.py data/bc_000.npz
+.venv/bin/python scripts/verify_shard.py data/bc_diverse_v1/train/bc_000.npz
+.venv/bin/python scripts/verify_shard.py data/bc_diverse_v1/validation/bc_000.npz
 ```
 
 Runs without Isaac. Checks structure, that storage is raw metres and not
@@ -150,15 +174,16 @@ Progress is reported as a quality warning rather than a hard failure: collision-
 
 # Phase 2 — BC training
 
-The full corpus is 623 compressed shards, 124.5 million state/action pairs and
-104 GB. The trainer streams one shard to the GPU while four background workers
-inflate an ordered eight-shard queue into host RAM; it never concatenates the
-corpus. The queue is bounded at roughly 2.4 GB on the 128 GB host.
+The trainer streams one shard to the GPU while four background workers inflate
+an ordered eight-shard queue into host RAM; it never concatenates the corpus.
+The queue is bounded at roughly 2.4 GB on the 128 GB host. New corpora use the
+collector's disjoint layout split automatically; `--val-shards` applies only to
+legacy flat corpora.
 
 ## 1. Pipeline smoke test
 
 ```bash
-.venv/bin/python scripts/train_bc.py data/overnight_v2 \
+.venv/bin/python scripts/train_bc.py data/bc_diverse_v1 \
     --out runs/bc_smoke --epochs 1 --max-train-shards 2 \
     --val-shards 1 --no-compile
 ```
@@ -170,13 +195,14 @@ directory as desired; a full run uses a different output directory.
 ## 2. Full 4090 run
 
 ```bash
-.venv/bin/python scripts/train_bc.py data/overnight_v2 --out runs/bc_v1
+.venv/bin/python scripts/train_bc.py data/bc_diverse_v1 \
+    --out runs/bc_diverse_v1 --epochs 8
 ```
 
-Defaults are for the 24 GB RTX 4090: batch 8192, BF16 autocast, compiled model,
-fused AdamW, four-worker/eight-shard prefetch and two complete corpus passes
-(~15,000 optimizer updates each). Four whole shards are held out. Training uses
-fresh 1x sensor and odometry corruption; validation reports both exact-clean and
+Hardware defaults are for the 24 GB RTX 4090: batch 8192, BF16 autocast,
+compiled model, fused AdamW, and four-worker/eight-shard prefetch. Eight passes
+are recommended for the smaller, more diverse corpus. Training uses fresh 1x
+sensor and odometry corruption; validation reports both exact-clean and
 deterministic 1x losses.
 
 `--prefetch-workers` controls parallel NPZ decompression and
@@ -199,8 +225,9 @@ The run directory is deliberately self-describing:
 Resume after an interruption (at most one shard is replayed):
 
 ```bash
-.venv/bin/python scripts/train_bc.py data/overnight_v2 \
-    --out runs/bc_v1 --resume runs/bc_v1/latest.pt
+.venv/bin/python scripts/train_bc.py data/bc_diverse_v1 \
+    --out runs/bc_diverse_v1 --epochs 8 \
+    --resume runs/bc_diverse_v1/latest.pt
 ```
 
 Resume refuses a changed spec, dataset split or training configuration rather
@@ -212,8 +239,9 @@ Offline loss does not establish navigation quality. Run the best candidate in
 Isaac on layouts generated from a seed disjoint from collection:
 
 ```bash
-~/isaac-venv/bin/python scripts/eval_bc.py runs/bc_v1/best.pt \
-    --episodes 512 --layout-seed 10000000 --out runs/bc_v1/eval.json
+~/isaac-venv/bin/python scripts/eval_bc.py runs/bc_diverse_v1/best.pt \
+    --episodes 512 --layout-seed 10000000 \
+    --out runs/bc_diverse_v1/eval.json
 ```
 
 Each environment contributes exactly one episode, so the 0x, 1x and 2x noise
@@ -231,9 +259,9 @@ scripts/train_bc.py            simulator-free training CLI
 scripts/eval_bc.py             held-out closed-loop Isaac evaluation
 ```
 
-The old shards do not contain layout IDs, so the offline split prevents temporal
-episode leakage but cannot measure new-layout generalization. The held-out
-`layout_seed` in the closed-loop evaluator is the generalization test.
+The explicit validation split measures held-out layouts from the same collection
+seed. The entirely new `layout_seed` in closed-loop evaluation remains the
+strongest generalization test.
 
 ---
 

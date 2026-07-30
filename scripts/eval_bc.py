@@ -51,7 +51,8 @@ def main() -> None:
     from isaaclab_env.nav_task import NavEnvCfg, Sim2EdgeNavEnv, normalize_action
     from sim2edge import noise as noise_mod
     from sim2edge.preprocess import bin_lidar, build_observation, goal_features
-    from sim2edge.spec import DT, OMEGA_MAX, V_MAX, fingerprint
+    from sim2edge.spec import (DT, GOAL_TOLERANCE_M, OMEGA_MAX, V_MAX,
+                               fingerprint)
     from sim2edge.training import load_policy_checkpoint
 
     sys.stdout.reconfigure(line_buffering=True)
@@ -76,7 +77,8 @@ def main() -> None:
                                          args.layout_seed, torch,
                                          noise_mod, bin_lidar,
                                          build_observation, goal_features,
-                                         normalize_action, DT, V_MAX, OMEGA_MAX)
+                                         normalize_action, DT, V_MAX, OMEGA_MAX,
+                                         GOAL_TOLERANCE_M)
         if (reference_layouts is not None
                 and not torch.equal(layouts, reference_layouts)):
             raise RuntimeError("re-seeded evaluation produced different layouts")
@@ -110,7 +112,7 @@ def main() -> None:
 
 def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
                    bin_lidar, build_observation, goal_features,
-                   normalize_action, dt, v_max, omega_max):
+                   normalize_action, dt, v_max, omega_max, goal_tolerance):
     """Run one initial episode per environment and aggregate on the GPU."""
     torch.manual_seed(seed)
     env.reset(seed=seed)
@@ -130,10 +132,9 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
 
     # Each env gets one initial layout. Auto-resets after completion are ignored,
     # which makes this exact layout vector reproducible at every noise tier.
-    optimal = torch.tensor(
-        [env._rooms[int(index)].path_length_m for index in env._layout.cpu()],
-        device=device,
-    )
+    # The environment records the geodesic for the start sampled on this reset.
+    # SPL targets the success region rather than the goal cell at its centre.
+    optimal = (env._optimal_path_m.clone() - goal_tolerance).clamp_min(0.0)
     inference_seconds = 0.0
     while bool(active.any()):
         pose = env._robot_pose()

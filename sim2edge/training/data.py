@@ -7,10 +7,11 @@ bounded RAM queue while the GPU trains on the current one. ZIP's zlib decoder
 releases the GIL, so independent shards really do decompress concurrently; a
 process pool would only add a 300 MB IPC copy per shard.
 
-Validation holds out whole shards. The collector never splits an episode across
-shards, so adjacent timesteps cannot leak across the split. It is still not a
-layout-generalization test--the old shards do not store layout IDs--which is why
-closed-loop evaluation uses an entirely new layout seed.
+New corpora arrive with explicit ``train/`` and ``validation/`` directories;
+the collector assigns whole layout IDs to one side and this loader verifies
+that they do not overlap. Legacy flat corpora still hold out whole shards. Those
+old shards do not store layout IDs, so only their closed-loop evaluation on a
+new layout seed measures layout generalization.
 """
 
 from __future__ import annotations
@@ -73,6 +74,21 @@ def inspect_shard(path: Path) -> ShardInfo:
     return ShardInfo(path=path, samples=samples, bytes=path.stat().st_size)
 
 
+def _inspect_layout_split(paths: Sequence[Path], expected: str) -> set[tuple[int, int]]:
+    """Return stable ``(layout_seed, layout_id)`` keys and verify provenance."""
+    keys: set[tuple[int, int]] = set()
+    for path in paths:
+        with np.load(path, allow_pickle=False) as shard:
+            if "layout" not in shard.files or "layout_seed" not in shard.files:
+                raise ValueError(f"explicit split shard {path} lacks layout metadata")
+            if "split" in shard.files and str(shard["split"]) != expected:
+                raise ValueError(
+                    f"shard {path} says split={shard['split']}, expected {expected}")
+            seed = int(shard["layout_seed"])
+            keys.update((seed, int(value)) for value in np.unique(shard["layout"]))
+    return keys
+
+
 class ShardCorpus:
     """A deterministic train/validation split over a directory of NPZ shards."""
 
@@ -80,11 +96,33 @@ class ShardCorpus:
                  val_shards: int = 4, seed: int = 0,
                  max_train_shards: int | None = None):
         self.root = Path(root).resolve()
-        paths = sorted(self.root.glob(pattern))
-        if not paths:
-            raise FileNotFoundError(f"no {pattern!r} shards under {self.root}")
-
-        infos = [inspect_shard(path) for path in paths]
+        explicit_train = sorted((self.root / "train").glob(pattern))
+        explicit_validation = sorted((self.root / "validation").glob(pattern))
+        explicit_split = bool(explicit_train or explicit_validation)
+        self.explicit_split = explicit_split
+        if explicit_split:
+            if not explicit_train or not explicit_validation:
+                raise FileNotFoundError(
+                    f"explicit corpus under {self.root} needs both train/ and "
+                    f"validation/ shards")
+            train_infos = [inspect_shard(path) for path in explicit_train]
+            validation_infos = [inspect_shard(path)
+                                for path in explicit_validation]
+            train_layouts = _inspect_layout_split(explicit_train, "train")
+            validation_layouts = _inspect_layout_split(
+                explicit_validation, "validation")
+            overlap = train_layouts & validation_layouts
+            if overlap:
+                sample = sorted(overlap)[:5]
+                raise ValueError(
+                    f"layout leakage across train/validation: {sample}")
+            infos = train_infos + validation_infos
+        else:
+            paths = sorted(self.root.glob(pattern))
+            if not paths:
+                raise FileNotFoundError(
+                    f"no {pattern!r} shards under {self.root}")
+            infos = [inspect_shard(path) for path in paths]
         ranked = sorted(
             infos,
             key=lambda item: hashlib.sha256(
@@ -92,11 +130,16 @@ class ShardCorpus:
         )
         # A one-shard smoke corpus remains trainable and simply has no offline
         # validation. Real runs should retain at least one whole shard.
-        count = min(max(0, val_shards), max(0, len(infos) - 1))
-        validation_paths = {item.path for item in ranked[:count]}
-        self.validation = [item for item in infos
-                           if item.path in validation_paths]
-        train = [item for item in infos if item.path not in validation_paths]
+        if explicit_split:
+            self.validation = validation_infos
+            train = train_infos
+        else:
+            count = min(max(0, val_shards), max(0, len(infos) - 1))
+            validation_paths = {item.path for item in ranked[:count]}
+            self.validation = [item for item in infos
+                               if item.path in validation_paths]
+            train = [item for item in infos
+                     if item.path not in validation_paths]
 
         if max_train_shards is not None:
             if max_train_shards < 1:
@@ -131,7 +174,7 @@ class ShardCorpus:
         return order
 
     def as_dict(self) -> dict:
-        return {
+        value = {
             "root": str(self.root),
             "spec_fingerprint": fingerprint(),
             "seed": self.seed,
@@ -140,6 +183,9 @@ class ShardCorpus:
             "train_samples": self.train_samples,
             "validation_samples": self.validation_samples,
         }
+        if self.explicit_split:
+            value["split"] = "layout"
+        return value
 
     def loaded(self, infos: Sequence[ShardInfo], device,
                *, prefetch: bool = True, workers: int = 4,

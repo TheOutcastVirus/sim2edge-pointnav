@@ -22,7 +22,7 @@ import hashlib
 import math
 
 __all__ = ["LIDAR_BINS", "LIDAR_MIN_M", "LIDAR_MAX_M", "INVALID_FILL",
-           "GOAL_MAX_M", "V_MAX", "OMEGA_MAX", "ACCEL_MAX", "ALPHA_MAX", "DT",
+           "GOAL_MAX_M", "GOAL_TOLERANCE_M", "V_MAX", "OMEGA_MAX", "ACCEL_MAX", "ALPHA_MAX", "DT",
            "ROBOT_RADIUS_M", "BODY_RADIUS_M", "LIDAR_MOUNT_XYZ", "LIDAR_MOUNT_YAW",
            "BIN_WIDTH_RAD", "OBS_DIM", "fingerprint"]
 
@@ -49,6 +49,9 @@ BIN_WIDTH_RAD = 2.0 * math.pi / LIDAR_BINS
 # where the robot needs to turn around, and quantizing a wrapping input to INT8
 # fails silently.
 GOAL_MAX_M = 8.0
+# Success is reaching this radius around the goal. It changes episode outcome,
+# not observation construction, so it is deliberately outside the fingerprint.
+GOAL_TOLERANCE_M = 0.25
 
 # ── Action: physical (v, omega), the units the Twist carries ─────────────────
 # Create3's real limits. An oracle allowed to exceed them produces a policy that

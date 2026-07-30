@@ -25,7 +25,7 @@ import numpy as np
 from . import grids
 from .spec import BODY_RADIUS_M, GOAL_MAX_M, ROBOT_RADIUS_M
 
-__all__ = ["MAX_OBSTACLES", "Room", "sample_room"]
+__all__ = ["MAX_OBSTACLES", "Room", "sample_room", "sample_start_positions"]
 
 #: Sampled obstacle slots.
 N_OBSTACLE_SLOTS = 24
@@ -168,8 +168,39 @@ class Room:
     @property
     def path_length_m(self) -> float:
         """Oracle path length for this episode -- the denominator for SPL."""
-        r, c = grids.world_to_cell(self.start[0], self.start[1], self.res)
+        return self.path_length_from(self.start[:2])
+
+    def path_length_from(self, xy) -> float:
+        """Geodesic metres from any sampled start position to this goal."""
+        r, c = grids.world_to_cell(float(xy[0]), float(xy[1]), self.res)
         return float(self.geodesic[r, c])
+
+
+def sample_start_positions(room: Room, rng: np.random.Generator,
+                           count: int) -> np.ndarray:
+    """Draw reusable feasible starts for a room's existing goal/flow field.
+
+    Changing the start does not require replanning: the geodesic and preferred
+    flow fields cover every reachable cell for the fixed goal. A small candidate
+    table therefore multiplies task diversity almost for free; yaw is sampled
+    independently at every environment reset and is intentionally not stored
+    here.
+    """
+    if count < 1:
+        raise ValueError("start candidate count must be positive")
+    spawnable = room.clearance >= (ROBOT_RADIUS_M + SPAWN_CLEARANCE_M)
+    eligible = (spawnable
+                & (room.geodesic >= GOAL_MIN_DIST_M)
+                & (room.geodesic <= GOAL_MAX_M))
+    choices = np.flatnonzero(eligible)
+    if choices.size == 0:  # construction guarantees this; retain a loud guard
+        raise ValueError("room has no feasible start candidates")
+    selected = rng.choice(choices, size=count,
+                          replace=choices.size < count)
+    rows, cols = np.divmod(selected, eligible.shape[1])
+    x = (cols.astype(np.float32) + 0.5) * room.res
+    y = (rows.astype(np.float32) + 0.5) * room.res
+    return np.stack((x, y), axis=1).astype(np.float32, copy=False)
 
 
 def _sample_obstacles(rng: np.random.Generator, size_xy) -> tuple:
