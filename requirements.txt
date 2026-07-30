@@ -1,0 +1,17 @@
+# pip interop. `pyproject.toml` is the source of truth; this file mirrors it so
+# `pip install -r requirements.txt` works on hosts without uv (the Isaac Lab
+# container, the board's export venv).
+#
+#   uv sync --extra dev          # preferred
+#   pip install -r requirements.txt
+#
+# Isaac Lab is NOT listed. It is installed by its own installer on the training
+# host and must never be a hard dependency of this package -- the export venv
+# and CI both import sim2edge without it.
+
+numpy>=1.24
+scipy>=1.10
+torch>=2.4
+
+# dev
+pytest>=8.0

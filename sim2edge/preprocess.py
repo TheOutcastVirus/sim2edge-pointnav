@@ -1,0 +1,118 @@
+"""Raw sensor readings -> the policy's input vector. Batched torch, on device.
+
+This runs in two places that must agree exactly: here, on a GPU batch during
+training, and in C++ on the board. It is written to be transcribable literally
+-- explicit index arithmetic, no library-behaviour dependence, no op whose
+semantics differ between torch and the C++ standard library.
+
+**It is deliberately not in C++ on this side.** Isaac hands us lidar as a
+``(num_envs, beams)`` tensor already resident on the GPU; routing that through
+C++ would mean a device->host->device round trip per step, which costs far more
+than the microsecond of arithmetic it would save. The C++ implementation exists
+because the *robot* needs it, and a parity test pins the two together.
+
+Two choices worth stating, because both look arbitrary and neither is:
+
+**Beams are binned by wrapped angle, never by array index.** The RPLIDAR's
+start angle is not stable across driver versions and its beam count varies with
+spin rate. Index binning would silently rotate the policy's entire view of the
+world when the driver changed.
+
+**Ranges are normalized before pooling, not after.** "Invalid" and "far" both
+map to 1.0, so pooling needs no companion mask -- there is no second data
+structure to keep in sync between the two implementations.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+from .spec import (BIN_WIDTH_RAD, GOAL_MAX_M, INVALID_FILL, LIDAR_BINS,
+                   LIDAR_MAX_M, LIDAR_MIN_M)
+
+__all__ = ["wrap_angle", "bin_lidar", "goal_features", "build_observation"]
+
+
+def wrap_angle(a: torch.Tensor) -> torch.Tensor:
+    """Wrap to [-pi, pi).
+
+    Written with floor rather than fmod on purpose: C's ``fmod`` keeps the sign
+    of the dividend, Python's and torch's ``%`` keep the sign of the divisor,
+    and the bin index depends on which. The C++ transcription must reproduce
+    *this* behaviour; getting it wrong is an off-by-one-hemisphere error that
+    looks like a badly trained policy.
+    """
+    return a - 2.0 * math.pi * torch.floor((a + math.pi) / (2.0 * math.pi))
+
+
+def bin_lidar(ranges: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+    """``(N, B)`` raw ranges + angles -> ``(N, LIDAR_BINS)`` in [0, 1].
+
+    ``angles`` may be ``(B,)`` if every scan shares a beam layout, or ``(N, B)``
+    when a per-scan bearing bias has been applied.
+
+    Reduction is **minimum**, which is the only choice that cannot delete a thin
+    obstacle: a table leg covering one beam out of ten in a bin survives to the
+    policy. Averaging would blend it into the wall behind it and mean would
+    make a chair disappear.
+
+    Bins with no beam in them come out as :data:`INVALID_FILL` -- "nothing out
+    to max range" -- which is also what an out-of-range or non-finite return
+    becomes. Absent data and distant data are the same statement to the policy.
+    """
+    if angles.dim() == 1:
+        angles = angles.unsqueeze(0).expand_as(ranges)
+
+    # Normalize first: near -> 0, far -> 1. Anything unusable is "far".
+    denom = LIDAR_MAX_M - LIDAR_MIN_M
+    norm = ((ranges - LIDAR_MIN_M) / denom).clamp(0.0, 1.0)
+    usable = torch.isfinite(ranges) & (ranges >= LIDAR_MIN_M) & (ranges <= LIDAR_MAX_M)
+    norm = torch.where(usable, norm, torch.full_like(norm, INVALID_FILL))
+
+    # Bin by wrapped bearing. `+ pi` moves [-pi, pi) to [0, 2pi) so bin 0 starts
+    # dead astern and bin index increases counter-clockwise.
+    idx = torch.floor((wrap_angle(angles) + math.pi) / BIN_WIDTH_RAD).long()
+    idx = idx.clamp(0, LIDAR_BINS - 1)          # guards the +pi boundary only
+
+    out = torch.full((ranges.shape[0], LIDAR_BINS), float(INVALID_FILL),
+                     dtype=norm.dtype, device=norm.device)
+    # scatter_reduce with "amin" is a single fused kernel; a Python loop over
+    # bins would be 180 launches per step.
+    out.scatter_reduce_(1, idx, norm, reduce="amin", include_self=True)
+    return out
+
+
+def goal_features(robot_pose: torch.Tensor, goal_xy: torch.Tensor) -> torch.Tensor:
+    """``(N, 3)`` = (distance / GOAL_MAX_M, sin bearing, cos bearing).
+
+    ``robot_pose`` is ``(N, 3)`` of x, y, yaw in the world frame. The output is
+    in the *robot* frame, which is what makes the policy translation- and
+    rotation-invariant: the same relative goal produces the same input anywhere
+    in any room.
+
+    Distance is clamped at 1.0 rather than left to grow. A goal beyond
+    GOAL_MAX_M is "far away in that direction"; the exact number carries no
+    information the policy can act on, and an unbounded input quantizes badly.
+    """
+    d = goal_xy - robot_pose[:, :2]
+    dist = torch.linalg.vector_norm(d, dim=1)
+    bearing = torch.atan2(d[:, 1], d[:, 0]) - robot_pose[:, 2]
+    return torch.stack([
+        (dist / GOAL_MAX_M).clamp(max=1.0),
+        torch.sin(bearing),
+        torch.cos(bearing),
+    ], dim=1)
+
+
+def build_observation(lidar: torch.Tensor, goal: torch.Tensor,
+                      last_action: torch.Tensor) -> torch.Tensor:
+    """Concatenate in the one order every consumer agrees on: lidar|goal|action.
+
+    ``last_action`` is the previous *commanded* (v, omega), normalized to
+    [-1, 1] by the caller. It is not decoration: without it, an action-smoothness
+    penalty depends on information absent from the observation, so the optimal
+    action is not representable by the policy.
+    """
+    return torch.cat([lidar, goal, last_action], dim=1)
