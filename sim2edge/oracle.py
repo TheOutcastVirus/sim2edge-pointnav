@@ -24,8 +24,10 @@ second time, a systematic underactuation that is invisible in sim.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
+from .grids import fill_unreachable
 from .spec import ACCEL_MAX, ALPHA_MAX, DT, OMEGA_MAX, V_MAX
 from .preprocess import wrap_angle
 
@@ -61,6 +63,11 @@ class LayoutPool:
     the right trade: diversity comes from pool size times start/goal sampling,
     which is cheap, not from unique geometry per environment, which costs a
     proportional number of USD prims.
+
+    It carries the geodesic distance field as well as the flow field, because
+    the RL progress reward and the oracle ask the same layout the same question
+    -- "how far is the goal from here" -- and the answer must be one field, not
+    two that can drift apart.
     """
 
     def __init__(self, rooms, device="cpu"):
@@ -71,6 +78,7 @@ class LayoutPool:
         flow = torch.zeros((n, h * w), dtype=torch.long)
         free = torch.zeros((n, h, w), dtype=torch.bool)
         body = torch.zeros((n, h, w), dtype=torch.bool)
+        distance = torch.zeros((n, h, w), dtype=torch.float32)
         for i, room in enumerate(rooms):
             rh, rw = room.free.shape
             # Re-index the flow field from the room's own width to the padded
@@ -84,12 +92,28 @@ class LayoutPool:
             free[i, :rh, :rw] = torch.from_numpy(room.free)
             body[i, :rh, :rw] = torch.from_numpy(room.body_free)
 
+            # Padding is *outside* this room's walls and unreachable by
+            # construction. Filling it with the room's farthest distance rather
+            # than zero means a clamped out-of-arena query can never read as
+            # "at the goal", which the progress reward would pay for.
+            filled = fill_unreachable(room.geodesic, room.free)
+            canvas = np.full((h, w), filled.max(), dtype=np.float32)
+            canvas[:rh, :rw] = filled
+            distance[i] = torch.from_numpy(canvas)
+
         self.h, self.w, self.res = h, w, float(rooms[0].res)
         self.flow = flow.to(device)
         self.free = free.to(device)
         self.body_free = body.to(device)
+        self.distance = distance.to(device)
         self.goal = torch.stack(
             [torch.from_numpy(r.goal) for r in rooms]).to(device)
+
+    def _cell(self, xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(N,) row, col for world points, clamped into the padded grid."""
+        col = torch.clamp((xy[:, 0] / self.res).long(), 0, self.w - 1)
+        row = torch.clamp((xy[:, 1] / self.res).long(), 0, self.h - 1)
+        return row, col
 
     def is_free(self, layout: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
         """(N,) True where the robot centre is legal, i.e. not in collision.
@@ -99,14 +123,27 @@ class LayoutPool:
         radius reported collisions where nothing was touching -- which, with a
         sticky per-episode flag, discarded a large share of good episodes.
         """
-        col = torch.clamp((xy[:, 0] / self.res).long(), 0, self.w - 1)
-        row = torch.clamp((xy[:, 1] / self.res).long(), 0, self.h - 1)
+        row, col = self._cell(xy)
         return self.body_free[layout, row, col]
+
+    def distance_to_goal(self, layout: torch.Tensor,
+                         xy: torch.Tensor) -> torch.Tensor:
+        """(N,) geodesic metres to the goal -- finite at every queryable cell.
+
+        Geodesic, never Euclidean: straight-line progress pays the robot to
+        drive into the concave side of an obstacle, then charges it for the
+        detour back out. This is the same field that defines episode difficulty
+        and the SPL denominator, so "distance to goal" means one thing
+        everywhere in the project.
+        """
+        row, col = self._cell(xy)
+        return self.distance[layout, row, col]
 
     def to(self, device) -> "LayoutPool":
         self.flow = self.flow.to(device)
         self.free = self.free.to(device)
         self.body_free = self.body_free.to(device)
+        self.distance = self.distance.to(device)
         self.goal = self.goal.to(device)
         return self
 

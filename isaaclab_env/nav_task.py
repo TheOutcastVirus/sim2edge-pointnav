@@ -63,6 +63,7 @@ except ImportError as exc:                       # pragma: no cover
     DirectRLEnvCfg = object                      # type: ignore[assignment,misc]
 
 from sim2edge import rooms as rooms_mod
+from sim2edge.noise import corrupt_goal, corrupt_lidar
 from sim2edge.oracle import LayoutPool, oracle_action
 from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
 from sim2edge.rooms import MAX_OBSTACLES, sample_room, sample_start_positions
@@ -93,6 +94,15 @@ OBSTACLE_HEIGHT_M = 0.6
 #: Beams per scan. The A1 delivers a variable count near 720 at 10 Hz; binning
 #: is by angle, so the exact number only has to be dense enough to fill 180 bins.
 LIDAR_BEAMS = 720
+
+#: Largest geodesic change a single control step may be paid for, in metres.
+#:
+#: This is a guard against grid artifacts, not a shaping term, so it sits far
+#: above both one grid cell (5 cm) and one step of travel (V_MAX * DT = 2.3 cm).
+#: Clamping tightly would be worse than not clamping at all: consecutive
+#: distances differ by whole cells, and the per-episode sum of unclamped
+#: differences telescopes to the true distance the robot closed.
+PROGRESS_CLAMP_M = 0.5
 
 
 def _obstacle_object_cfgs() -> dict:
@@ -301,6 +311,39 @@ class NavEnvCfg(DirectRLEnvCfg):
     #: task API.
     collection_mode: bool = False
 
+    #: Sensor and odometry corruption applied to the environment's own
+    #: observation, as a multiple of the ranges in ``sim2edge.noise``.
+    #:
+    #: Zero for collection, because a stored shard must keep its clean ranges
+    #: and let the loader draw fresh corruption every epoch. On-policy RL has no
+    #: shard to protect -- the observation is consumed once and discarded -- so
+    #: the noise has to be injected here or the fine-tuned policy would learn on
+    #: inputs cleaner than the ones BC trained on and evaluation measures.
+    observation_noise_scale: float = 0.0
+
+    # ── reward ───────────────────────────────────────────────────────────────
+    # Per step:
+    #   progress * (d_{t-1} - d_t)  +  goal * reached  -  collision * collided
+    #   -  time  -  smoothness * ||a_t - a_{t-1}||^2      (normalized axes)
+    #
+    # Scale check, which is the only way these numbers mean anything: an 8 m
+    # episode earns 3.0 * 8 = 24 of progress plus a 10 goal bonus against about
+    # 1.8 of accumulated time cost, while colliding 2 m in earns 6 and pays 10.
+    # Reaching the goal is worth more than any route to it, and no amount of
+    # loitering is worth a collision.
+
+    #: Per metre of geodesic progress. The term that does the work; everything
+    #: else only breaks ties it cannot see.
+    progress_reward: float = 3.0
+    goal_reward: float = 10.0
+    collision_penalty: float = 10.0
+    #: Small per-step cost. Without it, safe-but-stationary loitering is an
+    #: optimal policy for any episode the robot expects to fail.
+    time_penalty: float = 0.005
+    #: On the *normalized* command delta, so one unit means the same fraction of
+    #: each axis limit. This is the term that keeps the real base from jerking.
+    smoothness_penalty: float = 0.05
+
 
 class Sim2EdgeNavEnv(DirectRLEnv):
     """Direct-workflow environment. Produces observations and oracle labels."""
@@ -341,9 +384,29 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         # Allocated here because reset() builds an observation before any
         # action has been applied.
         self._action = torch.zeros(n, 2, device=self.device)
+        # The command before that, for the reward's smoothness term only.
+        self._previous_action = torch.zeros(n, 2, device=self.device)
+        # Geodesic metres to the goal at the previous control step. The reward
+        # is a difference of consecutive values, so this must be re-seeded on
+        # reset -- otherwise the first step of every episode is paid for a
+        # distance change that belongs to two different layouts.
+        self._previous_distance = torch.zeros(n, device=self.device)
+        # Pose at the current control step, published by _get_dones.
+        self._pose = torch.zeros(n, 3, device=self.device)
+        # Allocated once: the reward divides by this every step, and a fresh
+        # host tensor per step is a per-step host-to-device copy.
+        self._action_limits = torch.tensor([V_MAX, OMEGA_MAX],
+                                           device=self.device)
         # Planar command integration is kept separate from the contact-solver
         # state so tire scrub cannot erase commanded yaw between substeps.
         self._planar_pose_target = torch.zeros(n, 3, device=self.device)
+
+        # Observation corruption is drawn from a stream seeded off the task
+        # seed, so a rollout is reproducible without being identical between
+        # environments.
+        self._noise_generator = torch.Generator(
+            device=torch.device(self.device).type)
+        self._noise_generator.manual_seed(int(self.cfg.seed or 0) + 977)
 
         # Beam bearings, rotated from the sensor frame into base_link once.
         # Doing it here rather than per step keeps the hot path a single add.
@@ -480,6 +543,9 @@ class Sim2EdgeNavEnv(DirectRLEnv):
 
         self._goal_w[env_ids] = self._room_goal[layout] + origins[:, :2]
         self._action[env_ids] = 0.0
+        self._previous_action[env_ids] = 0.0
+        self._previous_distance[env_ids] = self.pool.distance_to_goal(
+            layout, start[:, :2])
         self._history_reset[env_ids] = True
         self._planar_pose_target[env_ids, :2] = root[:, :2]
         self._planar_pose_target[env_ids, 2] = start[:, 2]
@@ -504,6 +570,7 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         node emits SI units directly. Applying the same scaling here keeps sim
         and robot on one convention.
         """
+        self._previous_action = self._action
         self._action = denormalize_action(actions)
 
     def _apply_action(self):
@@ -568,14 +635,26 @@ class Sim2EdgeNavEnv(DirectRLEnv):
             return {"policy": self._collection_obs}
 
         pose = self._robot_pose()
+        goal = self._goal_w - self.scene.env_origins[:, :2]
+        ranges, angles = self._lidar_ranges(), self._beam_angles
+
+        # The same corruption functions the dataset loader applies, in the same
+        # order, so a policy fine-tuned here sees the input distribution it was
+        # cloned on. Applied to the raw scan, before binning -- corrupting bins
+        # instead would put noise on a quantity the sensor does not produce.
+        scale = float(self.cfg.observation_noise_scale)
+        if scale > 0.0:
+            ranges, angles = corrupt_lidar(ranges, angles, scale,
+                                           self._noise_generator)
+            pose, goal = corrupt_goal(pose, goal, scale, self._noise_generator)
+
         self._observation_history.push(
-            bin_lidar(self._lidar_ranges(), self._beam_angles),
+            bin_lidar(ranges, angles),
             torch.stack([self._action[:, 0] / V_MAX,
                          self._action[:, 1] / OMEGA_MAX], dim=1),
             self._history_reset)
         self._history_reset.zero_()
-        obs = self._observation_history.observation(
-            goal_features(pose, self._goal_w - self.scene.env_origins[:, :2]))
+        obs = self._observation_history.observation(goal_features(pose, goal))
         return {"policy": obs}
 
     # ── the oracle, for BC collection ────────────────────────────────────────
@@ -603,7 +682,11 @@ class Sim2EdgeNavEnv(DirectRLEnv):
     # ── termination and reward ───────────────────────────────────────────────
 
     def _get_dones(self):
-        pose = self._robot_pose()
+        # Cached for _get_rewards, which DirectRLEnv.step calls immediately
+        # after this on the same physics state and before any reset. Reading
+        # the pose again there would be equivalent but would leave which pose
+        # it meant -- pre- or post-reset -- resting on call ordering.
+        pose = self._pose = self._robot_pose()
         goal = self._goal_w - self.scene.env_origins[:, :2]
         self._reached = (
             torch.linalg.vector_norm(pose[:, :2] - goal, dim=1)
@@ -617,9 +700,39 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         return self._reached | self._collided, timeout
 
     def _get_rewards(self) -> torch.Tensor:
-        """Placeholder. BC does not use it; PPO will replace this with the
-        geodesic-progress reward once the demonstration set exists."""
-        return torch.zeros(self.num_envs, device=self.device)
+        """Dense geodesic progress, with terminal outcomes and two small costs.
+
+        **Geodesic, never Euclidean.** Straight-line progress pays the robot to
+        drive into the concave face of an obstacle and then charges it for the
+        detour back out; around a U-shaped obstacle that is a local optimum the
+        policy can and does get stuck in. The field this reads is ``Room
+        .geodesic`` -- true metric path length, the same field that decides
+        which starts are sampled and supplies the SPL denominator, not the
+        clearance-penalised cost the oracle steers by. So "closer to the goal"
+        means one thing across the whole project.
+
+        The progress term telescopes: over an episode the discounted-free sum
+        of ``d_{t-1} - d_t`` is the total distance closed, whatever route was
+        taken. Shaping like this changes *when* reward arrives, not which
+        trajectory is optimal.
+        """
+        if self.cfg.collection_mode:
+            # Collection and evaluation never read this, and the gathers below
+            # are not free at 16k environments.
+            return torch.zeros(self.num_envs, device=self.device)
+
+        distance = self.pool.distance_to_goal(self._layout, self._pose[:, :2])
+        progress = (self._previous_distance - distance).clamp(
+            -PROGRESS_CLAMP_M, PROGRESS_CLAMP_M)
+        self._previous_distance = distance
+
+        delta = (self._action - self._previous_action) / self._action_limits
+
+        return (self.cfg.progress_reward * progress
+                + self.cfg.goal_reward * self._reached.float()
+                - self.cfg.collision_penalty * self._collided.float()
+                - self.cfg.time_penalty
+                - self.cfg.smoothness_penalty * delta.square().sum(dim=1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

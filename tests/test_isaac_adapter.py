@@ -81,6 +81,37 @@ def test_the_mount_yaw_is_applied_exactly_once():
     assert rot[3] == pytest.approx(math.sin(LIDAR_MOUNT_YAW / 2))
 
 
+# ── the RL reward's arithmetic has to work out ───────────────────────────────
+#
+# These are cheap, they need no simulator, and each one pins a weight that
+# quietly inverts the optimal policy if it is set wrong.
+
+def test_moving_is_worth_more_than_standing_still():
+    """The time penalty must not exceed what one step of travel earns, or the
+    optimal policy is to stop and wait out the clock."""
+    from sim2edge.spec import DT, V_MAX
+    m = importlib.import_module("isaaclab_env.nav_task")
+    per_step_progress = m.NavEnvCfg.progress_reward * V_MAX * DT
+    assert m.NavEnvCfg.time_penalty < per_step_progress
+
+
+def test_reaching_the_goal_beats_running_out_the_clock():
+    from sim2edge.spec import DT
+    m = importlib.import_module("isaaclab_env.nav_task")
+    longest_episode = m.NavEnvCfg.episode_length_s / DT
+    assert m.NavEnvCfg.goal_reward > m.NavEnvCfg.time_penalty * longest_episode
+
+
+def test_the_progress_clamp_cannot_swallow_real_motion():
+    """It exists to bound grid artifacts. Set below one cell transition it would
+    instead silently discount most of the progress actually made, because
+    consecutive geodesic readings differ by whole cells."""
+    from sim2edge import rooms
+    from sim2edge.spec import DT, V_MAX
+    m = importlib.import_module("isaaclab_env.nav_task")
+    assert m.PROGRESS_CLAMP_M > rooms.GRID_RES_M + V_MAX * DT
+
+
 # ── the converted asset agrees with the spec ─────────────────────────────────
 
 URDF = "assets/turtlebot4_lite.urdf"

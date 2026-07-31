@@ -26,8 +26,8 @@ from ..models import NavPolicy, NavPolicyConfig
 from ..spec import OMEGA_MAX, V_MAX, fingerprint, observation_fingerprint
 from .data import ShardCorpus, ShardInfo
 
-__all__ = ["BCConfig", "imitation_loss", "load_policy_checkpoint",
-           "normalize_actions", "train_bc"]
+__all__ = ["BCConfig", "atomic_torch_save", "imitation_loss",
+           "load_policy_checkpoint", "normalize_actions", "train_bc"]
 
 
 @dataclass(frozen=True)
@@ -175,7 +175,9 @@ def _generator(device: torch.device, seed: int) -> torch.Generator:
     return torch.Generator(device=device.type).manual_seed(seed)
 
 
-def _atomic_torch_save(value: Any, path: Path) -> None:
+def atomic_torch_save(value: Any, path: Path) -> None:
+    """Write, then rename. A checkpoint is never half-written on the reader's
+    side, however the writer dies."""
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(value, temporary)
     os.replace(temporary, path)
@@ -356,7 +358,7 @@ def train_bc(data: str | Path, output: str | Path,
     if start_epoch >= config.epochs:
         # A completed checkpoint is already a valid final artifact. Treating a
         # harmless repeated resume as an undefined zero-epoch run is surprising.
-        _atomic_torch_save(saved, output / "final.pt")
+        atomic_torch_save(saved, output / "final.pt")
         print(f"[BC] checkpoint already completed {config.epochs} epoch(s)")
         return saved
 
@@ -453,7 +455,7 @@ def train_bc(data: str | Path, output: str | Path,
                     policy, optimizer, scheduler, config, corpus, epoch=epoch,
                     shard_cursor=completed, global_step=global_step,
                     best_validation=best_validation)
-                _atomic_torch_save(saved, latest)
+                atomic_torch_save(saved, latest)
 
         train_input_wait = corpus.input_wait_seconds - input_wait_started
         validation_wait_started = corpus.input_wait_seconds
@@ -496,16 +498,16 @@ def train_bc(data: str | Path, output: str | Path,
                 policy, optimizer, scheduler, config, corpus, epoch=epoch + 1,
                 shard_cursor=0, global_step=global_step,
                 best_validation=best_validation)
-            _atomic_torch_save(best, output / "best.pt")
+            atomic_torch_save(best, output / "best.pt")
 
         final = _checkpoint(
             policy, optimizer, scheduler, config, corpus, epoch=epoch + 1,
             shard_cursor=0, global_step=global_step,
             best_validation=best_validation)
-        _atomic_torch_save(final, latest)
+        atomic_torch_save(final, latest)
         start_cursor = 0
 
-    _atomic_torch_save(final, output / "final.pt")
+    atomic_torch_save(final, output / "final.pt")
     print(f"[BC] complete in {(time.perf_counter() - run_started) / 3600:.2f} h  "
           f"best clean validation={best_validation:.5f}")
     return final

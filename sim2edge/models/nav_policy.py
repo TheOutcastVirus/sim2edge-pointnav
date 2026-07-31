@@ -26,7 +26,8 @@ from torch import nn
 
 from ..spec import HISTORY_FRAMES, LIDAR_BINS, OMEGA_MAX, V_MAX
 
-__all__ = ["NavPolicy", "NavPolicyConfig"]
+__all__ = ["NavPolicy", "NavPolicyConfig", "build_encoder", "encode",
+           "initialize_layer", "physical_action"]
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,80 @@ def _mlp(sizes: tuple[int, ...]) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
+def build_encoder(config: NavPolicyConfig) -> tuple[nn.Module, ...]:
+    """The five stacks between the flat observation and the trunk output.
+
+    A free function rather than a shared base class, because the actor's
+    submodule *names* are its checkpoint keys: every BC run to date is stored
+    under ``lidar_conv.*``, ``trunk.*`` and so on, and wrapping them in a
+    container would orphan those files. The PPO critic wants the identical
+    architecture with independent weights, so it calls this too and assigns the
+    results to the same names.
+    """
+    conv: list[nn.Module] = []
+    channels = config.history_frames
+    length = config.lidar_bins
+    for index, output_channels in enumerate(config.lidar_channels):
+        kernel = 5 if index < 2 else 3
+        padding = kernel // 2
+        conv.extend((
+            nn.Conv1d(channels, output_channels, kernel, stride=2,
+                      padding=padding),
+            nn.ReLU(),
+        ))
+        channels = output_channels
+        length = (length + 2 * padding - kernel) // 2 + 1
+
+    lidar_conv = nn.Sequential(*conv)
+    lidar_projection = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(channels * length, config.lidar_features),
+        nn.ReLU(),
+    )
+    goal_encoder = _mlp((3, config.goal_features))
+    action_encoder = _mlp((2 * config.history_frames, config.action_features))
+    fused = (config.lidar_features + config.goal_features
+             + config.action_features)
+    trunk = _mlp((fused,) + config.trunk)
+    return lidar_conv, lidar_projection, goal_encoder, action_encoder, trunk
+
+
+def encode(module: nn.Module, observation: torch.Tensor) -> torch.Tensor:
+    """Flat observation -> trunk features, for anything built by ``build_encoder``.
+
+    ``module`` supplies the layers and a ``config``; it is passed in rather than
+    inherited from for the checkpoint-key reason above.
+    """
+    config = module.config
+    lidar_width = config.history_frames * config.lidar_bins
+    lidar = observation[:, :lidar_width].reshape(
+        -1, config.history_frames, config.lidar_bins)
+    goal = observation[:, lidar_width:lidar_width + 3]
+    last_action = observation[:, lidar_width + 3:]
+
+    fused = torch.cat((
+        module.lidar_projection(module.lidar_conv(lidar)),
+        module.goal_encoder(goal),
+        module.action_encoder(last_action),
+    ), dim=1)
+    return module.trunk(fused)
+
+
+def physical_action(raw: torch.Tensor, v_max: float,
+                    omega_max: float) -> torch.Tensor:
+    """Unbounded head output -> bounded SI ``(v, omega)``.
+
+    Keeping this squash in-model makes training, Isaac evaluation, ExecuTorch
+    and the future C++ node share one scale. ``tanh(raw)`` is exactly the
+    normalized action ``isaaclab_env.nav_task.denormalize_action`` expects, so
+    the simulator and the deployed graph apply the same two constants.
+    """
+    squashed = torch.tanh(raw)
+    v = 0.5 * v_max * (squashed[:, :1] + 1.0)
+    omega = omega_max * squashed[:, 1:]
+    return torch.cat((v, omega), dim=1)
+
+
 class NavPolicy(nn.Module):
     """``(N, OBS_DIM) -> (N, 2)`` deterministic physical command policy."""
 
@@ -79,59 +154,33 @@ class NavPolicy(nn.Module):
         self.config = config or NavPolicyConfig()
         cfg = self.config
 
-        conv: list[nn.Module] = []
-        channels = cfg.history_frames
-        length = cfg.lidar_bins
-        for index, output_channels in enumerate(cfg.lidar_channels):
-            kernel = 5 if index < 2 else 3
-            padding = kernel // 2
-            conv.extend((
-                nn.Conv1d(channels, output_channels, kernel, stride=2,
-                          padding=padding),
-                nn.ReLU(),
-            ))
-            channels = output_channels
-            length = (length + 2 * padding - kernel) // 2 + 1
-        self.lidar_conv = nn.Sequential(*conv)
-        self.lidar_projection = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(channels * length, cfg.lidar_features),
-            nn.ReLU(),
-        )
-        self.goal_encoder = _mlp((3, cfg.goal_features))
-        self.action_encoder = _mlp((2 * cfg.history_frames, cfg.action_features))
-
-        fused = cfg.lidar_features + cfg.goal_features + cfg.action_features
-        self.trunk = _mlp((fused,) + cfg.trunk)
+        (self.lidar_conv, self.lidar_projection, self.goal_encoder,
+         self.action_encoder, self.trunk) = build_encoder(cfg)
         self.action_head = nn.Linear(cfg.trunk[-1], 2)
 
-        self.apply(_initialize)
+        self.apply(initialize_layer)
         # Begin near a neutral midpoint command instead of allowing a random
         # final layer to saturate tanh before the first optimizer step.
         nn.init.uniform_(self.action_head.weight, -1.0e-3, 1.0e-3)
         nn.init.zeros_(self.action_head.bias)
 
+    def features(self, observation: torch.Tensor) -> torch.Tensor:
+        return encode(self, observation)
+
+    def pre_squash(self, observation: torch.Tensor) -> torch.Tensor:
+        """The head output *before* tanh -- the coordinates PPO explores in.
+
+        RL adds Gaussian noise here rather than to the physical command: a
+        Gaussian on a bounded quantity puts probability mass outside the
+        Create3's envelope, and clipping it back makes the density the ratio is
+        computed from a fiction. This is also the space the BC anchor compares
+        in, where a fixed distance means the same thing at every command.
+        """
+        return self.action_head(self.features(observation))
+
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        lidar_width = self.config.history_frames * self.config.lidar_bins
-        lidar = observation[:, :lidar_width].reshape(
-            -1, self.config.history_frames, self.config.lidar_bins)
-        goal_start = lidar_width
-        goal = observation[:, goal_start:goal_start + 3]
-        last_action = observation[:, goal_start + 3:]
-
-        features = torch.cat((
-            self.lidar_projection(self.lidar_conv(lidar)),
-            self.goal_encoder(goal),
-            self.action_encoder(last_action),
-        ), dim=1)
-        raw = self.action_head(self.trunk(features))
-
-        # The graph emits SI units. Keeping this squash in-model makes training,
-        # Isaac evaluation, ExecuTorch and the future C++ node share one scale.
-        squashed = torch.tanh(raw)
-        v = 0.5 * self.config.v_max * (squashed[:, :1] + 1.0)
-        omega = self.config.omega_max * squashed[:, 1:]
-        return torch.cat((v, omega), dim=1)
+        return physical_action(self.pre_squash(observation),
+                               self.config.v_max, self.config.omega_max)
 
     @property
     def parameter_count(self) -> int:
@@ -141,7 +190,7 @@ class NavPolicy(nn.Module):
         return torch.zeros(batch_size, self.config.observation_dim, device=device)
 
 
-def _initialize(module: nn.Module) -> None:
+def initialize_layer(module: nn.Module) -> None:
     if isinstance(module, nn.Conv1d):
         nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
         nn.init.zeros_(module.bias)

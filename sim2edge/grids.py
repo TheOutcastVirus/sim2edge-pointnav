@@ -15,7 +15,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 __all__ = ["INF", "UNREACHABLE", "world_to_cell", "cell_to_world", "rasterize",
-           "clearance", "geodesic", "flow_field"]
+           "clearance", "geodesic", "flow_field", "fill_unreachable"]
 
 #: Sentinel for "no path exists". Chosen so that INF + a few thousand step
 #: costs is still representable in float32 without changing value.
@@ -168,6 +168,31 @@ def geodesic(free: np.ndarray, goal_rc, res: float,
             return D
         D = best
     raise RuntimeError("geodesic() did not converge; grid larger than expected")
+
+
+def fill_unreachable(D: np.ndarray, free: np.ndarray) -> np.ndarray:
+    """Give every cell without a usable distance the value of the nearest cell
+    that has one.
+
+    :func:`geodesic` leaves ``INF`` in blocked cells and in free regions walled
+    off from the goal. That is correct as a *planning* answer and catastrophic
+    as a *reward* input: the RL progress term is a difference of consecutive
+    distances, so one step from a finite cell into an ``INF`` one pays the agent
+    a billion metres of progress for grazing an obstacle.
+
+    Filling from the nearest usable cell is the same trick :func:`flow_field`
+    uses for recovery, and it says the same thing: a robot that has drifted off
+    the free grid is as far from the goal as the closest point it can legally
+    stand on. The field stays finite everywhere, so the difference stays bounded
+    without any special case on the device side.
+    """
+    usable = free & (D < UNREACHABLE)
+    if not usable.any():
+        raise ValueError("no reachable free cell to fill from")
+    # EDT measures distance to the nearest *zero*, so the mask is inverted:
+    # indices come back pointing at the nearest usable cell.
+    _, (rows, cols) = distance_transform_edt(~usable, return_indices=True)
+    return D[rows, cols]
 
 
 def flow_field(free: np.ndarray, D: np.ndarray, res: float,

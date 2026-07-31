@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-124 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
+175 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -267,8 +267,150 @@ strongest generalization test.
 
 # Phase 3 — PPO fine-tune
 
-*(Not yet built. `_get_rewards` returns zeros; needs the geodesic-progress
-reward.)*
+BC can only imitate the oracle; it has no notion of reward, so it never learns
+that a collision is bad — only that the expert did not have one. PPO optimizes
+return directly, starting from the BC checkpoint.
+
+## 1. The reward
+
+Implemented in `Sim2EdgeNavEnv._get_rewards`, per control step:
+
+```text
+  progress_reward   * (d_{t-1} - d_t)      geodesic metres, clamped at 0.5 m
++ goal_reward       * reached
+- collision_penalty * collided
+- time_penalty
+- smoothness_penalty * ||a_t - a_{t-1}||²  normalized axes
+```
+
+Defaults are 3.0 / 10.0 / 10.0 / 0.005 / 0.05, and they live on `NavEnvCfg` so
+an experiment changes a config field, not the environment.
+
+`d` is **geodesic**, read from the same distance field that sets episode
+difficulty and the SPL denominator. Euclidean progress pays the robot to drive
+into the concave face of an obstacle. The field is filled from the nearest
+reachable cell (`grids.fill_unreachable`), so it is finite everywhere and no
+step into blocked space can be paid as a billion metres of progress.
+
+Three arithmetic properties are asserted in `tests/test_isaac_adapter.py`: one
+step of travel outearns the time penalty, reaching the goal outearns waiting out
+the clock, and the progress clamp exceeds one grid cell.
+
+## 2. Sanity check the loop before committing a run
+
+```bash
+~/isaac-venv/bin/python scripts/train_ppo.py \
+    --init runs/bc_stack_dagger_v2_e4_final/best.pt \
+    --num_envs 256 --num-steps 16 --iterations 5 --critic-warmup 2 \
+    --out runs/ppo_smoke
+```
+
+**This is too short to measure `SR`, by construction.** 5 × 16 = 80 control
+steps is 4 s of simulated time, and a successful episode on an 8 m geodesic
+takes 200–550 steps at ~0.29 m/s. Only fast failures can finish, so the smoke
+run reports ~100% collision no matter how good the policy is — the same
+survivorship bias the collector's yield figure has, inverted. Read it for
+crashes, throughput and reward scale only.
+
+To measure `SR`, pin the actor and run long enough for episodes to complete:
+
+```bash
+~/isaac-venv/bin/python scripts/train_ppo.py \
+    --init runs/bc_stack_dagger_v2_e4_final/best.pt \
+    --num_envs 512 --num-steps 32 --iterations 40 --critic-warmup 40 \
+    --out runs/ppo_frozen
+```
+
+`--critic-warmup` ≥ `--iterations` freezes the actor for the whole run, so
+whatever `SR` comes out is the BC policy's own behaviour reproduced through the
+PPO rollout — a direct test of observation assembly, the live noise, the action
+convention and termination, with no learning involved. Expect a few points
+below the checkpoint's deterministic held-out number, which is what sampling at
+`--init-std` costs. Measured 2026-07-30: **55.0% success, 44.8% collision,
+0.14% timeout over 2,900 episodes**, against a 58.4% BC baseline at 1× noise.
+Per-iteration `SR` swings ±7 points because each iteration completes only ~75
+episodes; pool across iterations before believing any single one.
+
+## 3. Fine-tune
+
+```bash
+~/isaac-venv/bin/python scripts/train_ppo.py \
+    --init runs/bc_stack_dagger_v2_e4_final/best.pt \
+    --num_envs 2048 --iterations 300 --out runs/ppo_v1
+```
+
+2,048 environments × 32 steps = 65,536 transitions per iteration. Layouts come
+from `--layout-seed 24680`; keep it disjoint from the evaluation seed.
+`--noise-scale 1.0` applies the deployment-level sensor and odometry corruption
+live, because on-policy data is consumed once and has no loader to add it later.
+
+### The BC handoff, and why it is three separate mechanisms
+
+Naive BC-init + PPO destroys a good actor: the critic starts random → advantages
+are noise → the first policy-gradient steps are large random updates to
+carefully fitted weights.
+
+| Mechanism | Flag | Default |
+|---|---|---|
+| Critic warmup, actor LR **exactly** zero | `--critic-warmup` | 25 iterations |
+| Annealed anchor to a frozen BC snapshot | `--anchor-coef` | 1.0, → 0 over 30% of the run |
+| Conservative trust region | `--clip-range`, `--actor-lr` | 0.1, 1e-4 |
+
+The warmup default is 25 and not the 500 an earlier CPU implementation used:
+at 65,536 transitions per iteration, 500 would burn 30M environment steps before
+the policy was permitted to learn anything.
+
+### What to watch, every iteration
+
+| Statistic | Healthy | Trouble |
+|---|---|---|
+| `SR` | ≥ the BC baseline from the start | below it → the anchor released too early |
+| `std` | slowly decreasing | sudden drop → exploration dead |
+| `kl` | well under `max_kl` (0.02) | at the cap every iteration → steps too big |
+| `clip` | 0.1 – 0.3 | near 1.0 → the update is fighting the clip |
+| `ev` (explained variance) | climbing toward 1 during warmup, then ≳0.9 | near 0 or negative → the critic is not learning and the warmup bought nothing |
+
+Read `ev`, never the raw value loss. Measured on a frozen-actor run at 512
+envs × 32 steps, the critic improved monotonically — `ev` 0.02 → 0.76 over
+eight iterations — while `value_loss` *rose* 0.06 → 2.77, because its targets
+were growing as terminal rewards began landing (0 → 88 completed episodes per
+iteration). The raw loss is in squared return units and misleads in both
+directions. `ev` reached 0.76 on 16k transitions per iteration, so the 25-iteration
+warmup default has ample margin at the production 65k.
+| `timeout_rate` | under ~1% | climbing → truncation-as-termination stops being a safe approximation |
+
+Checkpoints: `best.pt` on rollout success rate (never on a loss — Phase 2 showed
+offline loss improving while navigation did not), `latest.pt` every 10
+iterations, `final.pt` at the end. All three carry the actor under the same keys
+a BC checkpoint uses, so `scripts/eval_bc.py`, DAgger collection and export
+accept them without knowing which algorithm produced them.
+
+Resume:
+
+```bash
+~/isaac-venv/bin/python scripts/train_ppo.py --resume runs/ppo_v1/latest.pt \
+    --init runs/bc_stack_dagger_v2_e4_final/best.pt --out runs/ppo_v1
+```
+
+## 4. Evaluate the same way as Phase 2
+
+```bash
+~/isaac-venv/bin/python scripts/eval_bc.py runs/ppo_v1/best.pt \
+    --episodes 512 --layout-seed 10000000 --out runs/ppo_v1/eval.json
+```
+
+Rollout success during training is measured on *training* layouts with
+exploration noise still active; it is a progress signal, not a result. The
+held-out closed-loop number remains the one that counts.
+
+## Implementation map
+
+```text
+sim2edge/models/actor_critic.py  Gaussian wrapper + critic around the actor
+sim2edge/training/ppo.py         buffer, GAE, clipped surrogate, handoff
+isaaclab_env/nav_task.py         the reward and the live observation noise
+scripts/train_ppo.py             the rollout loop, and only that
+```
 
 ---
 
@@ -299,9 +441,10 @@ preprocessing parity test.)*
 sim2edge/        simulator-free core: spec, grids, rooms, oracle,
                  preprocess, noise, dataset
 isaaclab_env/    Isaac Lab adapter -- owns no task definition
-scripts/         collect_bc.py, verify_shard.py
+scripts/         collect_bc.py, verify_shard.py, train_bc.py,
+                 eval_bc.py, train_ppo.py
 tools/           convert_tb4.py
-tests/           100 tests, no GPU or simulator required
+tests/           175 tests, no GPU or simulator required
 docs/daily/      engineering log
 assets/, data/   generated; not in git
 ```
