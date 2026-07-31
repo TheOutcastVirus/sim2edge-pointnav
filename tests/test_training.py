@@ -11,7 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from sim2edge.dataset import save_shard
-from sim2edge.spec import OMEGA_MAX, V_MAX
+from sim2edge.spec import OBS_DIM, OMEGA_MAX, V_MAX
 from sim2edge.training import (BCConfig, ShardCorpus, load_policy_checkpoint,
                                train_bc)
 from sim2edge.training.bc import imitation_loss
@@ -48,6 +48,23 @@ def test_normalized_loss_gives_equal_errors_equal_weight():
     prediction = torch.tensor([[V_MAX * 0.6, OMEGA_MAX * 0.2]])
     _, v_loss, omega_loss = imitation_loss(prediction, target, omega_weight=1.0)
     assert v_loss == pytest.approx(omega_loss, rel=1e-6)
+
+
+def test_overspeed_penalty_only_applies_to_emphasized_samples():
+    target = torch.tensor([[0.20, 0.0], [0.20, 0.0]])
+    prediction = torch.tensor([[0.25, 0.0], [0.25, 0.0]])
+    weights = torch.tensor([1.0, 3.0])
+    base, _, _ = imitation_loss(
+        prediction, target, sample_weight=weights, overspeed_weight=1.0)
+    asymmetric, _, _ = imitation_loss(
+        prediction, target, sample_weight=weights, overspeed_weight=2.0)
+    assert asymmetric > base
+
+    ordinary_base, _, _ = imitation_loss(
+        prediction[:1], target[:1], overspeed_weight=1.0)
+    ordinary_asymmetric, _, _ = imitation_loss(
+        prediction[:1], target[:1], overspeed_weight=2.0)
+    assert ordinary_asymmetric == ordinary_base
 
 
 def test_corpus_split_is_deterministic_and_whole_shard(tmp_path):
@@ -132,7 +149,7 @@ def test_tiny_training_run_writes_loadable_transparent_artifacts(tmp_path):
     assert (output / "best.pt").is_file()
     assert (output / "final.pt").is_file()
     policy = load_policy_checkpoint(output / "final.pt")
-    assert policy(torch.zeros(2, 185)).shape == (2, 2)
+    assert policy(torch.zeros(2, OBS_DIM)).shape == (2, 2)
 
     # Reissuing resume after completion is idempotent, which is useful in job
     # scripts whose worker status can be lost independently of the checkpoint.

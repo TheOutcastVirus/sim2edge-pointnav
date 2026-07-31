@@ -29,6 +29,18 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=BCConfig.epochs)
     parser.add_argument("--batch-size", type=int, default=BCConfig.batch_size)
     parser.add_argument("--lr", type=float, default=BCConfig.learning_rate)
+    parser.add_argument("--collision-tail-steps", type=int,
+                        default=BCConfig.collision_tail_steps)
+    parser.add_argument("--collision-tail-weight", type=float,
+                        default=BCConfig.collision_tail_weight)
+    parser.add_argument("--near-obstacle-m", type=float,
+                        default=BCConfig.near_obstacle_m)
+    parser.add_argument("--near-obstacle-weight", type=float,
+                        default=BCConfig.near_obstacle_weight)
+    parser.add_argument("--near-obstacle-overspeed-weight", type=float,
+                        default=BCConfig.near_obstacle_overspeed_weight)
+    parser.add_argument("--policy-data-weight", type=float,
+                        default=BCConfig.policy_data_weight)
     parser.add_argument("--val-shards", type=int, default=BCConfig.val_shards)
     parser.add_argument("--max-train-shards", type=int)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction,
@@ -47,6 +59,12 @@ def main() -> None:
     config = replace(
         BCConfig(), epochs=args.epochs, batch_size=args.batch_size,
         learning_rate=args.lr, val_shards=args.val_shards,
+        collision_tail_steps=args.collision_tail_steps,
+        collision_tail_weight=args.collision_tail_weight,
+        near_obstacle_m=args.near_obstacle_m,
+        near_obstacle_weight=args.near_obstacle_weight,
+        near_obstacle_overspeed_weight=args.near_obstacle_overspeed_weight,
+        policy_data_weight=args.policy_data_weight,
         max_train_shards=args.max_train_shards,
         compile_model=args.compile, prefetch=args.prefetch, amp=args.amp,
         prefetch_workers=args.prefetch_workers,

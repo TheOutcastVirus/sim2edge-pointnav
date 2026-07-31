@@ -9,10 +9,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sim2edge.preprocess import (bin_lidar, build_observation, goal_features,
-                                 wrap_angle)
+from sim2edge.preprocess import (ObservationHistory, bin_lidar,
+                                 build_observation, goal_features, wrap_angle)
 from sim2edge.spec import (GOAL_MAX_M, INVALID_FILL, LIDAR_BINS, LIDAR_MAX_M,
-                           LIDAR_MIN_M, OBS_DIM)
+                           LIDAR_MIN_M, HISTORY_FRAMES, OBS_DIM)
 
 
 def _beams(n=720):
@@ -182,16 +182,35 @@ def test_distance_saturates_rather_than_growing_without_bound():
 # ── assembly ─────────────────────────────────────────────────────────────────
 
 def test_observation_layout_matches_the_declared_dimension():
-    obs = build_observation(torch.zeros(3, LIDAR_BINS), torch.zeros(3, 3),
-                            torch.zeros(3, 2))
+    obs = build_observation(
+        torch.zeros(3, HISTORY_FRAMES, LIDAR_BINS), torch.zeros(3, 3),
+        torch.zeros(3, HISTORY_FRAMES, 2))
     assert obs.shape == (3, OBS_DIM)
 
 
 def test_observation_order_is_lidar_goal_action():
-    lidar = torch.full((1, LIDAR_BINS), 0.5)
+    lidar = torch.arange(HISTORY_FRAMES * LIDAR_BINS).reshape(
+        1, HISTORY_FRAMES, LIDAR_BINS)
     goal = torch.tensor([[1.0, 2.0, 3.0]])
-    last = torch.tensor([[4.0, 5.0]])
+    last = torch.arange(HISTORY_FRAMES * 2).reshape(1, HISTORY_FRAMES, 2)
     obs = build_observation(lidar, goal, last)
-    assert torch.equal(obs[0, :LIDAR_BINS], lidar[0])
-    assert torch.equal(obs[0, LIDAR_BINS:LIDAR_BINS + 3], goal[0])
-    assert torch.equal(obs[0, -2:], last[0])
+    lidar_width = HISTORY_FRAMES * LIDAR_BINS
+    assert torch.equal(obs[0, :lidar_width], lidar.flatten())
+    assert torch.equal(obs[0, lidar_width:lidar_width + 3], goal[0])
+    assert torch.equal(obs[0, -HISTORY_FRAMES * 2:], last.flatten())
+
+
+def test_live_history_repeats_first_frame_then_advances_oldest_to_newest():
+    history = ObservationHistory(2, frames=3, lidar_bins=2, device="cpu")
+    first_lidar = torch.tensor([[1.0, 2.0], [10.0, 20.0]])
+    first_action = torch.tensor([[0.1, 0.2], [1.0, 2.0]])
+    history.push(first_lidar, first_action)
+    assert torch.equal(history.lidar[0], first_lidar[0].expand(3, -1))
+
+    second_lidar = first_lidar + 1
+    second_action = first_action + 1
+    history.push(second_lidar, second_action, torch.tensor([False, True]))
+    assert torch.equal(history.lidar[0, 0], first_lidar[0])
+    assert torch.equal(history.lidar[0, -1], second_lidar[0])
+    assert torch.equal(history.lidar[1], second_lidar[1].expand(3, -1))
+    assert torch.equal(history.action[1], second_action[1].expand(3, -1))

@@ -64,7 +64,7 @@ except ImportError as exc:                       # pragma: no cover
 
 from sim2edge import rooms as rooms_mod
 from sim2edge.oracle import LayoutPool, oracle_action
-from sim2edge.preprocess import bin_lidar, build_observation, goal_features
+from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
 from sim2edge.rooms import MAX_OBSTACLES, sample_room, sample_start_positions
 from sim2edge.spec import (DT, GOAL_MAX_M, GOAL_TOLERANCE_M, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
                            LIDAR_MOUNT_YAW, OBS_DIM, OMEGA_MAX, ROBOT_RADIUS_M,
@@ -350,6 +350,10 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         beams = torch.arange(LIDAR_BEAMS, device=self.device, dtype=torch.float32)
         self._beam_angles = (beams * (2.0 * math.pi / LIDAR_BEAMS)
                              + LIDAR_MOUNT_YAW)
+        self._observation_history = ObservationHistory(
+            n, device=self.device)
+        self._history_reset = torch.ones(
+            n, dtype=torch.bool, device=self.device)
 
     # ── scene ────────────────────────────────────────────────────────────────
 
@@ -476,6 +480,7 @@ class Sim2EdgeNavEnv(DirectRLEnv):
 
         self._goal_w[env_ids] = self._room_goal[layout] + origins[:, :2]
         self._action[env_ids] = 0.0
+        self._history_reset[env_ids] = True
         self._planar_pose_target[env_ids, :2] = root[:, :2]
         self._planar_pose_target[env_ids, 2] = start[:, 2]
 
@@ -563,12 +568,14 @@ class Sim2EdgeNavEnv(DirectRLEnv):
             return {"policy": self._collection_obs}
 
         pose = self._robot_pose()
-        obs = build_observation(
+        self._observation_history.push(
             bin_lidar(self._lidar_ranges(), self._beam_angles),
-            goal_features(pose, self._goal_w - self.scene.env_origins[:, :2]),
             torch.stack([self._action[:, 0] / V_MAX,
                          self._action[:, 1] / OMEGA_MAX], dim=1),
-        )
+            self._history_reset)
+        self._history_reset.zero_()
+        obs = self._observation_history.observation(
+            goal_features(pose, self._goal_w - self.scene.env_origins[:, :2]))
         return {"policy": obs}
 
     # ── the oracle, for BC collection ────────────────────────────────────────

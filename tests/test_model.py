@@ -4,8 +4,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sim2edge.models import NavPolicy
-from sim2edge.spec import OBS_DIM, OMEGA_MAX, V_MAX
+from sim2edge.models import NavPolicy, NavPolicyConfig
+from sim2edge.spec import LIDAR_BINS, OBS_DIM, OMEGA_MAX, V_MAX
 
 
 def test_policy_emits_physical_bounded_actions():
@@ -35,3 +35,9 @@ def test_graph_exports_with_static_deployment_signature():
 def test_parameter_budget_stays_edge_sized():
     policy = NavPolicy()
     assert 100_000 < policy.parameter_count < 500_000
+
+
+def test_legacy_one_frame_configuration_remains_loadable():
+    config = NavPolicyConfig.from_dict({"history_frames": 1})
+    policy = NavPolicy(config)
+    assert policy.example_input(2).shape == (2, LIDAR_BINS + 5)

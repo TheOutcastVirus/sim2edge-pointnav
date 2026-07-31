@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="must differ from the collection layout seed")
     parser.add_argument("--noise-scales", type=float, nargs="+",
                         default=(0.0, 1.0, 2.0))
+    parser.add_argument("--speed-cap-stop-m", type=float,
+                        help="optional forward-clearance distance that caps v at zero")
+    parser.add_argument("--speed-cap-full-m", type=float, default=0.60,
+                        help="clearance at which the optional speed cap permits full v")
     parser.add_argument("--out", type=Path, default=Path("runs/bc_eval.json"))
     parser.add_argument("--gui", action="store_true")
     return parser
@@ -41,6 +45,9 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.episodes < 1:
         raise ValueError("episodes must be positive")
+    if (args.speed_cap_stop_m is not None
+            and not 0.0 < args.speed_cap_stop_m < args.speed_cap_full_m):
+        raise ValueError("speed cap needs 0 < stop distance < full-speed distance")
 
     # Isaac's native modules become importable only after AppLauncher starts.
     from isaaclab.app import AppLauncher
@@ -50,9 +57,9 @@ def main() -> None:
 
     from isaaclab_env.nav_task import NavEnvCfg, Sim2EdgeNavEnv, normalize_action
     from sim2edge import noise as noise_mod
-    from sim2edge.preprocess import bin_lidar, build_observation, goal_features
+    from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
     from sim2edge.spec import (DT, GOAL_TOLERANCE_M, OMEGA_MAX, V_MAX,
-                               fingerprint)
+                               fingerprint, observation_fingerprint)
     from sim2edge.training import load_policy_checkpoint
 
     sys.stdout.reconfigure(line_buffering=True)
@@ -76,9 +83,11 @@ def main() -> None:
         report, layouts = _evaluate_tier(env, policy, float(scale),
                                          args.layout_seed, torch,
                                          noise_mod, bin_lidar,
-                                         build_observation, goal_features,
+                                         ObservationHistory, goal_features,
                                          normalize_action, DT, V_MAX, OMEGA_MAX,
-                                         GOAL_TOLERANCE_M)
+                                         GOAL_TOLERANCE_M,
+                                         args.speed_cap_stop_m,
+                                         args.speed_cap_full_m)
         if (reference_layouts is not None
                 and not torch.equal(layouts, reference_layouts)):
             raise RuntimeError("re-seeded evaluation produced different layouts")
@@ -93,10 +102,15 @@ def main() -> None:
     result = {
         "checkpoint": str(args.checkpoint.resolve()),
         "spec_fingerprint": fingerprint(),
+        "observation_fingerprint": observation_fingerprint(
+            policy.config.history_frames),
         "episodes": args.episodes,
         "num_layouts": args.num_layouts,
         "layout_seed": args.layout_seed,
         "paired_layouts_across_tiers": True,
+        "speed_cap_stop_m": args.speed_cap_stop_m,
+        "speed_cap_full_m": (args.speed_cap_full_m
+                              if args.speed_cap_stop_m is not None else None),
         "tiers": reports,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -111,8 +125,9 @@ def main() -> None:
 
 
 def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
-                   bin_lidar, build_observation, goal_features,
-                   normalize_action, dt, v_max, omega_max, goal_tolerance):
+                   bin_lidar, ObservationHistory, goal_features,
+                   normalize_action, dt, v_max, omega_max, goal_tolerance,
+                   speed_cap_stop_m=None, speed_cap_full_m=0.60):
     """Run one initial episode per environment and aggregate on the GPU."""
     torch.manual_seed(seed)
     env.reset(seed=seed)
@@ -126,6 +141,9 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
     distance = torch.zeros(n, device=device)
     jerk_sum = torch.zeros(n, device=device)
     previous = torch.zeros(n, 2, device=device)
+    history = ObservationHistory(
+        n, frames=policy.config.history_frames,
+        lidar_bins=policy.config.lidar_bins, device=device)
     success = torch.zeros(n, dtype=torch.bool, device=device)
     collision = torch.zeros(n, dtype=torch.bool, device=device)
     timeout = torch.zeros(n, dtype=torch.bool, device=device)
@@ -136,6 +154,8 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
     # SPL targets the success region rather than the goal cell at its centre.
     optimal = (env._optimal_path_m.clone() - goal_tolerance).clamp_min(0.0)
     inference_seconds = 0.0
+    capped_steps = torch.zeros((), device=device)
+    active_steps = torch.zeros((), device=device)
     while bool(active.any()):
         pose = env._robot_pose()
         ranges, angles = env.raw_scan()
@@ -146,9 +166,8 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
             pose, goal, scale, noise_generator)
         last_action = torch.stack((env._action[:, 0] / v_max,
                                    env._action[:, 1] / omega_max), dim=1)
-        observation = build_observation(
-            bin_lidar(noisy_ranges, noisy_angles),
-            goal_features(noisy_pose, noisy_goal), last_action)
+        history.push(bin_lidar(noisy_ranges, noisy_angles), last_action)
+        observation = history.observation(goal_features(noisy_pose, noisy_goal))
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -161,6 +180,14 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
             torch.cuda.synchronize()
         inference_seconds += time.perf_counter() - started
 
+        if speed_cap_stop_m is not None:
+            uncapped_v = command[:, 0]
+            command = _cap_forward_speed(
+                command, noisy_ranges, noisy_angles,
+                speed_cap_stop_m, speed_cap_full_m, v_max, torch)
+            capped_steps += ((command[:, 0] < uncapped_v - 1.0e-6)
+                             & active).sum()
+        active_steps += active.sum()
         command = torch.where(active[:, None], command, torch.zeros_like(command))
         normalized = torch.stack((command[:, 0] / v_max,
                                   command[:, 1] / omega_max), dim=1)
@@ -196,8 +223,22 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
                                  if bool(success.any()) else math.nan),
         "mean_jerk": float((jerk_sum / steps.clamp_min(1)).mean()),
         "mean_inference_ms": 1000.0 * inference_seconds / int(steps.max()),
+        "speed_cap_activation_rate": (float(capped_steps / active_steps)
+                                       if speed_cap_stop_m is not None else 0.0),
     }
     return result, layout_ids
+
+
+def _cap_forward_speed(command, ranges, angles, stop_m, full_m, v_max, torch):
+    """Linearly limit forward speed from the nearest return in a 120° cone."""
+    if angles.dim() == 1:
+        angles = angles.unsqueeze(0).expand(ranges.shape[0], -1)
+    forward = torch.cos(angles) >= 0.5
+    nearest = torch.where(
+        forward, ranges, torch.full_like(ranges, torch.inf)).amin(dim=1)
+    fraction = ((nearest - stop_m) / (full_m - stop_m)).clamp(0.0, 1.0)
+    cap = fraction * v_max
+    return torch.stack((torch.minimum(command[:, 0], cap), command[:, 1]), dim=1)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,11 @@ That is what puts the robot in a tube of states around the expert path while
 still labelling each one with what the expert would do there. Without it every
 state in the dataset is one the oracle put itself in, and the policy has no
 recovery behaviour at all.
+
+Passing ``--driver-checkpoint`` switches execution to a learned policy while
+the oracle continues to provide every stored label.  This is the minimal DAgger
+operation: collect the states caused by the policy's systematic errors, without
+changing the durable observation or label format.
 """
 
 from __future__ import annotations
@@ -61,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="execution noise as a fraction of each axis limit. "
                          "0 collects pure on-policy expert data, which is the "
                          "distribution BC fails on -- see the module docstring")
+    ap.add_argument("--driver-checkpoint", type=Path,
+                    help="execute this policy while retaining oracle labels (DAgger)")
     ap.add_argument("--validation_fraction", type=float, default=0.05,
                     help="fraction of layout IDs routed to validation/; 0 keeps "
                          "the legacy single-directory format")
@@ -93,6 +100,8 @@ def main() -> None:
         raise ValueError("--validation_fraction must be in [0, 1)")
     if args.starts_per_layout < 1 or args.writer_queue < 1:
         raise ValueError("starts_per_layout and writer_queue must be positive")
+    if args.driver_checkpoint is not None and not args.driver_checkpoint.is_file():
+        raise FileNotFoundError(args.driver_checkpoint)
 
     # Line-buffer stdout. Redirected to a file it is block-buffered, so progress
     # lines sit in the buffer until exit -- and a run whose shutdown wedges never
@@ -111,7 +120,9 @@ def main() -> None:
     from isaaclab_env.nav_task import NavEnvCfg, Sim2EdgeNavEnv, normalize_action
     from sim2edge.dataset import save_shard
     from sim2edge.oracle import perturb_action
-    from sim2edge.spec import LIDAR_BINS
+    from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
+    from sim2edge.spec import LIDAR_BINS, OMEGA_MAX, V_MAX
+    from sim2edge.training import load_policy_checkpoint
 
     cfg = NavEnvCfg()
     cfg.scene.num_envs = args.num_envs
@@ -152,15 +163,28 @@ def main() -> None:
     env.reset()
     print("[collect] drive-response preflight passed", flush=True)
 
+    driver_policy = None
+    driver_history = None
+    reset_history = None
+    driver = "oracle"
+    if args.driver_checkpoint is not None:
+        driver_policy = load_policy_checkpoint(args.driver_checkpoint, device=device)
+        driver_history = ObservationHistory(
+            env.num_envs, frames=driver_policy.config.history_frames,
+            lidar_bins=driver_policy.config.lidar_bins, device=device)
+        driver = "policy"
+        print(f"[collect] DAgger driver: {args.driver_checkpoint} ",
+              f"({driver_policy.parameter_count:,} parameters)", flush=True)
+
     collector = Collector(args.out, args.shard_steps, args.num_envs,
                           max_steps=int(env.max_episode_length),
                           n_beams=int(env._beam_angles.shape[0]),
                           device=device, layout_seed=args.seed,
                           num_layouts=args.num_layouts,
                           starts_per_layout=args.starts_per_layout,
-                          sigma=args.sigma,
+                          sigma=(0.0 if driver_policy is not None else args.sigma),
                           validation_fraction=args.validation_fraction,
-                          writer_queue=args.writer_queue)
+                          writer_queue=args.writer_queue, driver=driver)
     step = 0
     # Wall-clock per control step, split so the bottleneck is attributable
     # rather than inferred. `sim` covers observation + oracle + env.step;
@@ -189,8 +213,18 @@ def main() -> None:
         ranges, angles = env.raw_scan()
 
         label = env.oracle_command(pose)             # unperturbed: this is the label
-        executed = perturb_action(label, args.sigma, generator=gen,
-                                  prev_action=env._action)
+        if driver_policy is None:
+            executed = perturb_action(label, args.sigma, generator=gen,
+                                      prev_action=env._action)
+        else:
+            last_action = torch.stack((env._action[:, 0] / V_MAX,
+                                       env._action[:, 1] / OMEGA_MAX), dim=1)
+            driver_history.push(bin_lidar(ranges, angles), last_action,
+                                reset_history)
+            observation = driver_history.observation(goal_features(
+                pose, env._goal_w - env.scene.env_origins[:, :2]))
+            with torch.inference_mode():
+                executed = driver_policy(observation)
 
         _t = time.perf_counter()
         collector.record(
@@ -202,6 +236,7 @@ def main() -> None:
         _, _, terminated, truncated, _ = env.step(normalize_action(executed))
 
         done = terminated | truncated
+        reset_history = done
         if done.any():
             collector.flush(done, env._reached, env._collided, angles,
                             filter_failures=args.filter_failures)
@@ -362,7 +397,7 @@ class Collector:
                  max_steps: int, n_beams: int, device, *, layout_seed: int = 0,
                  num_layouts: int = 0, starts_per_layout: int = 1,
                  sigma: float = 0.0, validation_fraction: float = 0.0,
-                 writer_queue: int = 2):
+                 writer_queue: int = 2, driver: str = "oracle"):
         self.out, self.shard_steps, self.device = out, shard_steps, device
         self.num_envs, self.max_steps = num_envs, max_steps
         if not 0.0 <= validation_fraction < 1.0:
@@ -373,6 +408,9 @@ class Collector:
         self.num_layouts = num_layouts
         self.starts_per_layout = starts_per_layout
         self.sigma = sigma
+        if driver not in ("oracle", "policy"):
+            raise ValueError("driver must be 'oracle' or 'policy'")
+        self.driver = driver
         self.validation_fraction = validation_fraction
 
         self.b_ranges = np.zeros((num_envs, max_steps, n_beams), np.float16)
@@ -579,6 +617,7 @@ class Collector:
             "num_layouts": np.array(self.num_layouts, dtype=np.int32),
             "starts_per_layout": np.array(self.starts_per_layout, dtype=np.int32),
             "sigma": np.array(self.sigma, dtype=np.float32),
+            "driver": np.array(self.driver),
             "validation_fraction": np.array(
                 self.validation_fraction, dtype=np.float32),
             "validation_layout_ids": self.validation_layout_ids,

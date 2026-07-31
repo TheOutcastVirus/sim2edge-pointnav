@@ -24,7 +24,8 @@ import math
 __all__ = ["LIDAR_BINS", "LIDAR_MIN_M", "LIDAR_MAX_M", "INVALID_FILL",
            "GOAL_MAX_M", "GOAL_TOLERANCE_M", "V_MAX", "OMEGA_MAX", "ACCEL_MAX", "ALPHA_MAX", "DT",
            "ROBOT_RADIUS_M", "BODY_RADIUS_M", "LIDAR_MOUNT_XYZ", "LIDAR_MOUNT_YAW",
-           "BIN_WIDTH_RAD", "OBS_DIM", "fingerprint"]
+           "BIN_WIDTH_RAD", "HISTORY_FRAMES", "OBS_DIM", "fingerprint",
+           "observation_fingerprint"]
 
 # ── Lidar ────────────────────────────────────────────────────────────────────
 # 180 bins over the full 360 degrees. Coarse on purpose: the policy needs
@@ -93,12 +94,17 @@ LIDAR_MOUNT_XYZ = (0.0039, 0.0, 0.1395)
 # changes how the observation is constructed.
 LIDAR_MOUNT_YAW = math.pi / 2
 
-# Flat observation layout: [lidar | goal(3) | last_action(2)].
-OBS_DIM = LIDAR_BINS + 3 + 2
+# Four frames are the smallest planned temporal representation: at 20 Hz they
+# expose 150 ms of motion without recurrent state in the deployed graph.
+HISTORY_FRAMES = 4
+
+# Flat observation layout, oldest to newest within each history block:
+# [lidar(H, B) | current_goal(3) | previous_action(H, 2)].
+OBS_DIM = HISTORY_FRAMES * LIDAR_BINS + 3 + HISTORY_FRAMES * 2
 
 
 def fingerprint() -> str:
-    """16 hex chars over the values above; stamped into datasets and checkpoints.
+    """16 hex chars over the raw sensor contract; stamped into datasets.
 
     A dataset collected at 180 bins and loaded by a policy expecting 120 has
     compatible-looking shapes right up until it doesn't. Consumers compare this
@@ -112,4 +118,14 @@ def fingerprint() -> str:
               V_MAX, OMEGA_MAX, ACCEL_MAX, ALPHA_MAX, DT, ROBOT_RADIUS_M,
               LIDAR_MOUNT_XYZ, LIDAR_MOUNT_YAW]
     canon = ";".join(repr(v) for v in values)
+    return hashlib.sha256(canon.encode()).hexdigest()[:16]
+
+
+def observation_fingerprint(history_frames: int = HISTORY_FRAMES) -> str:
+    """Fingerprint the loader/model layout without invalidating raw shards.
+
+    History is assembled from sequential samples at load time, so changing its
+    length requires a new model checkpoint but not an expensive recollection.
+    """
+    canon = f"{fingerprint()};history-v1;{history_frames}"
     return hashlib.sha256(canon.encode()).hexdigest()[:16]

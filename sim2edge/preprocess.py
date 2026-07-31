@@ -29,10 +29,11 @@ import math
 
 import torch
 
-from .spec import (BIN_WIDTH_RAD, GOAL_MAX_M, INVALID_FILL, LIDAR_BINS,
-                   LIDAR_MAX_M, LIDAR_MIN_M)
+from .spec import (BIN_WIDTH_RAD, GOAL_MAX_M, HISTORY_FRAMES, INVALID_FILL,
+                   LIDAR_BINS, LIDAR_MAX_M, LIDAR_MIN_M)
 
-__all__ = ["wrap_angle", "bin_lidar", "goal_features", "build_observation"]
+__all__ = ["ObservationHistory", "wrap_angle", "bin_lidar", "goal_features",
+           "build_observation"]
 
 
 def wrap_angle(a: torch.Tensor) -> torch.Tensor:
@@ -108,11 +109,46 @@ def goal_features(robot_pose: torch.Tensor, goal_xy: torch.Tensor) -> torch.Tens
 
 def build_observation(lidar: torch.Tensor, goal: torch.Tensor,
                       last_action: torch.Tensor) -> torch.Tensor:
-    """Concatenate in the one order every consumer agrees on: lidar|goal|action.
+    """Concatenate history in the agreed order: lidar history|goal|action history.
 
-    ``last_action`` is the previous *commanded* (v, omega), normalized to
-    [-1, 1] by the caller. It is not decoration: without it, an action-smoothness
-    penalty depends on information absent from the observation, so the optimal
-    action is not representable by the policy.
+    History tensors are ``(N, H, B)`` / ``(N, H, 2)`` and ordered oldest to
+    newest. A two-dimensional input is accepted as a one-frame legacy layout.
+    ``last_action`` contains previous *commands*, normalized by the caller.
     """
-    return torch.cat([lidar, goal, last_action], dim=1)
+    return torch.cat([lidar.flatten(1), goal, last_action.flatten(1)], dim=1)
+
+
+class ObservationHistory:
+    """Small per-environment FIFO shared by live collection and evaluation."""
+
+    def __init__(self, batch_size: int, *, frames: int = HISTORY_FRAMES,
+                 lidar_bins: int = LIDAR_BINS, device=None):
+        if frames < 1:
+            raise ValueError("history frames must be positive")
+        self.frames = frames
+        self.lidar = torch.empty(batch_size, frames, lidar_bins, device=device)
+        self.action = torch.empty(batch_size, frames, 2, device=device)
+        self.initialized = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    def push(self, lidar: torch.Tensor, action: torch.Tensor,
+             reset: torch.Tensor | None = None) -> None:
+        """Append one frame; reset environments repeat it across the history."""
+        if reset is None:
+            reset = ~self.initialized
+        else:
+            reset = reset | ~self.initialized
+        if self.frames > 1:
+            self.lidar[:, :-1] = self.lidar[:, 1:].clone()
+            self.action[:, :-1] = self.action[:, 1:].clone()
+        self.lidar[:, -1] = lidar
+        self.action[:, -1] = action
+        # Empty advanced indexing is a no-op and avoids a GPU->CPU sync on the
+        # every-control-tick live path just to ask whether any bit is set.
+        self.lidar[reset] = lidar[reset, None, :]
+        self.action[reset] = action[reset, None, :]
+        self.initialized.fill_(True)
+
+    def observation(self, goal: torch.Tensor) -> torch.Tensor:
+        if not bool(self.initialized.all()):
+            raise RuntimeError("history must receive a frame before observation")
+        return build_observation(self.lidar, goal, self.action)

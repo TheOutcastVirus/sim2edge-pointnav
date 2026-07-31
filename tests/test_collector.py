@@ -138,6 +138,17 @@ def test_layout_split_routes_whole_episode_and_stamps_provenance(tmp_path):
         assert str(shard["split"]) == "validation"
 
 
+def test_policy_driver_is_stamped_for_dagger_weighting(tmp_path):
+    c = Collector(tmp_path, 100, 1, max_steps=10, n_beams=3, device="cpu",
+                  driver="policy")
+    _record(c, 3)
+    c.flush(torch.tensor([True]), torch.tensor([True]), torch.tensor([False]),
+            torch.zeros(3), filter_failures=False)
+    c.close(torch.zeros(3))
+    with np.load(tmp_path / "bc_000.npz") as shard:
+        assert str(shard["driver"]) == "policy"
+
+
 def test_compression_runs_asynchronously(tmp_path, monkeypatch):
     import threading
     from sim2edge import dataset

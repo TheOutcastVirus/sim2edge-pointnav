@@ -24,7 +24,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ..spec import LIDAR_BINS, OBS_DIM, OMEGA_MAX, V_MAX
+from ..spec import HISTORY_FRAMES, LIDAR_BINS, OMEGA_MAX, V_MAX
 
 __all__ = ["NavPolicy", "NavPolicyConfig"]
 
@@ -34,6 +34,7 @@ class NavPolicyConfig:
     """Architecture only; training hyperparameters live with the trainer."""
 
     lidar_bins: int = LIDAR_BINS
+    history_frames: int = HISTORY_FRAMES
     lidar_channels: tuple[int, ...] = (32, 64, 64)
     lidar_features: int = 128
     goal_features: int = 32
@@ -53,7 +54,14 @@ class NavPolicyConfig:
         for key in ("lidar_channels", "trunk"):
             if key in value:
                 value[key] = tuple(value[key])
+        # Checkpoints produced before temporal stacking remain usable for
+        # controlled comparisons and DAgger collection.
+        value.setdefault("history_frames", 1)
         return cls(**value)
+
+    @property
+    def observation_dim(self) -> int:
+        return self.history_frames * self.lidar_bins + 3 + self.history_frames * 2
 
 
 def _mlp(sizes: tuple[int, ...]) -> nn.Sequential:
@@ -72,7 +80,7 @@ class NavPolicy(nn.Module):
         cfg = self.config
 
         conv: list[nn.Module] = []
-        channels = 1
+        channels = cfg.history_frames
         length = cfg.lidar_bins
         for index, output_channels in enumerate(cfg.lidar_channels):
             kernel = 5 if index < 2 else 3
@@ -91,7 +99,7 @@ class NavPolicy(nn.Module):
             nn.ReLU(),
         )
         self.goal_encoder = _mlp((3, cfg.goal_features))
-        self.action_encoder = _mlp((2, cfg.action_features))
+        self.action_encoder = _mlp((2 * cfg.history_frames, cfg.action_features))
 
         fused = cfg.lidar_features + cfg.goal_features + cfg.action_features
         self.trunk = _mlp((fused,) + cfg.trunk)
@@ -104,10 +112,12 @@ class NavPolicy(nn.Module):
         nn.init.zeros_(self.action_head.bias)
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        lidar = observation[:, :self.config.lidar_bins].unsqueeze(1)
-        goal_start = self.config.lidar_bins
+        lidar_width = self.config.history_frames * self.config.lidar_bins
+        lidar = observation[:, :lidar_width].reshape(
+            -1, self.config.history_frames, self.config.lidar_bins)
+        goal_start = lidar_width
         goal = observation[:, goal_start:goal_start + 3]
-        last_action = observation[:, goal_start + 3:goal_start + 5]
+        last_action = observation[:, goal_start + 3:]
 
         features = torch.cat((
             self.lidar_projection(self.lidar_conv(lidar)),
@@ -128,7 +138,7 @@ class NavPolicy(nn.Module):
         return sum(parameter.numel() for parameter in self.parameters())
 
     def example_input(self, batch_size: int = 1, device=None) -> torch.Tensor:
-        return torch.zeros(batch_size, OBS_DIM, device=device)
+        return torch.zeros(batch_size, self.config.observation_dim, device=device)
 
 
 def _initialize(module: nn.Module) -> None:

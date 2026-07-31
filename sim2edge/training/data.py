@@ -69,7 +69,7 @@ def inspect_shard(path: Path) -> ShardInfo:
     if got != want:
         raise ValueError(
             f"shard {path} was collected under spec {got}, this process is "
-            f"{want}. Refusing to mix observation contracts."
+            f"{want}. Refusing to mix raw sensor contracts."
         )
     return ShardInfo(path=path, samples=samples, bytes=path.stat().st_size)
 

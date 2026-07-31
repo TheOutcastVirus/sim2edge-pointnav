@@ -23,8 +23,9 @@ import numpy as np
 import torch
 
 from sim2edge.dataset import load_shard
-from sim2edge.spec import (DT, INVALID_FILL, LIDAR_BINS, LIDAR_MAX_M,
-                           LIDAR_MIN_M, OBS_DIM, OMEGA_MAX, V_MAX, fingerprint)
+from sim2edge.spec import (DT, HISTORY_FRAMES, INVALID_FILL, LIDAR_BINS,
+                           LIDAR_MAX_M, LIDAR_MIN_M, OBS_DIM, OMEGA_MAX,
+                           V_MAX, fingerprint)
 
 PASS, FAIL, WARN = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m", "\033[33mWARN\033[0m"
 _failures: list[str] = []
@@ -175,12 +176,13 @@ def main() -> None:
     obs, act = next(iter(shard.batches(min(256, n), shuffle=False)))
     check(obs.shape[1] == OBS_DIM, "observation width", f"{obs.shape[1]}")
     check(bool(torch.isfinite(obs).all()), "no NaN or inf in the observation")
-    lidar = obs[:, :LIDAR_BINS]
+    lidar_width = HISTORY_FRAMES * LIDAR_BINS
+    lidar = obs[:, :lidar_width]
     check(bool(((lidar >= 0) & (lidar <= 1)).all()), "lidar bins in [0, 1]")
     occ = (lidar < INVALID_FILL).float().mean().item()
     check(occ > 0.05, "bins carry returns, the scan is not empty",
           f"{occ:.1%} of bins below INVALID_FILL")
-    goal_feat = obs[:, LIDAR_BINS:LIDAR_BINS + 3]
+    goal_feat = obs[:, lidar_width:lidar_width + 3]
     check(bool(((goal_feat[:, 0] >= 0) & (goal_feat[:, 0] <= 1)).all()),
           "goal distance normalized to [0, 1]")
     unit = (goal_feat[:, 1] ** 2 + goal_feat[:, 2] ** 2)

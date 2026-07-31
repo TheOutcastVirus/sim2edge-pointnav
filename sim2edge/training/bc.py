@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from ..models import NavPolicy, NavPolicyConfig
-from ..spec import OMEGA_MAX, V_MAX, fingerprint
+from ..spec import OMEGA_MAX, V_MAX, fingerprint, observation_fingerprint
 from .data import ShardCorpus, ShardInfo
 
 __all__ = ["BCConfig", "imitation_loss", "load_policy_checkpoint",
@@ -41,6 +41,12 @@ class BCConfig:
     warmup_steps: int = 500
     weight_decay: float = 1.0e-5
     omega_weight: float = 1.5
+    collision_tail_steps: int = 20
+    collision_tail_weight: float = 5.0
+    near_obstacle_m: float = 0.30
+    near_obstacle_weight: float = 3.0
+    near_obstacle_overspeed_weight: float = 2.0
+    policy_data_weight: float = 2.0
     grad_clip: float = 1.0
     train_noise_scale: float = 1.0
     validation_noise_scale: float = 1.0
@@ -62,6 +68,16 @@ class BCConfig:
             raise ValueError("min_learning_rate must be between zero and learning_rate")
         if self.omega_weight <= 0.0:
             raise ValueError("omega_weight must be positive")
+        if self.collision_tail_steps < 0:
+            raise ValueError("collision_tail_steps cannot be negative")
+        if self.collision_tail_weight < 1.0 or self.near_obstacle_weight < 1.0:
+            raise ValueError("safety weights cannot down-weight samples")
+        if self.near_obstacle_m <= 0.0:
+            raise ValueError("near_obstacle_m must be positive")
+        if self.near_obstacle_overspeed_weight < 1.0:
+            raise ValueError("overspeed weight cannot down-weight errors")
+        if self.policy_data_weight < 1.0:
+            raise ValueError("policy-data weight cannot down-weight samples")
         if self.prefetch_workers < 1:
             raise ValueError("prefetch_workers must be positive")
         if self.prefetch_shards < self.prefetch_workers:
@@ -79,14 +95,46 @@ def normalize_actions(actions: torch.Tensor) -> torch.Tensor:
 
 
 def imitation_loss(predicted: torch.Tensor, target: torch.Tensor,
-                   omega_weight: float = 1.5):
-    """Weighted MSE in normalized action space, plus transparent components."""
+                   omega_weight: float = 1.5,
+                   sample_weight: torch.Tensor | None = None,
+                   overspeed_weight: float = 1.0):
+    """Safety-weighted MSE in normalized action space.
+
+    ``sample_weight`` is derived from stored trajectory context, never supplied
+    to the policy.  Forward-speed overshoot is penalized asymmetrically only on
+    emphasized samples: driving slightly too slowly near geometry costs time;
+    driving slightly too fast caused the measured collision failures.
+    """
     error = (normalize_actions(predicted.float())
              - normalize_actions(target.float())).square()
-    v_loss = error[:, 0].mean()
-    omega_loss = error[:, 1].mean()
+    if sample_weight is None:
+        sample_weight = torch.ones_like(error[:, 0])
+    else:
+        sample_weight = sample_weight.float()
+    v_error = error[:, 0]
+    if overspeed_weight > 1.0:
+        overspeed = ((sample_weight > 1.0)
+                     & (predicted[:, 0] > target[:, 0]))
+        v_scale = torch.where(
+            overspeed, error.new_tensor(overspeed_weight), error.new_tensor(1.0))
+        v_error = v_error * v_scale
+    denominator = sample_weight.sum().clamp_min(1.0)
+    v_loss = (v_error * sample_weight).sum() / denominator
+    omega_loss = (error[:, 1] * sample_weight).sum() / denominator
     total = 0.5 * (v_loss + omega_weight * omega_loss)
     return total, v_loss, omega_loss
+
+
+def _weighted_batches(shard, config: BCConfig, batch_size: int, **kwargs):
+    return shard.weighted_batches(
+        batch_size,
+        collision_tail_steps=config.collision_tail_steps,
+        collision_tail_weight=config.collision_tail_weight,
+        near_obstacle_m=config.near_obstacle_m,
+        near_obstacle_weight=config.near_obstacle_weight,
+        policy_data_weight=config.policy_data_weight,
+        **kwargs,
+    )
 
 
 def _batch_totals(predicted, target, loss, v_loss, omega_loss):
@@ -139,6 +187,8 @@ def _checkpoint(policy: NavPolicy, optimizer, scheduler, config: BCConfig,
     return {
         "format_version": 1,
         "spec_fingerprint": fingerprint(),
+        "observation_fingerprint": observation_fingerprint(
+            policy.config.history_frames),
         "model_config": policy.config.to_dict(),
         "training_config": asdict(config),
         "dataset_digest": corpus.digest,
@@ -175,6 +225,13 @@ def load_policy_checkpoint(path: str | Path, device="cpu") -> NavPolicy:
             f"checkpoint {path} uses spec {got}, this process is {want}"
         )
     config = NavPolicyConfig.from_dict(checkpoint["model_config"])
+    got_observation = checkpoint.get("observation_fingerprint")
+    want_observation = observation_fingerprint(config.history_frames)
+    if got_observation is not None and got_observation != want_observation:
+        raise ValueError(
+            f"checkpoint {path} uses observation contract {got_observation}, "
+            f"model config requires {want_observation}"
+        )
     policy = NavPolicy(config).to(device)
     policy.load_state_dict(checkpoint["model"])
     return policy.eval()
@@ -196,7 +253,8 @@ def _validate(policy, corpus: ShardCorpus, config: BCConfig,
         for tier, scale in enumerate(scales):
             generator = _generator(
                 device, _batch_seed(config.seed, 0, info, tier + 1))
-            for observation, action in shard.batches(
+            for observation, action, sample_weight in _weighted_batches(
+                    shard, config,
                     config.batch_size, noise_scale=scale, shuffle=False,
                     generator=generator):
                 with torch.autocast(device_type=device.type,
@@ -205,7 +263,8 @@ def _validate(policy, corpus: ShardCorpus, config: BCConfig,
                                              and config.amp == "bf16")):
                     predicted = policy(observation)
                 loss, v_loss, omega_loss = imitation_loss(
-                    predicted, action, config.omega_weight)
+                    predicted, action, config.omega_weight, sample_weight,
+                    config.near_obstacle_overspeed_weight)
                 totals[scale] += _batch_totals(
                     predicted, action, loss, v_loss, omega_loss)
 
@@ -279,6 +338,8 @@ def train_bc(data: str | Path, output: str | Path,
         saved = torch.load(resume, map_location=device_obj, weights_only=False)
         if saved.get("spec_fingerprint") != fingerprint():
             raise ValueError("resume checkpoint uses a different spec")
+        if saved.get("observation_fingerprint") != observation_fingerprint():
+            raise ValueError("resume checkpoint uses a different observation layout")
         if saved.get("dataset_digest") != corpus.digest:
             raise ValueError("resume checkpoint uses a different dataset split")
         if (_semantic_training_config(saved.get("training_config", {}))
@@ -348,7 +409,8 @@ def train_bc(data: str | Path, output: str | Path,
             shard_index = cursor + local_index
             generator = _generator(
                 device_obj, _batch_seed(config.seed, epoch, info))
-            for observation, action in shard.batches(
+            for observation, action, sample_weight in _weighted_batches(
+                    shard, config,
                     config.batch_size, noise_scale=config.train_noise_scale,
                     shuffle=True, generator=generator, drop_last=True):
                 optimizer.zero_grad(set_to_none=True)
@@ -358,7 +420,8 @@ def train_bc(data: str | Path, output: str | Path,
                                              and config.amp == "bf16")):
                     predicted = runner(observation)
                     loss, v_loss, omega_loss = imitation_loss(
-                        predicted, action, config.omega_weight)
+                        predicted, action, config.omega_weight, sample_weight,
+                        config.near_obstacle_overspeed_weight)
                 loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), config.grad_clip)
                 optimizer.step()

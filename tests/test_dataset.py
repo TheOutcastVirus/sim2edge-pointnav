@@ -15,7 +15,8 @@ torch = pytest.importorskip("torch")
 
 from sim2edge import dataset as ds
 from sim2edge import noise as noise_mod
-from sim2edge.spec import INVALID_FILL, OBS_DIM, OMEGA_MAX, V_MAX, fingerprint
+from sim2edge.spec import (HISTORY_FRAMES, INVALID_FILL, LIDAR_BINS, OBS_DIM,
+                           OMEGA_MAX, V_MAX, fingerprint)
 
 T, B = 64, 360
 
@@ -108,6 +109,19 @@ def test_save_load_preserves_the_raw_quantities(tmp_path):
     assert np.allclose(got.path_length.numpy(), raw["path_length"])
 
 
+def test_outcome_context_round_trips_and_counts_down_within_episodes(tmp_path):
+    raw = _raw()
+    raw["episode"] = np.repeat(np.arange(4, dtype=np.int32), T // 4)
+    raw["outcome"] = np.repeat(np.array([0, 1, 0, 2], np.uint8), T // 4)
+    p = tmp_path / "outcomes.npz"
+    ds.save_shard(p, **raw)
+    got = ds.load_shard(p)
+    assert torch.equal(got.outcome, torch.from_numpy(raw["outcome"]))
+    expected = torch.arange(T // 4 - 1, -1, -1, dtype=torch.int32)
+    assert torch.equal(got.steps_to_end[:T // 4], expected)
+    assert torch.equal(got.steps_to_end[-T // 4:], expected)
+
+
 def test_stored_ranges_are_raw_not_preprocessed(shard):
     """If binning leaked into the file, changing LIDAR_BINS would invalidate
     every episode ever collected."""
@@ -150,6 +164,39 @@ def test_batches_cover_every_sample_once(shard):
     assert seen == T
 
 
+def test_safety_weights_are_bounded_and_only_use_training_context(tmp_path):
+    raw = _raw()
+    raw["episode"] = np.repeat(np.arange(2, dtype=np.int32), T // 2)
+    raw["outcome"] = np.repeat(np.array([0, 1], np.uint8), T // 2)
+    raw["ranges"][:] = 1.0
+    raw["ranges"][0] = 0.20
+    raw["ranges"][-1] = 0.20  # overlaps collision-tail and proximity rules
+    p = tmp_path / "weighted.npz"
+    ds.save_shard(p, **raw)
+    got = ds.load_shard(p)
+    _, _, weight = next(iter(got.weighted_batches(
+        T, noise_scale=0.0, shuffle=False, collision_tail_steps=2,
+        collision_tail_weight=5.0, near_obstacle_m=0.30,
+        near_obstacle_weight=3.0)))
+    assert weight[0] == 3.0
+    assert torch.all(weight[-2:] == 5.0)
+    assert weight.max() == 5.0, "overlapping rules must not multiply to 15x"
+    assert torch.all(weight[1:-2] == 1.0)
+
+
+def test_policy_driven_dagger_samples_receive_bounded_base_weight(tmp_path):
+    raw = _raw()
+    raw["driver"] = np.array("policy")
+    raw["ranges"][:] = 1.0
+    p = tmp_path / "dagger.npz"
+    ds.save_shard(p, **raw)
+    got = ds.load_shard(p)
+    assert got.driver == "policy"
+    _, _, weight = next(iter(got.weighted_batches(
+        T, noise_scale=0.0, shuffle=False, policy_data_weight=2.0)))
+    assert torch.all(weight == 2.0)
+
+
 def test_labels_stay_in_si_units(shard):
     """The exported graph squashes and rescales in-graph, so the C++ node gets
     m/s directly. Normalizing the label here would double-scale it."""
@@ -179,6 +226,46 @@ def test_last_action_input_is_normalized_even_though_the_label_is_not(shard):
     assert torch.all(last.abs() <= 1.0 + 1e-6)
     assert torch.allclose(last[:, 0], shard.prev_action[:, 0] / V_MAX, atol=1e-6)
     assert torch.allclose(last[:, 1], shard.prev_action[:, 1] / OMEGA_MAX, atol=1e-6)
+
+
+def test_history_is_chronological_and_cannot_cross_episode_boundaries(tmp_path):
+    raw = _raw()
+    raw["episode"] = np.repeat(np.arange(4, dtype=np.int32), T // 4)
+    raw["ranges"] = np.repeat(
+        (0.3 + np.arange(T, dtype=np.float32)[:, None] / T), B, axis=1)
+    raw["prev_action"][:, 0] = np.arange(T, dtype=np.float32) / T * V_MAX
+    raw["prev_action"][:, 1] = 0.0
+    path = tmp_path / "history.npz"
+    ds.save_shard(path, **raw)
+    got = ds.load_shard(path)
+    obs, _ = next(iter(got.batches(T, noise_scale=0.0, shuffle=False)))
+    lidar = obs[:, :HISTORY_FRAMES * LIDAR_BINS].reshape(
+        T, HISTORY_FRAMES, LIDAR_BINS)
+    actions = obs[:, -HISTORY_FRAMES * 2:].reshape(T, HISTORY_FRAMES, 2)
+
+    # Episode start repeats its own frame; the next row has three copies of
+    # that first frame and one current frame.
+    start = T // 4
+    assert torch.equal(lidar[start], lidar[start, :1].expand_as(lidar[start]))
+    assert torch.equal(lidar[start + 1, :3],
+                       lidar[start, :1].expand(3, -1))
+    assert torch.allclose(actions[start, :, 0],
+                          actions[start, 0, 0].expand(HISTORY_FRAMES))
+    expected = got.prev_action[start + 1, 0] / V_MAX
+    assert actions[start + 1, -1, 0] == pytest.approx(float(expected))
+
+
+def test_repeated_episode_start_has_one_consistent_noise_draw(tmp_path):
+    raw = _raw()
+    raw["episode"] = np.repeat(np.arange(4, dtype=np.int32), T // 4)
+    path = tmp_path / "boundary_noise.npz"
+    ds.save_shard(path, **raw)
+    got = ds.load_shard(path)
+    obs, _ = next(iter(got.batches(T, noise_scale=1.0, shuffle=False)))
+    lidar = obs[:, :HISTORY_FRAMES * LIDAR_BINS].reshape(
+        T, HISTORY_FRAMES, LIDAR_BINS)
+    for start in range(0, T, T // 4):
+        assert torch.equal(lidar[start], lidar[start, :1].expand_as(lidar[start]))
 
 
 def test_prev_action_is_stored_not_derived(shard):
