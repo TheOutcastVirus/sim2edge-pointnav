@@ -33,7 +33,7 @@ from .spec import (BIN_WIDTH_RAD, GOAL_MAX_M, HISTORY_FRAMES, INVALID_FILL,
                    LIDAR_BINS, LIDAR_MAX_M, LIDAR_MIN_M)
 
 __all__ = ["ObservationHistory", "wrap_angle", "bin_lidar", "goal_features",
-           "build_observation"]
+           "relative_goal_features", "build_observation"]
 
 
 def wrap_angle(a: torch.Tensor) -> torch.Tensor:
@@ -98,12 +98,36 @@ def goal_features(robot_pose: torch.Tensor, goal_xy: torch.Tensor) -> torch.Tens
     information the policy can act on, and an unbounded input quantizes badly.
     """
     d = goal_xy - robot_pose[:, :2]
-    dist = torch.linalg.vector_norm(d, dim=1)
-    bearing = torch.atan2(d[:, 1], d[:, 0]) - robot_pose[:, 2]
+    yaw = robot_pose[:, 2]
+    cos, sin = torch.cos(yaw), torch.sin(yaw)
+    # Rotate the world-frame offset into the robot frame here rather than
+    # subtracting yaw from a bearing later: it lets both callers share one
+    # encoder, and the belief policy never has a world frame to subtract from.
+    relative = torch.stack([cos * d[:, 0] + sin * d[:, 1],
+                            -sin * d[:, 0] + cos * d[:, 1]], dim=1)
+    return relative_goal_features(relative)
+
+
+def relative_goal_features(goal_body: torch.Tensor) -> torch.Tensor:
+    """``(N, 2)`` goal offset already in the robot frame -> the same ``(N, 3)``.
+
+    Split out from :func:`goal_features` because the goal-belief policy carries
+    exactly this quantity as its recurrent state and never possesses the world
+    pose the other entry point subtracts. Both paths must produce bit-identical
+    features for a given relative goal, or a checkpoint trained through one and
+    evaluated through the other would be measuring two different contracts --
+    so there is one implementation and two ways in.
+
+    The epsilon guards ``atan2(0, 0)`` at the instant the robot stands on the
+    goal. Direction is meaningless there, and the distance feature is already
+    zero, so any finite value is as good as another; NaN is not.
+    """
+    dist = torch.linalg.vector_norm(goal_body, dim=1)
+    safe = dist.clamp_min(1.0e-6)
     return torch.stack([
         (dist / GOAL_MAX_M).clamp(max=1.0),
-        torch.sin(bearing),
-        torch.cos(bearing),
+        goal_body[:, 1] / safe,
+        goal_body[:, 0] / safe,
     ], dim=1)
 
 

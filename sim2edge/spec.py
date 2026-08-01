@@ -25,7 +25,9 @@ __all__ = ["LIDAR_BINS", "LIDAR_MIN_M", "LIDAR_MAX_M", "INVALID_FILL",
            "GOAL_MAX_M", "GOAL_TOLERANCE_M", "V_MAX", "OMEGA_MAX", "ACCEL_MAX", "ALPHA_MAX", "DT",
            "ROBOT_RADIUS_M", "BODY_RADIUS_M", "LIDAR_MOUNT_XYZ", "LIDAR_MOUNT_YAW",
            "BIN_WIDTH_RAD", "HISTORY_FRAMES", "OBS_DIM", "fingerprint",
-           "observation_fingerprint"]
+           "observation_fingerprint",
+           "LIDAR_SPIN_HZ", "SPIN_TICKS", "DESKEW_WITH_GYRO", "GYRO_CHANNELS",
+           "sensor_model_fingerprint", "legacy_observation_fingerprint"]
 
 # ── Lidar ────────────────────────────────────────────────────────────────────
 # 180 bins over the full 360 degrees. Coarse on purpose: the policy needs
@@ -95,12 +97,62 @@ LIDAR_MOUNT_XYZ = (0.0039, 0.0, 0.1395)
 LIDAR_MOUNT_YAW = math.pi / 2
 
 # Four frames are the smallest planned temporal representation: at 20 Hz they
-# expose 150 ms of motion without recurrent state in the deployed graph.
+# expose 150 ms of motion. The original build chose this to avoid recurrent
+# state in the deployed graph; the belief policy reintroduces recurrence
+# deliberately and in a bounded, semantically-pinned form -- see
+# ``sim2edge.models.belief``. Four frames survives because it is also the
+# window the odometry head integrates translation over.
 HISTORY_FRAMES = 4
 
 # Flat observation layout, oldest to newest within each history block:
 # [lidar(H, B) | current_goal(3) | previous_action(H, 2)].
 OBS_DIM = HISTORY_FRAMES * LIDAR_BINS + 3 + HISTORY_FRAMES * 2
+
+# ── Spinning lidar ───────────────────────────────────────────────────────────
+# The A1 is a *mechanically spinning* 2-D lidar, and the first build modelled it
+# as an instantaneous 720-beam snapshot arriving every control tick. Neither
+# half of that is true, and both halves matter:
+#
+#   1. One revolution takes 1/LIDAR_SPIN_HZ. At 5.5 Hz that is 182 ms, which is
+#      3.6 control periods -- so a "scan" is stitched from beams acquired at
+#      three or four different robot poses. The result is motion skew, and the
+#      skew is a function of the command just issued. It is worst exactly when
+#      the robot turns hard to avoid something.
+#   2. A complete fresh revolution is therefore *not* available every tick.
+#      Beam age varies continuously with bearing, from zero at the beam the
+#      sweep just passed to a full revolution at the beam in front of it.
+#
+# Nominal A1 spin is 5.5 Hz; the motor is PWM-adjustable to roughly 10 Hz.
+# Confirm what the unit is actually configured to before trusting sim2real
+# numbers -- this constant is the single place to change it.
+LIDAR_SPIN_HZ = 5.5
+
+# How many control ticks of raw scan history one revolution spans, plus the
+# partial tick at each end. Anything reconstructing a swept scan needs this many
+# stored frames to have a measurement for every bearing.
+SPIN_TICKS = int(math.ceil(1.0 / (LIDAR_SPIN_HZ * DT))) + 1
+
+# Whether the gyro is used to rotationally deskew the swept scan before binning.
+# This is fixed, non-learned sensor preprocessing in the same category as
+# ``bin_lidar`` -- it does not make the policy less end-to-end, it just declines
+# to spend network capacity relearning a rotation matrix that is exactly known.
+DESKEW_WITH_GYRO = True
+
+# The belief policy's **actor observation is byte-identical to OBS_DIM**, and
+# that is a deliberate constraint rather than a coincidence.
+#
+# The obvious design feeds the gyro to the actor alongside the lidar. Doing so
+# widens the trunk's input and orphans every trunk weight in
+# ``runs/ppo_v1/best.pt`` -- 300 PPO iterations and the whole BC corpus behind
+# them. Routing the gyro to the odometry head *only* costs the actor nothing it
+# cannot already infer (it reads commanded omega through the previous-action
+# block) and buys a complete warm start: the actor transfers whole, and the
+# single randomly-initialized module in the new model is the odometry head.
+#
+# What changes for the actor is the *provenance* of its three goal features --
+# a belief the model maintains, rather than a subtraction against ground-truth
+# pose -- not their layout. Same three numbers, same meaning, same encoder.
+GYRO_CHANNELS = HISTORY_FRAMES
 
 
 def fingerprint() -> str:
@@ -121,11 +173,51 @@ def fingerprint() -> str:
     return hashlib.sha256(canon.encode()).hexdigest()[:16]
 
 
-def observation_fingerprint(history_frames: int = HISTORY_FRAMES) -> str:
+def sensor_model_fingerprint() -> str:
+    """The parts of the sensor model applied at *load* time, not collection time.
+
+    Spin rate and gyro deskew change how an observation is *built* from a stored
+    scan, but not what the collector had to write down: shards still hold clean
+    instantaneous ranges and true poses, and the sweep is reconstructed from
+    them. That is the same durability argument that keeps noise ranges out of
+    :func:`fingerprint`, and it is why 104 GB of ``overnight_v2`` survived this
+    change intact.
+    """
+    values = [LIDAR_SPIN_HZ, SPIN_TICKS, DESKEW_WITH_GYRO]
+    return ";".join(repr(v) for v in values)
+
+
+def legacy_observation_fingerprint(history_frames: int = HISTORY_FRAMES) -> str:
+    """The observation contract as it stood before the spinning-sensor model.
+
+    Kept so that checkpoints trained against instantaneous scans and white-noise
+    odometry can be *recognized* rather than merely rejected. Those checkpoints
+    are not interchangeable with current ones and must never load by default --
+    but running one against the corrected sensor model is the measurement that
+    says how much the correction was worth, and refusing to load it at all would
+    make that number unobtainable.
+    """
+    canon = f"{fingerprint()};history-v1;{history_frames}"
+    return hashlib.sha256(canon.encode()).hexdigest()[:16]
+
+
+def observation_fingerprint(history_frames: int = HISTORY_FRAMES,
+                            belief: bool = False) -> str:
     """Fingerprint the loader/model layout without invalidating raw shards.
 
     History is assembled from sequential samples at load time, so changing its
     length requires a new model checkpoint but not an expensive recollection.
+    The same now goes for the spinning-sensor reconstruction and the gyro
+    channel: both are load-time, both change what the network must expect, and
+    neither touches a stored byte.
+
+    ``belief`` selects the goal-belief observation layout, which carries the
+    extra gyro channels. A checkpoint trained against a ground-truth-pose goal
+    and one trained against a believed goal are not interchangeable even at
+    identical shapes -- the second maintains state the first does not have -- so
+    they must not share a fingerprint.
     """
-    canon = f"{fingerprint()};history-v1;{history_frames}"
+    layout = "belief-v1" if belief else "history-v1"
+    canon = (f"{fingerprint()};{layout};{history_frames};"
+             f"{sensor_model_fingerprint()}")
     return hashlib.sha256(canon.encode()).hexdigest()[:16]

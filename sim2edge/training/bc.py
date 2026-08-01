@@ -23,7 +23,8 @@ import torch
 from torch import nn
 
 from ..models import NavPolicy, NavPolicyConfig
-from ..spec import OMEGA_MAX, V_MAX, fingerprint, observation_fingerprint
+from ..spec import (OMEGA_MAX, V_MAX, fingerprint,
+                    legacy_observation_fingerprint, observation_fingerprint)
 from .data import ShardCorpus, ShardInfo
 
 __all__ = ["BCConfig", "atomic_torch_save", "imitation_loss",
@@ -218,8 +219,17 @@ def _semantic_training_config(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def load_policy_checkpoint(path: str | Path, device="cpu") -> NavPolicy:
-    """Load an inference policy and reject a stale observation contract."""
+def load_policy_checkpoint(path: str | Path, device="cpu", *,
+                           allow_legacy_sensor_model: bool = False) -> NavPolicy:
+    """Load an inference policy and reject a stale observation contract.
+
+    ``allow_legacy_sensor_model`` admits checkpoints trained before the spinning
+    lidar and random-walk odometry existed. It is opt-in and never silent,
+    because such a policy is genuinely mismatched to the current input
+    distribution -- that mismatch is the *point* when the caller is measuring
+    what the corrected sensor model costs an old policy, and a bug every other
+    time.
+    """
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     got, want = checkpoint.get("spec_fingerprint"), fingerprint()
     if got != want:
@@ -230,10 +240,15 @@ def load_policy_checkpoint(path: str | Path, device="cpu") -> NavPolicy:
     got_observation = checkpoint.get("observation_fingerprint")
     want_observation = observation_fingerprint(config.history_frames)
     if got_observation is not None and got_observation != want_observation:
-        raise ValueError(
-            f"checkpoint {path} uses observation contract {got_observation}, "
-            f"model config requires {want_observation}"
-        )
+        legacy = legacy_observation_fingerprint(config.history_frames)
+        if not (allow_legacy_sensor_model and got_observation == legacy):
+            hint = ("" if got_observation != legacy else
+                    " This is a pre-spinning-sensor checkpoint; pass "
+                    "allow_legacy_sensor_model=True to evaluate it anyway.")
+            raise ValueError(
+                f"checkpoint {path} uses observation contract {got_observation}, "
+                f"model config requires {want_observation}.{hint}"
+            )
     policy = NavPolicy(config).to(device)
     policy.load_state_dict(checkpoint["model"])
     return policy.eval()

@@ -63,13 +63,17 @@ except ImportError as exc:                       # pragma: no cover
     DirectRLEnvCfg = object                      # type: ignore[assignment,misc]
 
 from sim2edge import rooms as rooms_mod
-from sim2edge.noise import corrupt_goal, corrupt_lidar
+from sim2edge.noise import (OdometryDrift, WHEEL_SLIP_SCALE, WHEEL_SLIP_STD,
+                            WHEEL_SLIP_TURN, corrupt_goal, corrupt_lidar)
 from sim2edge.oracle import LayoutPool, oracle_action
-from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
+from sim2edge.preprocess import (ObservationHistory, bin_lidar, goal_features,
+                                 wrap_angle)
 from sim2edge.rooms import MAX_OBSTACLES, sample_room, sample_start_positions
-from sim2edge.spec import (DT, GOAL_MAX_M, GOAL_TOLERANCE_M, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
+from sim2edge.sensors import GyroModel, advance_phase, deskew, sweep_scan
+from sim2edge.spec import (DESKEW_WITH_GYRO, DT, GOAL_MAX_M, GOAL_TOLERANCE_M,
+                           HISTORY_FRAMES, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
                            LIDAR_MOUNT_YAW, OBS_DIM, OMEGA_MAX, ROBOT_RADIUS_M,
-                           V_MAX)
+                           SPIN_TICKS, V_MAX)
 
 __all__ = ["NavEnvCfg", "Sim2EdgeNavEnv", "normalize_action",
            "denormalize_action"]
@@ -321,6 +325,12 @@ class NavEnvCfg(DirectRLEnvCfg):
     #: inputs cleaner than the ones BC trained on and evaluation measures.
     observation_noise_scale: float = 0.0
 
+    #: Whether the base slips relative to its command. On by default because
+    #: the alternative is a robot that tracks to 0.22 mm, which flatters every
+    #: odometry result this project produces. Turn it off only to make a run
+    #: bit-repeatable while debugging something else.
+    wheel_slip: bool = True
+
     # ── reward ───────────────────────────────────────────────────────────────
     # Per step:
     #   progress * (d_{t-1} - d_t)  +  goal * reached  -  collision * collided
@@ -417,6 +427,31 @@ class Sim2EdgeNavEnv(DirectRLEnv):
             n, device=self.device)
         self._history_reset = torch.ones(
             n, dtype=torch.bool, device=self.device)
+
+        # ── spinning sensor state ────────────────────────────────────────────
+        # A revolution spans SPIN_TICKS control periods, so the environment has
+        # to remember that many raw scans to hand `sweep_scan` a full sweep.
+        # Without this the env would keep producing instantaneous scans while
+        # the dataset loader produced swept ones -- PPO and BC would then be
+        # training on two different sensors under one fingerprint, which is
+        # precisely the silent-disagreement failure `spec.py` exists to prevent.
+        self._scan_history = torch.zeros(
+            n, SPIN_TICKS, LIDAR_BEAMS, device=self.device)
+        # Phase is per-environment and free-running: the motor does not restart
+        # when an episode does, and two envs are not in step with each other.
+        self._spin_phase = torch.rand(n, device=self.device)
+        self._gyro = GyroModel(n, scale=float(self.cfg.observation_noise_scale),
+                               device=self.device,
+                               generator=self._noise_generator)
+        self._gyro_history = torch.zeros(
+            n, HISTORY_FRAMES, device=self.device)
+        self._odometry_drift = OdometryDrift(
+            n, scale=float(self.cfg.observation_noise_scale),
+            device=self.device, generator=self._noise_generator)
+        # Yaw at the previous control step, for the gyro's true input.
+        self._previous_yaw = torch.zeros(n, device=self.device)
+        # Per-episode drivetrain calibration error. Redrawn at reset.
+        self._slip_systematic = torch.zeros(n, device=self.device)
 
     # ── scene ────────────────────────────────────────────────────────────────
 
@@ -550,6 +585,19 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._planar_pose_target[env_ids, :2] = root[:, :2]
         self._planar_pose_target[env_ids, 2] = start[:, 2]
 
+        # Sensor state. The scan history is filled on the next observation --
+        # marking it stale via _history_reset is enough -- but the error models
+        # carry per-episode constants (gyro bias, wheel calibration) that have
+        # to be redrawn, or one unlucky draw would follow an environment for the
+        # whole run and read as a systematically bad policy.
+        self._gyro.reset(env_ids)
+        self._odometry_drift.reset(env_ids)
+        self._gyro_history[env_ids] = 0.0
+        self._previous_yaw[env_ids] = start[:, 2]
+        self._slip_systematic[env_ids] = torch.randn(
+            n, device=self.device,
+            generator=self._noise_generator) * WHEEL_SLIP_SCALE
+
     def _write_obstacle_poses(self, env_ids, world_xyz, yaw):
         """One batched PhysX write for every obstacle in the given envs.
 
@@ -584,6 +632,20 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         contacts during the following substeps.
         """
         v, w = self._action[:, 0], self._action[:, 1]
+        # Wheel slip: what the base does is not what was asked for.
+        #
+        # Measured on the collected corpus, achieved displacement tracked the
+        # command to a standard deviation of 0.22 mm per tick. That is not a
+        # robot, and it is not harmless: it makes dead reckoning exact, which
+        # leaves the belief policy's odometry head with a target ~90x below the
+        # lidar's own range noise and therefore nothing to learn. A design whose
+        # whole purpose is to correct dead reckoning cannot be validated in a
+        # world where dead reckoning is already perfect.
+        #
+        # Applied to the pose integration only. The commanded value is what the
+        # policy reads back as its previous action -- a robot knows what it
+        # asked for, and only the floor knows what it got.
+        v = v * self._slip_factor(w)
         target = self._planar_pose_target
         yaw = target[:, 2]
         target[:, 0] += v * torch.cos(yaw) * self.physics_dt
@@ -607,6 +669,22 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         right = (v + w * half) / WHEEL_RADIUS_M
         self.robot.set_joint_velocity_target(
             torch.stack([left, right], dim=1), joint_ids=self._wheel_ids)
+
+    def _slip_factor(self, yaw_rate: torch.Tensor) -> torch.Tensor:
+        """(N,) multiplier on commanded forward speed, in ``(0, 1]``.
+
+        Per-episode systematic component (wheel radius, tyre wear, floor) plus a
+        per-substep random component plus a turn-dependent term, because
+        skid-steer scrubs hardest when the wheels fight each other. Gated on
+        ``wheel_slip`` so a run can be made exactly repeatable for debugging.
+        """
+        if not self.cfg.wheel_slip:
+            return torch.ones_like(yaw_rate)
+        random = torch.randn(yaw_rate.shape, device=self.device,
+                             generator=self._noise_generator) * WHEEL_SLIP_STD
+        slip = (self._slip_systematic + random
+                + yaw_rate.abs() * WHEEL_SLIP_TURN)
+        return (1.0 - slip).clamp(0.5, 1.0)
 
     # ── observation ──────────────────────────────────────────────────────────
 
@@ -646,16 +724,70 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         if scale > 0.0:
             ranges, angles = corrupt_lidar(ranges, angles, scale,
                                            self._noise_generator)
+
+        # ── the spinning sensor ──────────────────────────────────────────────
+        # Push this instant's scan, then hand the last SPIN_TICKS of them to the
+        # sweep so each beam is drawn from whichever one is nearest its own
+        # acquisition time. A freshly reset environment has no history, so its
+        # scan is replicated across the buffer -- the same convention the
+        # loader's episode-boundary handling uses.
+        reset = self._history_reset
+        self._scan_history[:, :-1] = self._scan_history[:, 1:].clone()
+        self._scan_history[:, -1] = ranges
+        self._scan_history[reset] = ranges[reset, None, :]
+
+        measured_rate = self._gyro.step(self._true_yaw_rate(pose))
+        increment = measured_rate * self.cfg.sim.dt * self.cfg.decimation
+        self._gyro_history[:, :-1] = self._gyro_history[:, 1:].clone()
+        self._gyro_history[:, -1] = increment
+        self._gyro_history[reset] = increment[reset, None]
+
+        swept, ages = sweep_scan(self._scan_history, self._spin_phase)
+        if DESKEW_WITH_GYRO:
+            swept, angles = deskew(swept, angles, ages, measured_rate,
+                                   self._action[:, 0])
+        self._spin_phase = advance_phase(self._spin_phase)
+
+        # Odometry drift, for the ground-truth-goal observation only. The belief
+        # policy never reads this path -- it has no pose input at all -- but PPO
+        # and the legacy evaluation do, and they need the integrated walk rather
+        # than the white noise that used to stand in for it.
+        if scale > 0.0:
+            pose = pose + self._odometry_drift.step(
+                self._action[:, 1] * self.cfg.sim.dt * self.cfg.decimation)
             pose, goal = corrupt_goal(pose, goal, scale, self._noise_generator)
 
         self._observation_history.push(
-            bin_lidar(ranges, angles),
+            bin_lidar(swept, angles),
             torch.stack([self._action[:, 0] / V_MAX,
                          self._action[:, 1] / OMEGA_MAX], dim=1),
             self._history_reset)
         self._history_reset.zero_()
         obs = self._observation_history.observation(goal_features(pose, goal))
         return {"policy": obs}
+
+    def _true_yaw_rate(self, pose: torch.Tensor) -> torch.Tensor:
+        """(N,) rad/s over the control period just ended, from the true pose.
+
+        Differenced from the pose rather than read off ``root_ang_vel_w``
+        because the gyro integrates *attitude change*, and the two disagree
+        whenever the contact solver has nudged the base between substeps. The
+        pose difference is what actually happened.
+        """
+        rate = wrap_angle(pose[:, 2] - self._previous_yaw) / (
+            self.cfg.sim.dt * self.cfg.decimation)
+        self._previous_yaw = pose[:, 2].clone()
+        return rate
+
+    def gyro_increment(self) -> torch.Tensor:
+        """(N, HISTORY_FRAMES) measured yaw increments, oldest to newest.
+
+        The belief policy's only proprioceptive input. Published as its own
+        accessor rather than folded into the observation vector so that the
+        actor's 731-number layout -- and therefore every pretrained
+        checkpoint -- stays exactly as it was. See ``spec.GYRO_CHANNELS``.
+        """
+        return self._gyro_history
 
     # ── the oracle, for BC collection ────────────────────────────────────────
 
