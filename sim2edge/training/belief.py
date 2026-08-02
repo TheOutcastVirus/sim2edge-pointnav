@@ -88,6 +88,14 @@ class BeliefConfig:
     #: ordinary loss from commands alone and shuffled-lidar ablation is exactly
     #: unchanged.
     mismatched_lidar_coef: float = 20.0
+    #: Ranking supervision on the confidence gate, using the counterfactual pair
+    #: the mismatched-lidar term already builds. Zero reproduces every existing
+    #: run; see the note beside ``confidence_loss`` for why the gate gets no
+    #: usable gradient without it.
+    confidence_coef: float = 0.0
+    #: How far a matched scan's gate must outrank the same step's mismatched one
+    #: before the hinge stops pushing, as a fraction of the gate's (0, 1) range.
+    confidence_margin: float = 0.5
     full_episodes: bool = True
     validation_batches: int = 32
     train_noise_scale: float = 1.0
@@ -115,7 +123,8 @@ class BeliefConfig:
         if self.freeze_actor and self.freeze_estimator:
             raise ValueError("actor and estimator cannot both be frozen")
         for name in ("action_coef", "translation_coef", "belief_coef",
-                     "uncertainty_coef", "mismatched_lidar_coef"):
+                     "uncertainty_coef", "mismatched_lidar_coef",
+                     "confidence_coef"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} cannot be negative")
         if self.amp not in ("bf16", "off"):
@@ -154,6 +163,7 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
         translation_loss = action_loss.new_zeros(())
         uncertainty_loss = action_loss.new_zeros(())
         mismatched_lidar_loss = action_loss.new_zeros(())
+        confidence_loss = action_loss.new_zeros(())
         scan_confidence_mean = action_loss.new_zeros(())
     else:
         # Step 0 never integrates, so it carries no translation prediction to score.
@@ -214,13 +224,16 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
                     shift, dims=0)
                 counter_valid_raw = batch.raw_valid[:, counter_env].roll(
                     shift, dims=0)
-            counter_sequence, _, _ = policy.motion_rollout(
+            counter_sequence, _, counter_gate = policy.motion_rollout(
                 batch.lidar[:, counter_env], batch.gyro[:, counter_env],
                 batch.previous_action[:, counter_env], counter_raw,
                 counter_valid_raw)
             counter_mask = batch.valid_steps[1:, counter_env].reshape(-1)
             counter_translation = counter_sequence[1:].reshape(
                 -1, 2)[counter_mask]
+            counter_confidence = counter_gate[1:].reshape(-1)[counter_mask]
+            paired_confidence = rollout[4][1:, counter_env].reshape(
+                -1)[counter_mask]
             counter_action = batch.previous_action[1:, counter_env].reshape(
                 -1, *batch.previous_action.shape[2:])[counter_mask]
         else:
@@ -230,7 +243,8 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
                 -1, *batch.raw_valid.shape[2:])
             counter_index = torch.nonzero(
                 motion_valid, as_tuple=False).squeeze(1)[::4]
-            counter_translation, _, _ = policy.motion_estimate(
+            paired_confidence = scan_confidence[counter_index]
+            counter_translation, _, counter_confidence = policy.motion_estimate(
                 batch.lidar[1:].reshape(
                     -1, *batch.lidar.shape[2:])[counter_index],
                 batch.gyro[1:].reshape(
@@ -248,6 +262,23 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
         mismatched_lidar_loss = torch.nn.functional.smooth_l1_loss(
             counter_translation / TRANSLATION_SCALE_M,
             counter_prior / TRANSLATION_SCALE_M, beta=0.1)
+        # The gate cannot learn from the losses above. Every one of them reaches
+        # it through ``correction = confidence * proposal``, so its gradient is
+        # proportional to a proposal deliberately initialized near zero --
+        # measured at 3,000x smaller than the proposal head's own gradient, at
+        # either gate bias. The optimizer therefore satisfies the loss by growing
+        # the proposal instead and the gate never leaves its initialization,
+        # which is exactly the constant 0.13 every trained checkpoint reports.
+        #
+        # The counterfactual already supplies paired labels for the gate's actual
+        # question -- is this scan evidence about *my* motion? A hinge on the
+        # separation gives an O(1) gradient that does not pass through the
+        # proposal, and asserts no absolute confidence value: a genuinely
+        # uninformative real scan is still free to score low, it must merely
+        # outrank the same step's mismatched scan.
+        confidence_loss = torch.nn.functional.relu(
+            config.confidence_margin + counter_confidence - paired_confidence
+        ).mean()
         scan_confidence_mean = scan_confidence[motion_valid].mean().detach()
 
     belief_error = (predicted_belief - batch.belief).float()
@@ -258,7 +289,8 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
              + config.translation_coef * translation_loss
              + config.belief_coef * belief_loss
              + config.uncertainty_coef * uncertainty_loss
-             + config.mismatched_lidar_coef * mismatched_lidar_loss)
+             + config.mismatched_lidar_coef * mismatched_lidar_loss
+             + config.confidence_coef * confidence_loss)
 
     with torch.no_grad():
         distance = belief_error.norm(dim=-1)
@@ -272,6 +304,7 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
             "belief_loss": belief_loss.detach(),
             "uncertainty_loss": uncertainty_loss.detach(),
             "mismatched_lidar_loss": mismatched_lidar_loss.detach(),
+            "confidence_loss": confidence_loss.detach(),
             "scan_confidence": scan_confidence_mean,
             "belief_error_m": distance[batch.valid_steps].mean(),
             "belief_error_final_m": final_distance.mean(),

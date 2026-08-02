@@ -155,6 +155,22 @@ class BeliefNavPolicyConfig:
     #: the compact legacy/scalar state; positive values create a GRU whose
     #: explicit hidden state is carried by the runtime alongside the belief.
     motion_state_size: int = 0
+    #: Rotate the scan history into the newest frame's bearing grid with the
+    #: measured gyro before encoding it. Off by default so every existing
+    #: checkpoint keeps its exact numerics; see :meth:`OdometryHead._align_history`
+    #: for why a new run wants it on.
+    derotate_scan_history: bool = False
+    #: Mask the cross-frame range difference to bearings valid in both frames and
+    #: scale it by the translation a window can contain rather than by max range.
+    #: Off by default for exact checkpoint compatibility.
+    scaled_scan_difference: bool = False
+    #: Initial bias of the learned confidence gate. The correction is the product
+    #: ``confidence * proposal``, so the gate's gradient is proportional to a
+    #: proposal that starts near zero: at -2.0 it never leaves sigmoid(-2)=0.12
+    #: and the proposal grows ~8x to compensate, leaving the gate a constant
+    #: rather than a gate. 0.0 starts it mid-range where it has usable dynamic
+    #: range in both directions. The default reproduces existing checkpoints.
+    confidence_gate_bias: float = -2.0
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -232,7 +248,8 @@ class OdometryHead(nn.Module):
         # Begin close to command dead reckoning without starving the residual
         # branch of gradient as the old -6 gate did.
         nn.init.zeros_(self.confidence_head[-1].weight)
-        nn.init.constant_(self.confidence_head[-1].bias, -2.0)
+        nn.init.constant_(self.confidence_head[-1].bias,
+                          config.confidence_gate_bias)
         nn.init.zeros_(self.variance_head.weight)
         nn.init.constant_(self.variance_head.bias, -12.0)
         if config.motion_state_size > 0:
@@ -260,8 +277,45 @@ class OdometryHead(nn.Module):
         lo = torch.gather(scan, 1, low)
         hi = torch.gather(scan, 1, high)
         rotated = lo + fraction * (hi - lo)
-        usable = torch.gather(valid, 1, low) & torch.gather(valid, 1, high)
+        usable = torch.gather(valid, 1, low)
+        # At zero rotation the upper neighbour carries no weight, so requiring it
+        # would erode the newest frame's mask against itself. Identity in,
+        # identity out.
+        usable = usable & (torch.gather(valid, 1, high) | (fraction == 0))
         return rotated, usable
+
+    def _align_history(self, metric: torch.Tensor, valid: torch.Tensor,
+                       gyro: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate every frame into the newest frame's bearing grid.
+
+        Yaw between the oldest and newest frame of a one-second window shifts
+        scan content by 44 of 720 bins on average and 137 at p95, measured on
+        ``belief_onpolicy_v15``. The encoder's receptive field is about 28 bins,
+        so without this the convolution is stacking *unrelated bearings* in its
+        channel dimension whenever the robot turns, and the only cross-frame
+        signal that survives is the command -- which is exactly the degenerate
+        solution the head was previously found to have learned.
+
+        The gyro measures that rotation directly. Removing it leaves translation
+        parallax, which is the quantity being estimated. This is the same
+        argument as the within-sweep deskew in :func:`sensors.deskew_history`,
+        applied across frames rather than within one revolution, and it declines
+        to spend capacity relearning a rotation that is already known.
+        """
+        n, frames, beams = metric.shape
+        # ``gyro[:, i]`` is the increment *ending* at frame ``i`` -- the
+        # convention `deskew_history` documents -- so the rotation carrying frame
+        # ``i`` into the newest frame is the sum over ``i+1:``, and exactly zero
+        # for the newest frame itself.
+        trailing = gyro.flip(-1).cumsum(-1).flip(-1)
+        delta = torch.cat(
+            [trailing[:, 1:], torch.zeros_like(trailing[:, :1])], dim=1)
+        rotated, usable = self._rotate_scan(
+            metric.reshape(n * frames, beams),
+            valid.reshape(n * frames, beams),
+            delta.reshape(n * frames))
+        return rotated.view(n, frames, beams), usable.view(n, frames, beams)
 
     def _raw_inputs(self, lidar: torch.Tensor,
                     raw_lidar: torch.Tensor | None,
@@ -303,10 +357,31 @@ class OdometryHead(nn.Module):
             previous_action = torch.cat([
                 previous_action[:, :1].expand(-1, pad, -1), previous_action
             ], 1)
+        if self.config.derotate_scan_history:
+            metric, valid = self._align_history(metric, valid, gyro)
         normalized = metric / LIDAR_MAX_M
         newest = normalized[:, -1:]
+        difference = newest - normalized
+        if self.config.scaled_scan_difference:
+            # Two problems with sharing a convolution between an absolute range
+            # channel and a difference channel normalized the same way.
+            #
+            # First, an invalid return is filled with LIDAR_MAX_M, so pairing a
+            # 3 m hit against a no-return manufactures a 9 m "range change" that
+            # dwarfs anything motion produces. Only bearings valid in *both*
+            # frames carry a difference; the mask channel already says which.
+            #
+            # Second, scale: the parallax being measured is centimetres, so
+            # dividing it by a 12 m range puts the signal three orders of
+            # magnitude below the channel beside it and, at standard init,
+            # essentially out of the first layer's reach. Normalize instead by
+            # the translation one window can physically contain.
+            difference = torch.where(valid & valid[:, -1:], difference,
+                                     torch.zeros_like(difference))
+            difference = difference * (
+                LIDAR_MAX_M / (V_MAX * DT * frames))
         encoded = self.conv(torch.cat(
-            [normalized, newest - normalized, valid.float()], dim=1))
+            [normalized, difference, valid.float()], dim=1))
         scan_features = self.scan_projection(encoded)
         motion = torch.cat((gyro, previous_action.flatten(1)), dim=1)
         hidden = self.trunk(torch.cat(

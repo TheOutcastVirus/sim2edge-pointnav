@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-245 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
+268 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -480,6 +480,34 @@ Resume at the next shard after the most recent periodic checkpoint:
   --resume runs/belief_motion_v4/latest.pt
 ```
 
+### Encoder flags for the scan history
+
+Three options change how the odometry head reads the scan history. All three are
+off by default so every existing checkpoint keeps its exact numerics, and all
+three are initialization- or input-level changes, so they need `--reset-odometry`
+to be meaningful and cannot be turned on with `--resume`.
+
+```bash
+.venv/bin/python scripts/train_belief.py \
+  --data data/belief_onpolicy_v15 \
+  --belief-start runs/belief_ppo_biasfix_v14/iter_1130.pt \
+  --out runs/belief_gate_v21 \
+  --epochs 1 --batch-size 8 --learning-rate 3e-4 \
+  --derotate-scan-history --scaled-scan-difference \
+  --confidence-coef 20 --confidence-gate-bias 0.0 \
+  --reset-odometry --checkpoint-every 200 --seed 0
+```
+
+| flag | what it does |
+|---|---|
+| `--derotate-scan-history` | gyro-aligns every frame into the newest frame's bearing grid before encoding. Measured: **no material gain** (8.53 vs 8.56 cm paired, 8.51 vs 8.76 cm on the trainer's own validation). Correct and cheap, but not the constraint. |
+| `--scaled-scan-difference` | masks the cross-frame range difference to bearings valid in both frames and scales it by per-window travel instead of `LIDAR_MAX_M`. **No result yet.** |
+| `--confidence-coef` | ranks the confidence gate on matched vs mismatched scans. Without it the gate's gradient is ~740× below the proposal head's and it never leaves its initialization. **No result yet.** |
+| `--confidence-gate-bias` | initial gate bias, default −2.0 (= 0.119). Does not fix the starvation on its own. |
+
+One run holds ~16 GB, so do not run two on a 24 GB card. About 1,900 updates at
+roughly 2 steps/s on `belief_onpolicy_v15` at batch 8.
+
 ## 4. Optional actor-only offline adaptation
 
 ```bash
@@ -568,9 +596,18 @@ pose-fed `--driver-checkpoint` compatibility path:
 
 The completed v15 corpus has 3.61M samples. One full-episode epoch at a constant
 3e-5 LR preserved lidar causality but changed held-out mean error only from
-9.49 to 9.46 cm. Do not repeat that branch with more epochs: the four-frame
-correction head, rather than the state distribution alone, is now the likely
-limitation.
+9.49 to 9.46 cm. Do not repeat that branch with more epochs.
+
+The limitation is **not** observability, despite what the 2026-08-01 handoff
+concluded. Measured on this corpus at `noise_scale 0.0`, the median range change
+between consecutive reconstructed frames tracks distance travelled at a ratio of
+about 1.0 (2.13 cm median for 1.99 cm of travel), so the frames are consistent
+rigid views and the motion is in them. A point-to-line solver and a full ICP,
+both validated exact against analytic rooms and precise to ~0.07 cm on a 0.08 cm
+one-tick slip, nevertheless recover nothing from corpus scans. The reason is that
+the *mean* frame difference is 6× the median: roughly a third of bearings are
+gross outliers at depth edges in cluttered rooms, and no estimator tried so far —
+learned or geometric — is robust to that. See `docs/daily/2026_08_02_log.md` §4.
 
 No external hardware pose reference is currently available. Robot trials can
 verify timestamps, coordinate signs, reset behavior, stationary drift, and

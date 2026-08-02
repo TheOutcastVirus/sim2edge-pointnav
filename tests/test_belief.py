@@ -13,9 +13,11 @@ import pytest
 import torch
 
 from sim2edge.models import (BeliefNavPolicy, BeliefNavPolicyConfig, NavPolicy,
+                             OdometryHead,
                              NavPolicyConfig, compose_belief)
 from sim2edge.preprocess import goal_features, relative_goal_features
-from sim2edge.spec import (DT, GOAL_MAX_M, LIDAR_MAX_M, V_MAX, fingerprint,
+from sim2edge.spec import (DT, GOAL_MAX_M, LIDAR_MAX_M, MOTION_HISTORY_FRAMES,
+                           V_MAX, fingerprint,
                            observation_fingerprint)
 from sim2edge.training import load_policy_checkpoint
 
@@ -382,3 +384,310 @@ def test_arrival_stops_a_moving_actor_after_confirmation():
             belief, covariance, count, lidar, raw, valid, gyro, previous)
     assert bool(arrived)
     torch.testing.assert_close(command, torch.zeros_like(command))
+
+
+# ── gyro derotation of the scan history ──────────────────────────────────────
+# Measured on `belief_onpolicy_v15`, yaw across the one-second motion window
+# shifts scan content by 44 of 720 bins on average and 137 at p95, against an
+# encoder receptive field of about 28. These cover the alignment that removes it.
+
+
+def _offset_circular_room(bearing: torch.Tensor, x: float, y: float
+                          ) -> torch.Tensor:
+    """Range to a radius-4 wall from a point off its centre. Not rotationally
+    symmetric, so an alignment that got the sign or scale wrong cannot pass."""
+    b = x * torch.cos(bearing) + y * torch.sin(bearing)
+    c = x * x + y * y - 16.0
+    return -b + torch.sqrt(b.square() - c)
+
+
+def _spun_history(frames: int, beams: int, yaw_rate: float
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """A static scene observed while turning in place, plus the gyro that saw it."""
+    angle = (torch.arange(beams) + 0.5) * (2 * math.pi / beams) - math.pi
+    yaw = torch.arange(frames, dtype=torch.float32) * yaw_rate
+    scans = torch.stack([
+        _offset_circular_room(yaw[i] + angle, 0.9, -1.3) for i in range(frames)
+    ])[None]
+    gyro = torch.full((1, frames), yaw_rate)
+    gyro[:, 0] = 0.0                    # nothing precedes the oldest frame
+    return scans, gyro
+
+
+def test_derotation_makes_a_pure_spin_look_stationary():
+    """The decisive geometric check: rotation is known, so it must cancel exactly.
+
+    Turning in place changes every bearing's range but moves the robot nowhere.
+    After alignment each frame must reproduce the newest one; whatever survives
+    is translation parallax, which is the signal the head is asked to measure.
+    """
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(derotate_scan_history=True))
+    frames = policy.config.motion_history_frames
+    beams = policy.config.raw_lidar_bins
+    scans, gyro = _spun_history(frames, beams, yaw_rate=0.06)
+    valid = torch.ones_like(scans, dtype=torch.bool)
+
+    aligned, usable = policy.odometry._align_history(scans, valid, gyro)
+
+    newest = scans[:, -1]
+    before = (scans - newest[:, None]).abs().max()
+    after = (aligned - newest[:, None]).abs().max()
+    # 1.1 rad of accumulated yaw moves the wall metres in the raw history.
+    assert float(before) > 0.5
+    # What is left is linear-interpolation error on a 0.5-degree grid.
+    assert float(after) < 5e-3
+    assert bool(usable.all())
+
+
+def test_derotation_leaves_the_newest_frame_bit_exact():
+    """Frame -1 is the reference frame; resampling it would corrupt the anchor."""
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(derotate_scan_history=True))
+    frames = policy.config.motion_history_frames
+    beams = policy.config.raw_lidar_bins
+    torch.manual_seed(5)
+    scans = torch.rand(2, frames, beams) * LIDAR_MAX_M
+    valid = torch.rand(2, frames, beams) > 0.3
+    gyro = torch.randn(2, frames) * 0.05
+
+    aligned, usable = policy.odometry._align_history(scans, valid, gyro)
+
+    torch.testing.assert_close(aligned[:, -1], scans[:, -1], atol=0.0, rtol=0.0)
+    assert bool((usable[:, -1] == valid[:, -1]).all())
+
+
+def test_derotation_is_identity_when_the_robot_does_not_turn():
+    """Zero gyro must reproduce the unrotated encoder exactly, flag or not."""
+    torch.manual_seed(6)
+    plain = BeliefNavPolicy().eval()
+    aligned = BeliefNavPolicy(
+        BeliefNavPolicyConfig(derotate_scan_history=True)).eval()
+    aligned.load_state_dict(plain.state_dict())
+    frames = plain.config.motion_history_frames
+    raw = torch.rand(4, frames, plain.config.raw_lidar_bins) * LIDAR_MAX_M
+    valid = torch.rand_like(raw) > 0.2
+    previous = torch.rand(4, frames, 2)
+    lidar = torch.rand(4, frames, 180)
+
+    with torch.no_grad():
+        quiet = [p.motion_estimate(lidar, torch.zeros(4, frames), previous,
+                                  raw, valid)[0] for p in (plain, aligned)]
+        turning = [p.motion_estimate(lidar, torch.full((4, frames), 0.05),
+                                     previous, raw, valid)[0]
+                   for p in (plain, aligned)]
+
+    torch.testing.assert_close(quiet[0], quiet[1], atol=1e-6, rtol=0.0)
+    # And it must actually be doing something once the robot turns, or the flag
+    # is silently inert and the test above proves nothing.
+    assert float((turning[0] - turning[1]).abs().max()) > 0.0
+
+
+def test_derotation_keeps_the_zero_return_fallback_exact():
+    """The deployable guarantee survives the new input path: no scan, no motion."""
+    policy = BeliefNavPolicy(
+        BeliefNavPolicyConfig(derotate_scan_history=True)).eval()
+    frames = policy.config.motion_history_frames
+    previous = torch.zeros(3, frames, 2)
+    previous[:, -1, 0] = 0.6
+    raw = torch.full((3, frames, policy.config.raw_lidar_bins), LIDAR_MAX_M)
+    valid = torch.zeros_like(raw, dtype=torch.bool)
+    with torch.no_grad():
+        translation, _, confidence = policy.motion_estimate(
+            torch.ones(3, frames, 180), torch.randn(3, frames) * 0.05,
+            previous, raw, valid)
+    expected = torch.full((3,), 0.6 * V_MAX * DT)
+    torch.testing.assert_close(translation[:, 0], expected, atol=1e-4, rtol=0.0)
+    assert float(translation[:, 1].abs().max()) < 1e-4
+    assert float(confidence.max()) < 0.01
+
+
+def test_derotation_passes_gradient_to_the_convolutional_stack():
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(derotate_scan_history=True))
+    frames = policy.config.motion_history_frames
+    torch.manual_seed(7)
+    raw = torch.rand(2, 3, frames, policy.config.raw_lidar_bins) * LIDAR_MAX_M
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    # The actor keeps its four-frame observation; only the estimator sees 20.
+    actions, beliefs = policy.rollout(
+        torch.rand(2, 3, 4, 180), torch.randn(2, 3, frames) * 0.05,
+        torch.zeros(2, 3, frames, 2), torch.randn(3, 2), raw, valid)
+    (actions.square().mean() + beliefs.square().mean()).backward()
+    assert float(policy.odometry.conv[0].weight.grad.abs().sum()) > 0.0
+
+
+def test_scaled_difference_ignores_bearings_missing_from_either_frame():
+    """A no-return filled at max range must not read as a nine-metre closure."""
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        derotate_scan_history=True, scaled_scan_difference=True)).eval()
+    frames = policy.config.motion_history_frames
+    beams = policy.config.raw_lidar_bins
+    # Identical geometry in every frame, but the oldest frame lost half its
+    # returns. With the mask absent, those bearings fabricate a huge difference.
+    raw = torch.full((1, frames, beams), 3.0)
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    valid[0, 0, : beams // 2] = False
+    gyro = torch.zeros(1, frames)
+    previous = torch.zeros(1, frames, 2)
+    with torch.no_grad():
+        intact = policy.motion_estimate(
+            torch.ones(1, frames, 180), gyro, previous,
+            raw, torch.ones_like(valid))[0]
+        holed = policy.motion_estimate(
+            torch.ones(1, frames, 180), gyro, previous, raw, valid)[0]
+    # The remaining difference is only what the validity channel itself carries,
+    # not an amplified 9 m artefact.
+    assert float((intact - holed).abs().max()) < 2e-3
+
+
+def test_scaled_difference_lifts_a_centimetre_signal_off_the_floor():
+    """The channel the head must read cannot sit three orders below its neighbour."""
+    frames = MOTION_HISTORY_FRAMES
+    beams = 720
+    plain = OdometryHead(BeliefNavPolicyConfig())
+    scaled = OdometryHead(BeliefNavPolicyConfig(scaled_scan_difference=True))
+    # A uniform 2 cm range closure: the size of one full-speed tick.
+    metric = torch.full((1, frames, beams), 3.0)
+    metric[:, -1] -= 0.02
+    valid = torch.ones_like(metric, dtype=torch.bool)
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def grab(name, head):
+        head.conv.register_forward_pre_hook(
+            lambda _module, args: captured.__setitem__(name, args[0]))
+
+    grab("plain", plain)
+    grab("scaled", scaled)
+    args = (torch.ones(1, frames, 180), torch.zeros(1, frames),
+            torch.zeros(1, frames, 2), metric, valid)
+    with torch.no_grad():
+        plain._features(*args)
+        scaled._features(*args)
+
+    magnitude = lambda name: float(
+        captured[name][:, frames:2 * frames].abs().max())
+    assert magnitude("plain") < 2.0e-3
+    assert magnitude("scaled") > 4.0e-2
+
+
+def test_confidence_gate_bias_default_reproduces_existing_checkpoints():
+    """The stuck-gate fix must be opt-in; -2.0 is what every checkpoint holds."""
+    head = OdometryHead(BeliefNavPolicyConfig())
+    assert float(head.confidence_head[-1].bias.detach()) == pytest.approx(-2.0)
+
+
+def test_raising_the_gate_bias_leaves_the_correction_at_dead_reckoning():
+    """Mid-range gate, near-zero proposal: the gate gains gradient without
+    moving the initial translation off the command prior."""
+    policy = BeliefNavPolicy(
+        BeliefNavPolicyConfig(confidence_gate_bias=0.0)).eval()
+    frames = policy.config.motion_history_frames
+    previous = torch.zeros(8, frames, 2)
+    previous[:, -1, 0] = 0.7
+    raw = torch.rand(8, frames, policy.config.raw_lidar_bins) * LIDAR_MAX_M
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    with torch.no_grad():
+        step = policy.translation(torch.rand(8, frames, 180),
+                                  torch.zeros(8, frames), previous, raw, valid)
+        _, _, confidence = policy.motion_estimate(
+            torch.rand(8, frames, 180), torch.zeros(8, frames), previous,
+            raw, valid)
+    assert float(confidence.mean()) == pytest.approx(0.5, abs=0.02)
+    assert float((step[:, 0] - 0.7 * V_MAX * DT).abs().max()) < 1e-3
+
+
+def test_the_belief_loss_alone_starves_the_confidence_gate():
+    """Documents the defect the ranking loss exists to fix.
+
+    Every geometric loss reaches the gate through ``confidence * proposal``, so
+    its gradient carries a factor of a proposal initialized at ~1e-3. Raising the
+    gate's bias does not help: it lifts the proposal's gradient by the same
+    sigmoid factor. Both biases leave the gate three orders of magnitude behind,
+    which is why every trained checkpoint reports a gate frozen at its init.
+    """
+    def gradients(bias):
+        torch.manual_seed(11)
+        policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+            derotate_scan_history=True, confidence_gate_bias=bias))
+        frames = policy.config.motion_history_frames
+        raw = torch.rand(4, 6, frames, policy.config.raw_lidar_bins) * LIDAR_MAX_M
+        valid = torch.ones_like(raw, dtype=torch.bool)
+        _, beliefs = policy.rollout(
+            torch.rand(4, 6, 4, 180), torch.randn(4, 6, frames) * 0.05,
+            torch.zeros(4, 6, frames, 2), torch.randn(6, 2), raw, valid)
+        beliefs.square().mean().backward()
+        total = lambda module: float(module.weight.grad.abs().sum())
+        return (total(policy.odometry.confidence_head[-1]),
+                total(policy.odometry.proposal_head))
+
+    for bias in (-2.0, 0.0):
+        gate, proposal = gradients(bias)
+        assert gate < proposal / 1000.0, f"gate not starved at bias {bias}"
+
+
+def _synthetic_sequence_batch(steps=6, envs=8):
+    """A minimal well-formed window; the loss only needs shapes and finiteness."""
+    from sim2edge.dataset import SequenceBatch
+    from sim2edge.spec import HISTORY_FRAMES
+    torch.manual_seed(12)
+    motion = MOTION_HISTORY_FRAMES
+    return SequenceBatch(
+        lidar=torch.rand(steps, envs, HISTORY_FRAMES, 180),
+        raw_lidar=torch.rand(steps, envs, motion, 720) * LIDAR_MAX_M,
+        raw_valid=torch.ones(steps, envs, motion, 720, dtype=torch.bool),
+        gyro=torch.randn(steps, envs, motion) * 0.05,
+        previous_action=torch.rand(steps, envs, motion, 2) * 0.5,
+        action=torch.rand(steps, envs, 2) * 0.3,
+        belief=torch.randn(steps, envs, 2),
+        initial_belief=torch.randn(envs, 2),
+        translation=torch.rand(steps, envs, 2) * 0.02,
+        valid_steps=torch.ones(steps, envs, dtype=torch.bool),
+    )
+
+
+def test_confidence_ranking_loss_unstarves_the_gate():
+    """The point of the term: an O(1) gate gradient that skips the proposal.
+
+    Without it the gate's gradient is under a thousandth of the proposal head's
+    (see ``test_the_belief_loss_alone_starves_the_confidence_gate``). With it the
+    gate must become the better-fed of the two.
+    """
+    from sim2edge.training import BeliefConfig, belief_losses
+
+    def gate_and_proposal_gradients(confidence_coef):
+        torch.manual_seed(13)
+        policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+            derotate_scan_history=True, scaled_scan_difference=True))
+        config = BeliefConfig(batch_size=8, seq_len=6, amp="off",
+                              confidence_coef=confidence_coef)
+        loss, _ = belief_losses(policy, _synthetic_sequence_batch(), config)
+        loss.backward()
+        total = lambda module: float(module.weight.grad.abs().sum())
+        return (total(policy.odometry.confidence_head[-1]),
+                total(policy.odometry.proposal_head))
+
+    off_gate, off_proposal = gate_and_proposal_gradients(0.0)
+    on_gate, on_proposal = gate_and_proposal_gradients(20.0)
+    # Left alone, the gate trails the proposal head by nearly three orders of
+    # magnitude even with the mismatched-lidar term already in the total.
+    assert off_gate < off_proposal / 500.0
+    # The ranking term is the only path to the gate that does not carry a factor
+    # of the proposal, so it scales the gate's gradient directly.
+    assert on_gate > 50.0 * off_gate
+    assert on_gate > on_proposal / 20.0
+
+
+def test_confidence_ranking_loss_is_zero_once_the_gate_separates():
+    """A hinge, not a penalty: a gate that already discriminates is left alone."""
+    from sim2edge.training import BeliefConfig, belief_losses
+    torch.manual_seed(14)
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        derotate_scan_history=True, scaled_scan_difference=True))
+    # A gate that is saturated high everywhere cannot separate matched from
+    # mismatched, so the hinge must be active...
+    with torch.no_grad():
+        policy.odometry.confidence_head[-1].bias.fill_(20.0)
+    config = BeliefConfig(batch_size=8, seq_len=6, amp="off",
+                          confidence_coef=1.0)
+    _, flat = belief_losses(policy, _synthetic_sequence_batch(), config)
+    assert float(flat["confidence_loss"]) == pytest.approx(
+        config.confidence_margin, abs=1e-3)

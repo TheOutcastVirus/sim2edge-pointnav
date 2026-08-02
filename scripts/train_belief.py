@@ -29,7 +29,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sim2edge.models import BeliefNavPolicy, BeliefNavPolicyConfig
+from sim2edge.models import (BeliefNavPolicy, BeliefNavPolicyConfig,
+                             OdometryHead)
 from sim2edge.training import (ShardCorpus, BeliefConfig, belief_losses,
                                load_belief_checkpoint, warm_start)
 from sim2edge.training.bc import atomic_torch_save
@@ -69,12 +70,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--motion-state-size", type=int, default=0,
         help="learn an explicit recurrent motion state of this width (0 disables)")
+    parser.add_argument(
+        "--derotate-scan-history", action="store_true",
+        help="gyro-align the scan history into the newest frame before encoding")
+    parser.add_argument(
+        "--scaled-scan-difference", action="store_true",
+        help="mask and rescale the cross-frame range difference channel")
+    parser.add_argument(
+        "--confidence-gate-bias", type=float,
+        help="initial bias of the learned confidence gate (default -2.0); "
+             "requires --reset-odometry, since it is an initialization")
+    parser.add_argument(
+        "--reset-odometry", action="store_true",
+        help="reinitialize the odometry head, keeping the warm-started actor; "
+             "use when a change to the scan encoding invalidates its weights")
     parser.add_argument("--action-coef", type=float,
                         help="action imitation coefficient (default: 1 when "
                              "--train-actor, otherwise 0)")
     parser.add_argument("--mismatched-lidar-coef", type=float,
                         default=BeliefConfig.mismatched_lidar_coef,
                         help="force mismatched scans back to command dead reckoning")
+    parser.add_argument("--confidence-coef", type=float,
+                        default=BeliefConfig.confidence_coef,
+                        help="rank the confidence gate on matched vs mismatched "
+                             "scans; without it the gate gets no usable gradient")
     parser.add_argument("--windowed", action="store_true",
                         help="legacy fixed windows; complete episodes are the default")
     parser.add_argument("--max-train-shards", type=int)
@@ -138,6 +157,7 @@ def main() -> None:
         action_coef=((1.0 if args.action_coef is None else args.action_coef)
                      if args.train_actor else 0.0),
         mismatched_lidar_coef=args.mismatched_lidar_coef,
+        confidence_coef=args.confidence_coef,
         full_episodes=not args.windowed,
         val_shards=args.val_shards, seed=args.seed,
         max_train_shards=args.max_train_shards)
@@ -173,6 +193,32 @@ def main() -> None:
     else:
         policy = BeliefNavPolicy(BeliefNavPolicyConfig()).to(device)
         print("[belief] cold actor -- expect this to need far more data")
+    if args.derotate_scan_history and not policy.config.derotate_scan_history:
+        if resume is not None:
+            raise ValueError("cannot change scan derotation while resuming")
+        policy.config = replace(policy.config, derotate_scan_history=True)
+        policy.odometry.config = policy.config
+        print("[belief] gyro-aligning the scan history before encoding")
+    if args.scaled_scan_difference and not policy.config.scaled_scan_difference:
+        if resume is not None:
+            raise ValueError("cannot change difference scaling while resuming")
+        policy.config = replace(policy.config, scaled_scan_difference=True)
+        policy.odometry.config = policy.config
+        print("[belief] masking and rescaling the scan difference channel")
+    if args.confidence_gate_bias is not None:
+        if not args.reset_odometry:
+            raise ValueError("--confidence-gate-bias only takes effect on a "
+                             "fresh head; pass --reset-odometry")
+        policy.config = replace(
+            policy.config, confidence_gate_bias=args.confidence_gate_bias)
+        policy.odometry.config = policy.config
+        print(f"[belief] confidence gate starts at bias "
+              f"{args.confidence_gate_bias:+.2f}")
+    if args.reset_odometry:
+        if resume is not None:
+            raise ValueError("cannot reset the odometry head while resuming")
+        policy.odometry = OdometryHead(policy.config).to(device)
+        print("[belief] reinitialized the odometry head")
     if args.persistent_calibration and not policy.config.persistent_calibration:
         policy.config = replace(policy.config, persistent_calibration=True)
         policy.odometry.config = policy.config
