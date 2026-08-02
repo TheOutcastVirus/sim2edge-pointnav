@@ -3,6 +3,7 @@
 that the constants it shares with the dataset loader agree."""
 
 import importlib
+import inspect
 
 import numpy as np
 import pytest
@@ -67,6 +68,26 @@ def test_lidar_beam_count_can_fill_every_bin():
     assert m.LIDAR_BEAMS >= LIDAR_BINS
 
 
+def test_live_lidar_bearing_bias_is_persistent_within_an_episode():
+    """A mount calibration offset is not fresh angular jitter every tick."""
+    m = importlib.import_module("isaaclab_env.nav_task")
+    observation = inspect.getsource(m.Sim2EdgeNavEnv._get_observations)
+    reset = inspect.getsource(m.Sim2EdgeNavEnv._reset_idx)
+    assert "bearing_bias" in observation
+    assert "self._lidar_bearing_bias[:, None]" in observation
+    assert "self._lidar_bearing_bias[env_ids]" in reset
+
+
+def test_external_model_arrival_is_consumed_once_as_a_terminal():
+    """Belief-driven collection must reset instead of recording idle tails."""
+    m = importlib.import_module("isaaclab_env.nav_task")
+    dones = inspect.getsource(m.Sim2EdgeNavEnv._get_dones)
+    reset = inspect.getsource(m.Sim2EdgeNavEnv._reset_idx)
+    assert "external_done = self._external_done.clone()" in dones
+    assert "self._external_done.zero_()" in dones
+    assert "self._external_done[env_ids] = False" in reset
+
+
 def test_the_mount_yaw_is_applied_exactly_once():
     """The sensor is mounted with the hardware's quarter turn and the beam
     bearings undo it. Applying it twice, or not at all, rotates the policy's
@@ -99,7 +120,23 @@ def test_reaching_the_goal_beats_running_out_the_clock():
     from sim2edge.spec import DT
     m = importlib.import_module("isaaclab_env.nav_task")
     longest_episode = m.NavEnvCfg.episode_length_s / DT
-    assert m.NavEnvCfg.goal_reward > m.NavEnvCfg.time_penalty * longest_episode
+    assert (m.NavEnvCfg.goal_reward + m.NavEnvCfg.timeout_penalty
+            > m.NavEnvCfg.time_penalty * longest_episode)
+
+
+def test_loitering_is_not_cheaper_than_a_collision():
+    """A policy that cannot yet find a safe path must still try to finish it.
+
+    This caught the swept-lidar PPO branch trading collisions for timeouts while
+    success stayed flat: its measured return increased because waiting cost 4.5
+    and collision cost 10. Terminal timeout cost closes that local optimum.
+    """
+    from sim2edge.spec import DT
+    m = importlib.import_module("isaaclab_env.nav_task")
+    longest_episode = m.NavEnvCfg.episode_length_s / DT
+    timeout_cost = (m.NavEnvCfg.timeout_penalty
+                    + m.NavEnvCfg.time_penalty * longest_episode)
+    assert timeout_cost >= m.NavEnvCfg.collision_penalty
 
 
 def test_the_progress_clamp_cannot_swallow_real_motion():

@@ -193,7 +193,9 @@ class NavPolicy(nn.Module):
 def initialize_layer(module: nn.Module) -> None:
     if isinstance(module, nn.Conv1d):
         nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-        nn.init.zeros_(module.bias)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Linear):
         nn.init.orthogonal_(module.weight, gain=2.0 ** 0.5)
-        nn.init.zeros_(module.bias)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)

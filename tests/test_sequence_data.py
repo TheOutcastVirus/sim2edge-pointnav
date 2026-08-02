@@ -15,7 +15,8 @@ import torch
 
 from sim2edge.dataset import Shard
 from sim2edge.models import BeliefNavPolicy
-from sim2edge.spec import DT, HISTORY_FRAMES, SPIN_TICKS, V_MAX
+from sim2edge.spec import (DT, HISTORY_FRAMES, MOTION_HISTORY_FRAMES,
+                           SPIN_TICKS, V_MAX)
 
 BEAMS, LENGTH, EPISODES = 720, 96, 8
 
@@ -76,12 +77,15 @@ def test_sequence_batch_has_the_expected_time_major_shapes():
     batch = next(shard.sequence_batches(8, 12, 1.0, generator=generator))
     assert batch.lidar.shape[:2] == (12, 8)
     assert batch.lidar.shape[2] == HISTORY_FRAMES
-    assert batch.gyro.shape == (12, 8, HISTORY_FRAMES)
-    assert batch.previous_action.shape == (12, 8, HISTORY_FRAMES, 2)
+    assert batch.raw_lidar.shape == (12, 8, MOTION_HISTORY_FRAMES, BEAMS)
+    assert batch.raw_valid.shape == batch.raw_lidar.shape
+    assert batch.gyro.shape == (12, 8, MOTION_HISTORY_FRAMES)
+    assert batch.previous_action.shape == (12, 8, MOTION_HISTORY_FRAMES, 2)
     assert batch.action.shape == (12, 8, 2)
     assert batch.belief.shape == (12, 8, 2)
     assert batch.translation.shape == (12, 8, 2)
     assert batch.initial_belief.shape == (8, 2)
+    assert batch.valid_steps.shape == (12, 8)
 
 
 def test_sequence_batch_is_finite_everywhere():
@@ -153,6 +157,25 @@ def test_noise_scale_zero_gives_exact_dead_reckoning():
     dead_reckoned = batch.previous_action[1:, :, -1, 0] * V_MAX * DT
     truth = batch.translation[1:, :, 0]
     assert float((dead_reckoned - truth).abs().max()) < 1e-4
+
+
+def test_new_dynamics_corpus_does_not_receive_legacy_slip_twice():
+    shard = _shard()
+    shard.motion_model_version = 2
+    batch = next(shard.sequence_batches(
+        32, 16, 1.0, generator=torch.Generator().manual_seed(6)))
+    dead_reckoned = batch.previous_action[1:, :, -1, 0] * V_MAX * DT
+    truth = batch.translation[1:, :, 0]
+    assert float((dead_reckoned - truth).abs().max()) < 1e-4
+
+
+def test_episode_batches_start_only_at_real_resets():
+    shard = _shard()
+    batches = list(shard.episode_batches(
+        3, 0.0, shuffle=False, generator=torch.Generator().manual_seed(9)))
+    assert sum(batch.initial_belief.shape[0] for batch in batches) == EPISODES
+    assert all(batch.lidar.shape[0] == LENGTH for batch in batches)
+    assert all(bool(batch.valid_steps.all()) for batch in batches)
 
 
 def test_a_belief_policy_consumes_the_batch_unmodified():

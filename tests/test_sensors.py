@@ -15,7 +15,8 @@ import torch
 
 from sim2edge.preprocess import wrap_angle
 from sim2edge.sensors import (SPIN_PERIOD_S, GyroModel, advance_phase,
-                              beam_ages, deskew, sweep_scan, synthesize_gyro)
+                              beam_ages, deskew, deskew_history, sweep_scan,
+                              synthesize_gyro)
 from sim2edge.spec import DT, LIDAR_SPIN_HZ, SPIN_TICKS
 
 BEAMS = 720
@@ -110,6 +111,57 @@ def test_deskew_preserves_absent_returns():
                            torch.tensor([0.5]), torch.tensor([0.3]))
     assert math.isinf(float(moved[0, 1]))
     assert torch.isfinite(angles).all()
+
+
+def test_history_deskew_matches_constant_rate_rotation():
+    """Piecewise integration reduces to scalar deskew at tick-aligned ages."""
+    ages = torch.arange(SPIN_TICKS, dtype=torch.float32)[None, :] * DT
+    ranges = torch.full_like(ages, 3.0)
+    angles = torch.linspace(-1.0, 1.0, SPIN_TICKS)[None, :]
+    rate = torch.tensor([0.7])
+    increments = torch.full((1, SPIN_TICKS), float(rate * DT))
+    speed = torch.zeros_like(increments)
+
+    old_ranges, old_angles = deskew(ranges, angles, ages, rate)
+    new_ranges, new_angles = deskew_history(
+        ranges, angles, ages, increments, speed)
+
+    assert torch.allclose(new_ranges, old_ranges, atol=1e-6)
+    assert torch.allclose(wrap_angle(new_angles), wrap_angle(old_angles),
+                          atol=1e-6)
+
+
+def test_history_deskew_integrates_varying_motion_per_beam():
+    """Older returns use every intervening command and gyro increment."""
+    ages = torch.arange(SPIN_TICKS, dtype=torch.float32)[None, :] * DT
+    ranges = torch.full_like(ages, 2.0)
+    angles = torch.zeros_like(ages)
+    speed = torch.arange(1, SPIN_TICKS + 1, dtype=torch.float32)[None, :] * 0.1
+    increments = torch.zeros_like(speed)
+
+    moved, bearing = deskew_history(
+        ranges, angles, ages, increments, speed)
+    expected_distance = torch.tensor([
+        speed[0, SPIN_TICKS - back:].sum() * DT
+        for back in range(SPIN_TICKS)
+    ])
+
+    assert torch.allclose(moved[0], 2.0 - expected_distance, atol=1e-6)
+    assert torch.allclose(bearing, torch.zeros_like(bearing), atol=1e-6)
+
+
+def test_history_deskew_zero_reset_history_is_identity():
+    """A new episode cannot inherit motion from the episode before reset."""
+    ages = beam_ages(torch.tensor([0.4]), BEAMS)
+    ranges = torch.linspace(0.5, 5.0, BEAMS)[None, :]
+    angles = torch.linspace(-math.pi, math.pi, BEAMS)[None, :]
+    reset = torch.zeros(1, SPIN_TICKS)
+
+    moved, bearing = deskew_history(ranges, angles, ages, reset, reset)
+
+    assert torch.allclose(moved, ranges, atol=1e-6)
+    assert torch.allclose(wrap_angle(bearing - angles),
+                          torch.zeros_like(angles), atol=1e-6)
 
 
 def test_gyro_error_is_dominated_by_bias_not_white_noise():

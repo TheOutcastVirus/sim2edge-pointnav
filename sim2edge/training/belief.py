@@ -59,24 +59,37 @@ class BeliefConfig:
 
     epochs: int = 1
     #: Windows per batch. The effective sample count is this times ``seq_len``.
-    batch_size: int = 256
+    batch_size: int = 32
     #: 32 steps is 1.6 s -- long enough that compounding is visible in the loss
     #: and short enough that BPTT memory stays under a gigabyte of activations.
     #: Belief error at this horizon is the number to watch; see the log.
-    seq_len: int = 32
+    seq_len: int = 128
     learning_rate: float = 3.0e-4
     #: The actor is already good. Moving it at the head's rate is how a warm
     #: start gets thrown away in the first hundred steps.
     actor_lr_scale: float = 0.1
-    freeze_actor: bool = False
+    freeze_actor: bool = True
+    #: Actor-only adaptation starts from a trained causal estimator and teaches
+    #: the policy on its accumulated belief distribution without moving that
+    #: estimator back toward command shortcuts.
+    freeze_estimator: bool = False
     min_learning_rate: float = 3.0e-5
     warmup_steps: int = 200
     weight_decay: float = 1.0e-5
     grad_clip: float = 1.0
     omega_weight: float = 1.5
-    action_coef: float = 1.0
-    translation_coef: float = 50.0
+    action_coef: float = 0.0
+    translation_coef: float = 20.0
     belief_coef: float = 1.0
+    uncertainty_coef: float = 0.01
+    #: Counterfactual scan supervision: if lidar histories are assigned to the
+    #: wrong robots, the estimator must reject them and return to command dead
+    #: reckoning. Without this term the direct residual head can minimize the
+    #: ordinary loss from commands alone and shuffled-lidar ablation is exactly
+    #: unchanged.
+    mismatched_lidar_coef: float = 20.0
+    full_episodes: bool = True
+    validation_batches: int = 32
     train_noise_scale: float = 1.0
     validation_noise_scale: float = 1.0
     val_shards: int = 4
@@ -99,7 +112,10 @@ class BeliefConfig:
             raise ValueError("min_learning_rate must be in [0, learning_rate]")
         if not 0.0 <= self.actor_lr_scale <= 1.0:
             raise ValueError("actor_lr_scale must be in [0, 1]")
-        for name in ("action_coef", "translation_coef", "belief_coef"):
+        if self.freeze_actor and self.freeze_estimator:
+            raise ValueError("actor and estimator cannot both be frozen")
+        for name in ("action_coef", "translation_coef", "belief_coef",
+                     "uncertainty_coef", "mismatched_lidar_coef"):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} cannot be negative")
         if self.amp not in ("bf16", "off"):
@@ -114,21 +130,48 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
     window, and the same at the start. The ratio between them is the compounding
     rate, and it is the number that decides whether the horizon needs extending.
     """
-    predicted_action, predicted_belief = policy.rollout(
-        batch.lidar, batch.gyro, batch.previous_action, batch.initial_belief)
+    recurrent_motion = (policy.config.persistent_calibration
+                        or policy.config.motion_state_size > 0)
+    rollout = policy.rollout(
+        batch.lidar, batch.gyro, batch.previous_action, batch.initial_belief,
+        batch.raw_lidar, batch.raw_valid,
+        return_motion=recurrent_motion)
+    predicted_action, predicted_belief = rollout[:2]
 
     steps, envs = predicted_action.shape[0], predicted_action.shape[1]
+    valid = batch.valid_steps.reshape(steps * envs)
     action_loss, _, _ = imitation_loss(
-        predicted_action.reshape(steps * envs, 2),
-        batch.action.reshape(steps * envs, 2),
+        predicted_action.reshape(steps * envs, 2)[valid],
+        batch.action.reshape(steps * envs, 2)[valid],
         omega_weight=config.omega_weight)
 
-    # Step 0 never integrates, so it carries no translation prediction to score.
-    predicted_translation = policy.translation(
-        batch.lidar[1:].reshape(-1, *batch.lidar.shape[2:]),
-        batch.gyro[1:].reshape(-1, batch.gyro.shape[-1]),
-        batch.previous_action[1:].reshape(-1, *batch.previous_action.shape[2:]),
-    )
+    motion_valid = batch.valid_steps[1:].reshape(-1)
+    if config.freeze_estimator:
+        # The recurrent rollout above still uses the trained estimator to
+        # construct every belief consumed by the actor. Its dense auxiliary
+        # views cannot affect any trainable parameter in actor-only mode, and
+        # materializing them a second time costs several GB on full episodes.
+        translation_loss = action_loss.new_zeros(())
+        uncertainty_loss = action_loss.new_zeros(())
+        mismatched_lidar_loss = action_loss.new_zeros(())
+        scan_confidence_mean = action_loss.new_zeros(())
+    else:
+        # Step 0 never integrates, so it carries no translation prediction to score.
+        if recurrent_motion:
+            predicted_translation = rollout[2][1:].reshape(-1, 2)
+            predicted_variance = rollout[3][1:].reshape(-1, 2)
+            scan_confidence = rollout[4][1:].reshape(-1)
+        else:
+            predicted_translation, predicted_variance, scan_confidence = policy.motion_estimate(
+                batch.lidar[1:].reshape(-1, *batch.lidar.shape[2:]),
+                batch.gyro[1:].reshape(-1, batch.gyro.shape[-1]),
+                batch.previous_action[1:].reshape(-1, *batch.previous_action.shape[2:]),
+                batch.raw_lidar[1:].reshape(-1, *batch.raw_lidar.shape[2:]),
+                batch.raw_valid[1:].reshape(-1, *batch.raw_valid.shape[2:]),
+            )
+        predicted_translation = predicted_translation[motion_valid]
+        predicted_variance = predicted_variance[motion_valid]
+        translation_target = batch.translation[1:].reshape(-1, 2).float()[motion_valid]
     # Both geometric losses are divided by a characteristic length before being
     # squared, and that is not cosmetic. In raw metres the translation residual
     # is ~5e-4 m, so its squared loss is ~3e-7 -- against an action loss of
@@ -140,32 +183,104 @@ def belief_losses(policy: BeliefNavPolicy, batch, config: BeliefConfig):
     # Translation is scaled by the distance one full-speed tick covers, and the
     # belief by the goal tolerance -- the length at which an error stops being
     # cosmetic and starts losing episodes.
-    translation_loss = torch.nn.functional.mse_loss(
-        predicted_translation / TRANSLATION_SCALE_M,
-        batch.translation[1:].reshape(-1, 2).float() / TRANSLATION_SCALE_M)
+        translation_error = predicted_translation.float() - translation_target
+        translation_loss = torch.nn.functional.smooth_l1_loss(
+            predicted_translation / TRANSLATION_SCALE_M,
+            translation_target / TRANSLATION_SCALE_M, beta=0.1)
+    # Calibrate the declared variance to observed squared error without allowing
+    # the variance branch to move the translation target itself. A log-space
+    # robust loss stays non-negative and behaves well across millimetres to cm.
+        variance_target = translation_error.detach().square() + 1.0e-7
+        uncertainty_loss = torch.nn.functional.smooth_l1_loss(
+            predicted_variance.float().log(), variance_target.log(), beta=0.5)
+
+    # A second, counterfactual view closes the shortcut where the head predicts
+    # the simulator's mean slip entirely from commands and merely carries lidar
+    # along as an unused tensor. Roll along the environment axis so every scan
+    # remains temporally coherent but belongs to a different robot. Such a scan
+    # provides no evidence about this robot's motion; the only safe answer is
+    # the exact command prior. A quarter of valid steps is enough to make that
+    # distinction while bounding activation memory on full episodes.
+        if recurrent_motion:
+            counter_env = torch.arange(
+                0, envs, 4, device=batch.lidar.device)
+            if counter_env.numel() > 1:
+                counter_raw = batch.raw_lidar[:, counter_env].roll(1, dims=1)
+                counter_valid_raw = batch.raw_valid[:, counter_env].roll(
+                    1, dims=1)
+            else:
+                shift = max(1, batch.raw_lidar.shape[0] // 2)
+                counter_raw = batch.raw_lidar[:, counter_env].roll(
+                    shift, dims=0)
+                counter_valid_raw = batch.raw_valid[:, counter_env].roll(
+                    shift, dims=0)
+            counter_sequence, _, _ = policy.motion_rollout(
+                batch.lidar[:, counter_env], batch.gyro[:, counter_env],
+                batch.previous_action[:, counter_env], counter_raw,
+                counter_valid_raw)
+            counter_mask = batch.valid_steps[1:, counter_env].reshape(-1)
+            counter_translation = counter_sequence[1:].reshape(
+                -1, 2)[counter_mask]
+            counter_action = batch.previous_action[1:, counter_env].reshape(
+                -1, *batch.previous_action.shape[2:])[counter_mask]
+        else:
+            counter_source = batch.raw_lidar[1:].roll(1, dims=1).reshape(
+                -1, *batch.raw_lidar.shape[2:])
+            counter_valid_source = batch.raw_valid[1:].roll(1, dims=1).reshape(
+                -1, *batch.raw_valid.shape[2:])
+            counter_index = torch.nonzero(
+                motion_valid, as_tuple=False).squeeze(1)[::4]
+            counter_translation, _, _ = policy.motion_estimate(
+                batch.lidar[1:].reshape(
+                    -1, *batch.lidar.shape[2:])[counter_index],
+                batch.gyro[1:].reshape(
+                    -1, batch.gyro.shape[-1])[counter_index],
+                batch.previous_action[1:].reshape(
+                    -1, *batch.previous_action.shape[2:])[counter_index],
+                counter_source[counter_index],
+                counter_valid_source[counter_index],
+            )
+            counter_action = batch.previous_action[1:].reshape(
+                -1, *batch.previous_action.shape[2:])[counter_index]
+        counter_v = counter_action[:, -1, 0] * V_MAX
+        counter_prior = torch.stack(
+            [counter_v * DT, torch.zeros_like(counter_v)], dim=1)
+        mismatched_lidar_loss = torch.nn.functional.smooth_l1_loss(
+            counter_translation / TRANSLATION_SCALE_M,
+            counter_prior / TRANSLATION_SCALE_M, beta=0.1)
+        scan_confidence_mean = scan_confidence[motion_valid].mean().detach()
 
     belief_error = (predicted_belief - batch.belief).float()
-    belief_loss = (belief_error / GOAL_TOLERANCE_M).square().sum(dim=-1).mean()
+    belief_distance_loss = (belief_error / GOAL_TOLERANCE_M).square().sum(dim=-1)
+    belief_loss = belief_distance_loss[batch.valid_steps].mean()
 
     total = (config.action_coef * action_loss
              + config.translation_coef * translation_loss
-             + config.belief_coef * belief_loss)
+             + config.belief_coef * belief_loss
+             + config.uncertainty_coef * uncertainty_loss
+             + config.mismatched_lidar_coef * mismatched_lidar_loss)
 
     with torch.no_grad():
         distance = belief_error.norm(dim=-1)
+        last = batch.valid_steps.long().sum(dim=0).clamp_min(1) - 1
+        final_distance = distance.gather(0, last[None]).squeeze(0)
+        travelled = (batch.translation.norm(dim=-1) * batch.valid_steps).sum(dim=0)
         parts = {
             "loss": total.detach(),
             "action_loss": action_loss.detach(),
             "translation_loss": translation_loss.detach(),
             "belief_loss": belief_loss.detach(),
-            "belief_error_m": distance.mean(),
-            "belief_error_final_m": distance[-1].mean(),
-            "belief_error_final_p95_m": distance[-1].quantile(0.95),
+            "uncertainty_loss": uncertainty_loss.detach(),
+            "mismatched_lidar_loss": mismatched_lidar_loss.detach(),
+            "scan_confidence": scan_confidence_mean,
+            "belief_error_m": distance[batch.valid_steps].mean(),
+            "belief_error_final_m": final_distance.mean(),
+            "belief_error_final_p95_m": final_distance.quantile(0.95),
             # Per-metre-travelled drift is the portable number: it is what a
             # published lidar-odometry result quotes, and it does not depend on
             # this window length.
-            "drift_per_m": distance[-1].mean() / batch.translation[1:].norm(
-                dim=-1).sum(dim=0).mean().clamp_min(1.0e-6),
+            "drift_per_m": final_distance.mean()
+            / travelled.mean().clamp_min(1.0e-6),
         }
     return total, parts
 
@@ -174,10 +289,15 @@ def _parameter_groups(policy: BeliefNavPolicy, config: BeliefConfig):
     """Two groups, so the warm-started actor moves slower than the new head."""
     head = list(policy.odometry.parameters())
     actor = list(policy.actor.parameters())
+    for parameter in head:
+        parameter.requires_grad_(not config.freeze_estimator)
+    for parameter in actor:
+        parameter.requires_grad_(not config.freeze_actor)
     if config.freeze_actor:
-        for parameter in actor:
-            parameter.requires_grad_(False)
         return [{"params": head, "lr": config.learning_rate}]
+    if config.freeze_estimator:
+        return [{"params": actor,
+                 "lr": config.learning_rate * config.actor_lr_scale}]
     return [
         {"params": head, "lr": config.learning_rate},
         {"params": actor,
@@ -236,7 +356,7 @@ def belief_checkpoint(policy: BeliefNavPolicy, optimizer, scheduler,
                       global_step: int, best_validation: float,
                       warm_start_path: str | None) -> dict[str, Any]:
     return {
-        "format_version": 1,
+        "format_version": 2,
         "algorithm": "belief",
         "spec_fingerprint": fingerprint(),
         "observation_fingerprint": observation_fingerprint(

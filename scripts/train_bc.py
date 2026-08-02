@@ -25,6 +25,8 @@ def main() -> None:
     parser.add_argument("data", type=Path)
     parser.add_argument("--out", type=Path, default=Path("runs/bc"))
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--init", type=Path,
+                        help="warm-start actor weights without optimizer state")
     parser.add_argument("--device", default=None)
     parser.add_argument("--epochs", type=int, default=BCConfig.epochs)
     parser.add_argument("--batch-size", type=int, default=BCConfig.batch_size)
@@ -71,7 +73,7 @@ def main() -> None:
         prefetch_shards=args.prefetch_shards, seed=args.seed,
     )
     train_bc(args.data, args.out, config, device=args.device,
-             resume=args.resume)
+             resume=args.resume, init=args.init)
 
 
 if __name__ == "__main__":

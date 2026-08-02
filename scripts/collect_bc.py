@@ -30,9 +30,11 @@ still labelling each one with what the expert would do there. Without it every
 state in the dataset is one the oracle put itself in, and the policy has no
 recovery behaviour at all.
 
-Passing ``--driver-checkpoint`` switches execution to a learned policy while
-the oracle continues to provide every stored label.  This is the minimal DAgger
-operation: collect the states caused by the policy's systematic errors, without
+Passing ``--driver-checkpoint`` switches execution to a pose-fed learned actor
+while the oracle continues to provide every stored label. Passing
+``--belief-driver-checkpoint`` instead executes the complete recurrent
+lidar/IMU belief policy, including its own arrival decision. Both are DAgger:
+they collect states caused by the learned policy's systematic errors without
 changing the durable observation or label format.
 """
 
@@ -66,8 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="execution noise as a fraction of each axis limit. "
                          "0 collects pure on-policy expert data, which is the "
                          "distribution BC fails on -- see the module docstring")
-    ap.add_argument("--driver-checkpoint", type=Path,
-                    help="execute this policy while retaining oracle labels (DAgger)")
+    drivers = ap.add_mutually_exclusive_group()
+    drivers.add_argument(
+        "--driver-checkpoint", type=Path,
+        help="execute this pose-fed actor while retaining oracle labels (DAgger)")
+    drivers.add_argument(
+        "--belief-driver-checkpoint", type=Path,
+        help="execute this recurrent lidar/IMU belief policy while retaining "
+             "oracle labels (on-policy belief DAgger)")
     ap.add_argument("--validation_fraction", type=float, default=0.05,
                     help="fraction of layout IDs routed to validation/; 0 keeps "
                          "the legacy single-directory format")
@@ -102,6 +110,9 @@ def main() -> None:
         raise ValueError("starts_per_layout and writer_queue must be positive")
     if args.driver_checkpoint is not None and not args.driver_checkpoint.is_file():
         raise FileNotFoundError(args.driver_checkpoint)
+    if (args.belief_driver_checkpoint is not None
+            and not args.belief_driver_checkpoint.is_file()):
+        raise FileNotFoundError(args.belief_driver_checkpoint)
 
     # Line-buffer stdout. Redirected to a file it is block-buffered, so progress
     # lines sit in the buffer until exit -- and a run whose shutdown wedges never
@@ -120,9 +131,7 @@ def main() -> None:
     from isaaclab_env.nav_task import NavEnvCfg, Sim2EdgeNavEnv, normalize_action
     from sim2edge.dataset import save_shard
     from sim2edge.oracle import perturb_action
-    from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
-    from sim2edge.spec import LIDAR_BINS, OMEGA_MAX, V_MAX
-    from sim2edge.training import load_policy_checkpoint
+    from sim2edge.training import load_belief_checkpoint, load_policy_checkpoint
 
     cfg = NavEnvCfg()
     cfg.scene.num_envs = args.num_envs
@@ -130,7 +139,15 @@ def main() -> None:
     cfg.starts_per_layout = args.starts_per_layout
     cfg.layout_seed = args.seed
     cfg.seed = args.seed
-    cfg.collection_mode = True
+    # A learned driver must see the real online swept/deskewed observation.
+    # Oracle collection can retain the O(1) observation path because it records
+    # raw scans and never consumes env observations.
+    cfg.collection_mode = (args.driver_checkpoint is None
+                           and args.belief_driver_checkpoint is None)
+    if args.belief_driver_checkpoint is not None:
+        # Stored raw scans remain clean; only the live recurrent driver sees
+        # the noise distribution used by PPO, evaluation and hardware.
+        cfg.observation_noise_scale = 1.0
 
     # Progress markers. Isaac Lab initializes sensors lazily on first `.data`
     # access, so a stall inside reset() is really a stall inside sensor setup --
@@ -142,7 +159,7 @@ def main() -> None:
     gen = torch.Generator(device=device).manual_seed(args.seed)
 
     print("[collect] first reset (initializes the ray caster) ...", flush=True)
-    env.reset()
+    reset_observation, _ = env.reset()
     print("[collect] reset done", flush=True)
 
     if args.gui:
@@ -160,21 +177,27 @@ def main() -> None:
     # gated on physical command tracking before a single sample can be written.
     print("[collect] drive-response preflight ...", flush=True)
     run_drive_checks(env, torch)
-    env.reset()
+    reset_observation, _ = env.reset()
     print("[collect] drive-response preflight passed", flush=True)
 
     driver_policy = None
-    driver_history = None
-    reset_history = None
+    belief_driver = None
+    driver_observation = None
     driver = "oracle"
     if args.driver_checkpoint is not None:
         driver_policy = load_policy_checkpoint(args.driver_checkpoint, device=device)
-        driver_history = ObservationHistory(
-            env.num_envs, frames=driver_policy.config.history_frames,
-            lidar_bins=driver_policy.config.lidar_bins, device=device)
+        driver_observation = reset_observation["policy"]
         driver = "policy"
         print(f"[collect] DAgger driver: {args.driver_checkpoint} ",
               f"({driver_policy.parameter_count:,} parameters)", flush=True)
+    elif args.belief_driver_checkpoint is not None:
+        policy = load_belief_checkpoint(
+            args.belief_driver_checkpoint, device=device)
+        belief_driver = BeliefDriver(policy, env, torch)
+        driver = "policy"
+        print(f"[collect] recurrent belief DAgger driver: "
+              f"{args.belief_driver_checkpoint} "
+              f"({policy.parameter_count:,} parameters)", flush=True)
 
     collector = Collector(args.out, args.shard_steps, args.num_envs,
                           max_steps=int(env.max_episode_length),
@@ -182,7 +205,9 @@ def main() -> None:
                           device=device, layout_seed=args.seed,
                           num_layouts=args.num_layouts,
                           starts_per_layout=args.starts_per_layout,
-                          sigma=(0.0 if driver_policy is not None else args.sigma),
+                          sigma=(0.0 if (driver_policy is not None
+                                         or belief_driver is not None)
+                                 else args.sigma),
                           validation_fraction=args.validation_fraction,
                           writer_queue=args.writer_queue, driver=driver)
     step = 0
@@ -214,17 +239,16 @@ def main() -> None:
 
         label = env.oracle_command(pose)             # unperturbed: this is the label
         if driver_policy is None:
-            executed = perturb_action(label, args.sigma, generator=gen,
-                                      prev_action=env._action)
+            if belief_driver is None:
+                executed = perturb_action(label, args.sigma, generator=gen,
+                                          prev_action=env._action)
+            else:
+                with torch.inference_mode():
+                    executed, model_arrived = belief_driver.action()
+                env.set_external_done(model_arrived)
         else:
-            last_action = torch.stack((env._action[:, 0] / V_MAX,
-                                       env._action[:, 1] / OMEGA_MAX), dim=1)
-            driver_history.push(bin_lidar(ranges, angles), last_action,
-                                reset_history)
-            observation = driver_history.observation(goal_features(
-                pose, env._goal_w - env.scene.env_origins[:, :2]))
             with torch.inference_mode():
-                executed = driver_policy(observation)
+                executed = driver_policy(driver_observation)
 
         _t = time.perf_counter()
         collector.record(
@@ -233,10 +257,14 @@ def main() -> None:
             env._optimal_path_m)
         t_rec += time.perf_counter() - _t
 
-        _, _, terminated, truncated, _ = env.step(normalize_action(executed))
+        next_observation, _, terminated, truncated, _ = env.step(
+            normalize_action(executed))
+        if driver_policy is not None:
+            driver_observation = next_observation["policy"]
 
         done = terminated | truncated
-        reset_history = done
+        if belief_driver is not None:
+            belief_driver.reset(done)
         if done.any():
             collector.flush(done, env._reached, env._collided, angles,
                             filter_failures=args.filter_failures)
@@ -283,6 +311,99 @@ def main() -> None:
         print("  NOTE: a low yield both wastes compute and biases the set -- the "
               "filter\n        correlates with difficulty, so survivors skew easy.")
     _finish(simulation_app)
+
+
+def _body_goal(pose, goal, torch):
+    """True start-relative goal in body coordinates, used only on reset."""
+    delta = goal - pose[:, :2]
+    yaw = pose[:, 2]
+    cos, sin = torch.cos(yaw), torch.sin(yaw)
+    return torch.stack((cos * delta[:, 0] + sin * delta[:, 1],
+                        -sin * delta[:, 0] + cos * delta[:, 1]), dim=1)
+
+
+class BeliefDriver:
+    """Carry deployment-style belief state across asynchronous env resets.
+
+    Privileged pose is read exactly once per episode to initialize the relative
+    goal requested by the caller. Every later action uses only swept lidar, IMU
+    increments and prior commands.
+    """
+
+    def __init__(self, policy, env, torch):
+        self.policy, self.env, self.torch = policy, env, torch
+        n = env.num_envs
+        device = env.device
+        self.belief = torch.zeros(n, 2, device=device)
+        self.covariance = torch.zeros(n, 2, 2, device=device)
+        self.arrival_count = torch.zeros(n, dtype=torch.long, device=device)
+        self.calibration = torch.zeros(n, device=device)
+        self.first = torch.ones(n, dtype=torch.bool, device=device)
+
+    def _initial_goal(self):
+        pose = self.env._robot_pose()
+        goal = self.env._goal_w - self.env.scene.env_origins[:, :2]
+        return _body_goal(pose, goal, self.torch)
+
+    def action(self):
+        torch = self.torch
+        n = self.env.num_envs
+        device = self.env.device
+        command = torch.zeros(n, 2, device=device)
+        arrived = torch.zeros(n, dtype=torch.bool, device=device)
+
+        lidar = self.env._observation_history.lidar
+        previous_action = self.env.motion_action()
+        raw_lidar, raw_valid = self.env.motion_scan()
+        gyro = self.env.gyro_increment()
+
+        fresh = self.first
+        if bool(fresh.any()):
+            belief, covariance, count = self.policy.initial_state(
+                self._initial_goal()[fresh])
+            self.belief[fresh] = belief
+            self.covariance[fresh] = covariance
+            self.arrival_count[fresh] = count
+            config = getattr(self.policy, "config", None)
+            if (getattr(config, "persistent_calibration", False)
+                    or getattr(config, "motion_state_size", 0) > 0):
+                self.calibration[fresh] = self.policy.initial_calibration(
+                    self.belief[fresh])
+            command[fresh] = self.policy.actor(self.policy.observation(
+                lidar[fresh], self.belief[fresh], previous_action[fresh]))
+
+        ongoing = ~fresh
+        if bool(ongoing.any()):
+            config = getattr(self.policy, "config", None)
+            if (getattr(config, "persistent_calibration", False)
+                    or getattr(config, "motion_state_size", 0) > 0):
+                (next_command, next_arrived, next_belief, next_covariance,
+                 next_count, _, next_calibration) = self.policy.step_state(
+                    self.belief[ongoing], self.covariance[ongoing],
+                    self.arrival_count[ongoing], lidar[ongoing],
+                    raw_lidar[ongoing], raw_valid[ongoing], gyro[ongoing],
+                    previous_action[ongoing],
+                    calibration=self.calibration[ongoing])
+                self.calibration[ongoing] = next_calibration
+            else:
+                (next_command, next_arrived, next_belief, next_covariance,
+                 next_count, _) = self.policy.step_state(
+                    self.belief[ongoing], self.covariance[ongoing],
+                    self.arrival_count[ongoing], lidar[ongoing],
+                    raw_lidar[ongoing], raw_valid[ongoing], gyro[ongoing],
+                    previous_action[ongoing])
+            command[ongoing] = next_command
+            arrived[ongoing] = next_arrived
+            self.belief[ongoing] = next_belief
+            self.covariance[ongoing] = next_covariance
+            self.arrival_count[ongoing] = next_count
+
+        self.first.zero_()
+        return command, arrived
+
+    def reset(self, done):
+        """Mark auto-reset environments for start-coordinate initialization."""
+        self.first |= done
 
 
 def _finish(simulation_app) -> None:
@@ -618,6 +739,10 @@ class Collector:
             "starts_per_layout": np.array(self.starts_per_layout, dtype=np.int32),
             "sigma": np.array(self.sigma, dtype=np.float32),
             "driver": np.array(self.driver),
+            # v2 means pose labels were collected after the shared two-sided
+            # calibration/loss-only slip model landed. The loader must not add
+            # legacy synthetic slip to these commands a second time.
+            "motion_model_version": np.array(2, dtype=np.int32),
             "validation_fraction": np.array(
                 self.validation_fraction, dtype=np.float32),
             "validation_layout_ids": self.validation_layout_ids,

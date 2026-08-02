@@ -32,7 +32,8 @@ import torch
 from .spec import (BIN_WIDTH_RAD, GOAL_MAX_M, HISTORY_FRAMES, INVALID_FILL,
                    LIDAR_BINS, LIDAR_MAX_M, LIDAR_MIN_M)
 
-__all__ = ["ObservationHistory", "wrap_angle", "bin_lidar", "goal_features",
+__all__ = ["ObservationHistory", "wrap_angle", "bin_lidar", "rasterize_lidar",
+           "goal_features",
            "relative_goal_features", "build_observation"]
 
 
@@ -83,6 +84,33 @@ def bin_lidar(ranges: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     # bins would be 180 launches per step.
     out.scatter_reduce_(1, idx, norm, reduce="amin", include_self=True)
     return out
+
+
+def rasterize_lidar(ranges: torch.Tensor, angles: torch.Tensor,
+                    bins: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Angle-bin raw ranges without normalization, returning a validity mask.
+
+    The navigation actor intentionally collapses the A1 to 180 normalized bins.
+    Scan motion cannot afford that loss of angular detail, so the estimator uses
+    this companion operation to retain 720 uniformly-spaced metric ranges. Empty
+    bins are filled with ``LIDAR_MAX_M`` and are distinguished by the returned
+    boolean mask.
+    """
+    if bins < 1:
+        raise ValueError("bins must be positive")
+    if angles.dim() == 1:
+        angles = angles.unsqueeze(0).expand_as(ranges)
+    usable = (torch.isfinite(ranges) & (ranges >= LIDAR_MIN_M)
+              & (ranges <= LIDAR_MAX_M))
+    values = torch.where(usable, ranges, torch.full_like(ranges, math.inf))
+    width = 2.0 * math.pi / bins
+    idx = torch.floor((wrap_angle(angles) + math.pi) / width).long()
+    idx = idx.clamp(0, bins - 1)
+    out = torch.full((ranges.shape[0], bins), math.inf,
+                     dtype=ranges.dtype, device=ranges.device)
+    out.scatter_reduce_(1, idx, values, reduce="amin", include_self=True)
+    valid = torch.isfinite(out)
+    return torch.where(valid, out, torch.full_like(out, LIDAR_MAX_M)), valid
 
 
 def goal_features(robot_pose: torch.Tensor, goal_xy: torch.Tensor) -> torch.Tensor:

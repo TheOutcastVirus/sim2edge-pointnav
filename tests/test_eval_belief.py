@@ -196,6 +196,14 @@ def test_belief_modes_report_finite_diagnostics(evaluator, policy, mode):
     assert report["belief_error_final_m"] >= 0.0
 
 
+def test_drift_is_aggregated_over_distance_not_mean_of_episode_ratios(evaluator):
+    """A near-zero path must not dominate the portable drift metric."""
+    final = torch.tensor([0.01, 1.0])
+    distance = torch.tensor([0.001, 100.0])
+    got = evaluator._aggregate_drift(final, distance)
+    assert got == pytest.approx(1.01 / 100.001)
+
+
 def test_dead_reckoning_restores_the_odometry_head(evaluator, policy):
     """The baseline must not be destructive: it borrows the head, not owns it."""
     before = policy.odometry.head.weight.detach().clone()

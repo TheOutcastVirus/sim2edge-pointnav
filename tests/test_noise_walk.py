@@ -16,7 +16,8 @@ import math
 import torch
 
 from sim2edge.noise import (ODOM_YAW_RATE_BIAS_RAD, OdometryDrift,
-                            _segmented_cumsum, odometry_drift)
+                            _segmented_cumsum, odometry_drift,
+                            wheel_motion_factor)
 from sim2edge.spec import DT
 
 EPISODE, COUNT = 190, 256
@@ -115,3 +116,22 @@ def test_drift_scale_zero_produces_no_error():
     """Clean evaluation must be genuinely clean, for the noise=0 tier."""
     drift = odometry_drift(_episodes(), 0.0, torch.Generator().manual_seed(8))
     assert float(drift.abs().max()) == 0.0
+
+
+def test_wheel_calibration_is_two_sided_but_slip_is_loss_only():
+    count = 4096
+    yaw_rate = torch.zeros(count)
+    loss_only = wheel_motion_factor(
+        torch.zeros(count), yaw_rate,
+        generator=torch.Generator().manual_seed(19))
+    assert float(loss_only.max()) <= 1.0
+    assert float(loss_only.min()) < 1.0
+
+    fast = wheel_motion_factor(
+        torch.full((count,), 0.10), yaw_rate,
+        generator=torch.Generator().manual_seed(20))
+    slow = wheel_motion_factor(
+        torch.full((count,), -0.10), yaw_rate,
+        generator=torch.Generator().manual_seed(21))
+    assert float(fast.mean()) > 1.0
+    assert float(slow.mean()) < 1.0

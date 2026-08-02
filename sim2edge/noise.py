@@ -25,7 +25,7 @@ import torch
 __all__ = ["RANGE_STD_M", "DROPOUT_PROB", "BEARING_BIAS_RAD", "ODOM_XY_STD_M",
            "ODOM_YAW_STD_RAD", "ODOM_XY_WALK_M", "ODOM_YAW_WALK_RAD",
            "ODOM_YAW_RATE_BIAS_RAD", "corrupt_lidar", "corrupt_goal",
-           "odometry_drift", "OdometryDrift"]
+           "odometry_drift", "OdometryDrift", "wheel_motion_factor"]
 
 #: Gaussian range error, metres. Roughly constant over the A1's usable range.
 RANGE_STD_M = 0.02
@@ -112,12 +112,39 @@ GYRO_SCALE_ERROR = 5.0e-3
 #: Per-episode systematic scale error -- wheel radius, tyre wear, floor type.
 #: Constant within an episode, so it integrates into a distance-proportional
 #: error rather than averaging out. This is the term that matters.
+#: Two-sided drivetrain calibration error. A positive draw means the robot
+#: travels farther than the nominal command; a negative draw means it travels
+#: less. This is deliberately separate from physical slip, which is loss-only.
 WHEEL_SLIP_SCALE = 0.03
 #: Per-step random slip, as a fraction of the commanded step.
 WHEEL_SLIP_STD = 0.02
 #: Extra slip while turning, as a fraction per rad/s of commanded yaw rate.
 #: Skid-steer scrubs, and it scrubs most when the wheels fight each other.
 WHEEL_SLIP_TURN = 0.02
+
+
+def wheel_motion_factor(calibration_error: torch.Tensor,
+                        yaw_rate: torch.Tensor, *, noise_scale: float = 1.0,
+                        generator: torch.Generator | None = None) -> torch.Tensor:
+    """Return achieved/commanded forward travel for one control interval.
+
+    ``calibration_error`` is a per-episode, zero-mean fractional scale error.
+    Random wheel loss and turn scrub are non-negative. Keeping these terms
+    separate prevents the old half-rectification bug where a nominally
+    two-sided calibration draw could only ever slow the simulated robot.
+
+    This function is shared by the live simulator and the legacy-corpus adapter;
+    there is one sign convention and one clamp for both paths.
+    """
+    if noise_scale == 0.0:
+        return torch.ones_like(yaw_rate)
+    kw = {"generator": generator, "device": yaw_rate.device,
+          "dtype": yaw_rate.dtype}
+    random_loss = torch.randn(yaw_rate.shape, **kw).abs() * (
+        WHEEL_SLIP_STD * noise_scale)
+    turn_loss = yaw_rate.abs() * (WHEEL_SLIP_TURN * noise_scale)
+    factor = 1.0 + calibration_error - random_loss - turn_loss
+    return factor.clamp(0.5, 1.2)
 
 
 def corrupt_lidar(ranges: torch.Tensor, angles: torch.Tensor, scale: float = 1.0,

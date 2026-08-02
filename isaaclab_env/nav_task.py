@@ -63,17 +63,19 @@ except ImportError as exc:                       # pragma: no cover
     DirectRLEnvCfg = object                      # type: ignore[assignment,misc]
 
 from sim2edge import rooms as rooms_mod
-from sim2edge.noise import (OdometryDrift, WHEEL_SLIP_SCALE, WHEEL_SLIP_STD,
-                            WHEEL_SLIP_TURN, corrupt_goal, corrupt_lidar)
+from sim2edge.noise import (BEARING_BIAS_RAD, OdometryDrift,
+                            WHEEL_SLIP_SCALE, corrupt_goal, corrupt_lidar,
+                            wheel_motion_factor)
 from sim2edge.oracle import LayoutPool, oracle_action
 from sim2edge.preprocess import (ObservationHistory, bin_lidar, goal_features,
-                                 wrap_angle)
+                                 rasterize_lidar, wrap_angle)
 from sim2edge.rooms import MAX_OBSTACLES, sample_room, sample_start_positions
-from sim2edge.sensors import GyroModel, advance_phase, deskew, sweep_scan
+from sim2edge.sensors import (GyroModel, advance_phase, deskew_history,
+                              sweep_scan)
 from sim2edge.spec import (DESKEW_WITH_GYRO, DT, GOAL_MAX_M, GOAL_TOLERANCE_M,
                            HISTORY_FRAMES, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
                            LIDAR_MOUNT_YAW, OBS_DIM, OMEGA_MAX, ROBOT_RADIUS_M,
-                           SPIN_TICKS, V_MAX)
+                           MOTION_HISTORY_FRAMES, SPIN_TICKS, V_MAX)
 
 __all__ = ["NavEnvCfg", "Sim2EdgeNavEnv", "normalize_action",
            "denormalize_action"]
@@ -331,6 +333,12 @@ class NavEnvCfg(DirectRLEnvCfg):
     #: bit-repeatable while debugging something else.
     wheel_slip: bool = True
 
+    #: End an episode when simulator truth enters the goal tolerance. This is
+    #: correct for ordinary BC/PPO, but hardware-style belief evaluation must
+    #: leave it false: the robot has no truth signal and needs several sensor
+    #: ticks to confirm its own arrival. Collision and timeout still terminate.
+    terminate_on_goal: bool = True
+
     # ── reward ───────────────────────────────────────────────────────────────
     # Per step:
     #   progress * (d_{t-1} - d_t)  +  goal * reached  -  collision * collided
@@ -347,6 +355,12 @@ class NavEnvCfg(DirectRLEnvCfg):
     progress_reward: float = 3.0
     goal_reward: float = 10.0
     collision_penalty: float = 10.0
+    #: Terminal cost for consuming the entire horizon. Without this, the
+    #: accumulated 0.005 step cost is only 4.5, so once collision avoidance gets
+    #: difficult PPO correctly prefers to stop in free space instead of
+    #: finishing the route. Keep timeout at least as costly as collision after
+    #: the accumulated step cost, while successful arrival retains its bonus.
+    timeout_penalty: float = 10.0
     #: Small per-step cost. Without it, safe-but-stationary loitering is an
     #: optimal policy for any episode the robot expects to fail.
     time_penalty: float = 0.005
@@ -444,14 +458,38 @@ class Sim2EdgeNavEnv(DirectRLEnv):
                                device=self.device,
                                generator=self._noise_generator)
         self._gyro_history = torch.zeros(
-            n, HISTORY_FRAMES, device=self.device)
+            n, MOTION_HISTORY_FRAMES, device=self.device)
+        self._motion_action_history = torch.zeros(
+            n, MOTION_HISTORY_FRAMES, 2, device=self.device)
+        # Deskew spans a full lidar revolution, which is longer than the
+        # estimator's four-frame feature history. Keep the two contracts
+        # separate so changing actor history cannot silently shorten deskew.
+        self._deskew_gyro_history = torch.zeros(
+            n, SPIN_TICKS, device=self.device)
+        self._deskew_speed_history = torch.zeros(
+            n, SPIN_TICKS, device=self.device)
+        self._motion_scan_history = torch.full(
+            (n, MOTION_HISTORY_FRAMES, LIDAR_BEAMS), LIDAR_MAX_M,
+            device=self.device)
+        self._motion_valid_history = torch.zeros(
+            n, MOTION_HISTORY_FRAMES, LIDAR_BEAMS, dtype=torch.bool,
+            device=self.device)
         self._odometry_drift = OdometryDrift(
             n, scale=float(self.cfg.observation_noise_scale),
             device=self.device, generator=self._noise_generator)
         # Yaw at the previous control step, for the gyro's true input.
         self._previous_yaw = torch.zeros(n, device=self.device)
         # Per-episode drivetrain calibration error. Redrawn at reset.
-        self._slip_systematic = torch.zeros(n, device=self.device)
+        self._wheel_calibration = torch.zeros(n, device=self.device)
+        # Sensor mounting error is systematic within a trajectory.  Drawing it
+        # afresh every control tick turns a fixed calibration offset into lidar
+        # jitter and breaks the sequence-training contract.
+        self._lidar_bearing_bias = torch.zeros(n, device=self.device)
+        # A deployable belief policy may terminate on its own confirmed arrival
+        # decision. Keeping this explicit avoids collecting a stationary
+        # false-arrival tail until the simulator timeout.
+        self._external_done = torch.zeros(
+            n, dtype=torch.bool, device=self.device)
 
     # ── scene ────────────────────────────────────────────────────────────────
 
@@ -593,10 +631,27 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._gyro.reset(env_ids)
         self._odometry_drift.reset(env_ids)
         self._gyro_history[env_ids] = 0.0
+        self._motion_action_history[env_ids] = 0.0
+        self._deskew_gyro_history[env_ids] = 0.0
+        self._deskew_speed_history[env_ids] = 0.0
+        self._motion_scan_history[env_ids] = LIDAR_MAX_M
+        self._motion_valid_history[env_ids] = False
         self._previous_yaw[env_ids] = start[:, 2]
-        self._slip_systematic[env_ids] = torch.randn(
+        self._wheel_calibration[env_ids] = torch.randn(
             n, device=self.device,
             generator=self._noise_generator) * WHEEL_SLIP_SCALE
+        self._lidar_bearing_bias[env_ids] = torch.randn(
+            n, device=self.device,
+            generator=self._noise_generator) * BEARING_BIAS_RAD
+        self._external_done[env_ids] = False
+
+    def set_external_done(self, done: torch.Tensor) -> None:
+        """Request termination on the next step for model arrival logic."""
+        if done.shape != self._external_done.shape:
+            raise ValueError(
+                f"expected external done shape {tuple(self._external_done.shape)}, "
+                f"got {tuple(done.shape)}")
+        self._external_done |= done.to(device=self.device, dtype=torch.bool)
 
     def _write_obstacle_poses(self, env_ids, world_xyz, yaw):
         """One batched PhysX write for every obstacle in the given envs.
@@ -680,11 +735,9 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         """
         if not self.cfg.wheel_slip:
             return torch.ones_like(yaw_rate)
-        random = torch.randn(yaw_rate.shape, device=self.device,
-                             generator=self._noise_generator) * WHEEL_SLIP_STD
-        slip = (self._slip_systematic + random
-                + yaw_rate.abs() * WHEEL_SLIP_TURN)
-        return (1.0 - slip).clamp(0.5, 1.0)
+        return wheel_motion_factor(
+            self._wheel_calibration, yaw_rate,
+            generator=self._noise_generator)
 
     # ── observation ──────────────────────────────────────────────────────────
 
@@ -723,7 +776,10 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         scale = float(self.cfg.observation_noise_scale)
         if scale > 0.0:
             ranges, angles = corrupt_lidar(ranges, angles, scale,
-                                           self._noise_generator)
+                                           self._noise_generator,
+                                           bearing_bias=(
+                                               self._lidar_bearing_bias[:, None]
+                                               * scale))
 
         # ── the spinning sensor ──────────────────────────────────────────────
         # Push this instant's scan, then hand the last SPIN_TICKS of them to the
@@ -737,15 +793,41 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._scan_history[reset] = ranges[reset, None, :]
 
         measured_rate = self._gyro.step(self._true_yaw_rate(pose))
+        # A reset observation has no preceding control interval. The offline
+        # gyro synthesizer and evaluator both publish zero for this sample.
+        measured_rate[reset] = 0.0
         increment = measured_rate * self.cfg.sim.dt * self.cfg.decimation
         self._gyro_history[:, :-1] = self._gyro_history[:, 1:].clone()
         self._gyro_history[:, -1] = increment
         self._gyro_history[reset] = increment[reset, None]
+        normalized_action = torch.stack([
+            self._action[:, 0] / V_MAX, self._action[:, 1] / OMEGA_MAX
+        ], dim=1)
+        self._motion_action_history[:, :-1] = (
+            self._motion_action_history[:, 1:].clone())
+        self._motion_action_history[:, -1] = normalized_action
+        self._motion_action_history[reset] = normalized_action[reset, None]
+        self._deskew_gyro_history[:, :-1] = (
+            self._deskew_gyro_history[:, 1:].clone())
+        self._deskew_gyro_history[:, -1] = increment
+        self._deskew_speed_history[:, :-1] = (
+            self._deskew_speed_history[:, 1:].clone())
+        self._deskew_speed_history[:, -1] = self._action[:, 0]
+        self._deskew_gyro_history[reset] = increment[reset, None]
+        self._deskew_speed_history[reset] = self._action[reset, 0, None]
 
         swept, ages = sweep_scan(self._scan_history, self._spin_phase)
         if DESKEW_WITH_GYRO:
-            swept, angles = deskew(swept, angles, ages, measured_rate,
-                                   self._action[:, 0])
+            swept, angles = deskew_history(
+                swept, angles, ages, self._deskew_gyro_history,
+                self._deskew_speed_history)
+        metric, metric_valid = rasterize_lidar(swept, angles, LIDAR_BEAMS)
+        self._motion_scan_history[:, :-1] = self._motion_scan_history[:, 1:].clone()
+        self._motion_valid_history[:, :-1] = self._motion_valid_history[:, 1:].clone()
+        self._motion_scan_history[:, -1] = metric
+        self._motion_valid_history[:, -1] = metric_valid
+        self._motion_scan_history[reset] = metric[reset, None]
+        self._motion_valid_history[reset] = metric_valid[reset, None]
         self._spin_phase = advance_phase(self._spin_phase)
 
         # Odometry drift, for the ground-truth-goal observation only. The belief
@@ -789,6 +871,19 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         """
         return self._gyro_history
 
+    def motion_scan(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Deskewed 720-bin metric scan history and valid-return mask.
+
+        This is the high-resolution input for the internal motion estimator. It
+        is deliberately separate from the actor's 180-bin observation so actor
+        checkpoints do not silently change meaning.
+        """
+        return self._motion_scan_history, self._motion_valid_history
+
+    def motion_action(self) -> torch.Tensor:
+        """Normalized command history spanning the motion-estimation window."""
+        return self._motion_action_history
+
     # ── the oracle, for BC collection ────────────────────────────────────────
 
     def oracle_command(self, pose: torch.Tensor | None = None) -> torch.Tensor:
@@ -829,7 +924,11 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         # before the colliding state, and an RL episode should also end on a
         # collision.  Resetting here avoids simulating as many as 899 steps
         # that the collector is guaranteed to throw away.
-        return self._reached | self._collided, timeout
+        reached_terminal = (self._reached if self.cfg.terminate_on_goal
+                            else torch.zeros_like(self._reached))
+        external_done = self._external_done.clone()
+        self._external_done.zero_()
+        return reached_terminal | self._collided | external_done, timeout
 
     def _get_rewards(self) -> torch.Tensor:
         """Dense geodesic progress, with terminal outcomes and two small costs.
@@ -863,6 +962,7 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         return (self.cfg.progress_reward * progress
                 + self.cfg.goal_reward * self._reached.float()
                 - self.cfg.collision_penalty * self._collided.float()
+                - self.cfg.timeout_penalty * self.reset_time_outs.float()
                 - self.cfg.time_penalty
                 - self.cfg.smoothness_penalty * delta.square().sum(dim=1))
 

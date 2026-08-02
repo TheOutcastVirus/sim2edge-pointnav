@@ -49,7 +49,7 @@ from .preprocess import wrap_angle
 from .spec import DT, LIDAR_SPIN_HZ, SPIN_TICKS
 
 __all__ = ["SPIN_PERIOD_S", "beam_ages", "advance_phase", "sweep_scan",
-           "deskew", "GyroModel", "synthesize_gyro"]
+           "deskew", "deskew_history", "GyroModel", "synthesize_gyro"]
 
 #: Seconds per revolution. The quantity every function here is really about.
 SPIN_PERIOD_S = 1.0 / LIDAR_SPIN_HZ
@@ -161,6 +161,66 @@ def deskew(ranges: torch.Tensor, angles: torch.Tensor, ages: torch.Tensor,
     moved = torch.sqrt(x * x + y * y)
     return (torch.where(finite, moved, ranges),
             torch.where(finite, torch.atan2(y, x), wrap_angle(corrected)))
+
+
+def deskew_history(ranges: torch.Tensor, angles: torch.Tensor,
+                   ages: torch.Tensor, gyro_increment: torch.Tensor,
+                   forward_speed: torch.Tensor
+                   ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deskew with the piecewise motion actually measured over a revolution.
+
+    ``gyro_increment`` and ``forward_speed`` are ``(N, K)``, oldest to newest,
+    with at least :data:`SPIN_TICKS` entries. Entry ``s`` describes the motion
+    ending at stored scan ``s``. ``sweep_scan`` selects a stored scan by rounding
+    each beam age to a control tick; this function integrates that exact same
+    number of motion intervals instead of pretending the newest rate held for
+    the entire 182 ms revolution.
+
+    Translation uses commands, not achieved motion, so this remains odometry
+    free. Gyro supplies rotation. The residual is precisely the slip the motion
+    estimator is intended to learn rather than a deskew artifact.
+    """
+    n, beams = ranges.shape
+    if gyro_increment.shape != forward_speed.shape or gyro_increment.dim() != 2:
+        raise ValueError("gyro and speed histories must have matching (N, K) shape")
+    if gyro_increment.shape[0] != n or gyro_increment.shape[1] < SPIN_TICKS:
+        raise ValueError(f"deskew needs (N, K>={SPIN_TICKS}) motion history")
+    if angles.dim() == 1:
+        angles = angles.unsqueeze(0).expand_as(ranges)
+
+    k = gyro_increment.shape[1]
+    # Transform from each stored frame into the newest frame. Slot b contains
+    # the acquisition->current displacement/yaw for b ticks of beam age.
+    dx = torch.zeros(n, k, device=ranges.device, dtype=ranges.dtype)
+    dy = torch.zeros_like(dx)
+    yaw = torch.zeros_like(dx)
+    for back in range(1, k):
+        x = torch.zeros(n, device=ranges.device, dtype=ranges.dtype)
+        y = torch.zeros_like(x)
+        heading = torch.zeros_like(x)
+        for index in range(k - back, k):
+            distance = forward_speed[:, index] * DT
+            x = x + distance * torch.cos(heading)
+            y = y + distance * torch.sin(heading)
+            heading = heading + gyro_increment[:, index]
+        dx[:, back], dy[:, back], yaw[:, back] = x, y, heading
+
+    back = torch.round(ages / DT).long().clamp_(0, k - 1)
+    beam_dx = torch.gather(dx, 1, back)
+    beam_dy = torch.gather(dy, 1, back)
+    beam_yaw = torch.gather(yaw, 1, back)
+
+    finite = torch.isfinite(ranges)
+    safe = torch.where(finite, ranges, torch.zeros_like(ranges))
+    x = safe * torch.cos(angles) - beam_dx
+    y = safe * torch.sin(angles) - beam_dy
+    cos, sin = torch.cos(beam_yaw), torch.sin(beam_yaw)
+    current_x = cos * x + sin * y
+    current_y = -sin * x + cos * y
+    moved = torch.sqrt(current_x.square() + current_y.square())
+    bearing = torch.atan2(current_y, current_x)
+    return (torch.where(finite, moved, ranges),
+            torch.where(finite, bearing, wrap_angle(angles - beam_yaw)))
 
 
 class GyroModel:

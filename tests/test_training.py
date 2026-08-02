@@ -160,3 +160,13 @@ def test_tiny_training_run_writes_loadable_transparent_artifacts(tmp_path):
     torch.save(legacy, legacy_path)
     resumed = train_bc(data, output, config, device="cpu", resume=legacy_path)
     assert resumed["epoch"] == 1
+
+    warm_output = tmp_path / "warm_run"
+    warmed = train_bc(data, warm_output, config, device="cpu",
+                      init=output / "final.pt")
+    assert warmed["initial_checkpoint"] == str(output / "final.pt")
+    assert load_policy_checkpoint(warm_output / "final.pt")(
+        torch.zeros(2, OBS_DIM)).shape == (2, 2)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        train_bc(data, warm_output, config, device="cpu",
+                 resume=warm_output / "final.pt", init=output / "final.pt")

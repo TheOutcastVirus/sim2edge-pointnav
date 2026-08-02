@@ -186,7 +186,8 @@ def atomic_torch_save(value: Any, path: Path) -> None:
 
 def _checkpoint(policy: NavPolicy, optimizer, scheduler, config: BCConfig,
                 corpus: ShardCorpus, *, epoch: int, shard_cursor: int,
-                global_step: int, best_validation: float) -> dict[str, Any]:
+                global_step: int, best_validation: float,
+                initial_checkpoint: str | None = None) -> dict[str, Any]:
     return {
         "format_version": 1,
         "spec_fingerprint": fingerprint(),
@@ -203,6 +204,7 @@ def _checkpoint(policy: NavPolicy, optimizer, scheduler, config: BCConfig,
         "shard_cursor": shard_cursor,
         "global_step": global_step,
         "best_validation": best_validation,
+        "initial_checkpoint": initial_checkpoint,
     }
 
 
@@ -236,9 +238,16 @@ def load_policy_checkpoint(path: str | Path, device="cpu", *,
         raise ValueError(
             f"checkpoint {path} uses spec {got}, this process is {want}"
         )
-    config = NavPolicyConfig.from_dict(checkpoint["model_config"])
+    model_config = checkpoint["model_config"]
+    belief_checkpoint = (isinstance(model_config, dict)
+                         and "actor" in model_config
+                         and checkpoint.get("algorithm") in
+                         {"belief", "belief-ppo"})
+    config = NavPolicyConfig.from_dict(
+        model_config["actor"] if belief_checkpoint else model_config)
     got_observation = checkpoint.get("observation_fingerprint")
-    want_observation = observation_fingerprint(config.history_frames)
+    want_observation = observation_fingerprint(
+        config.history_frames, belief=belief_checkpoint)
     if got_observation is not None and got_observation != want_observation:
         legacy = legacy_observation_fingerprint(config.history_frames)
         if not (allow_legacy_sensor_model and got_observation == legacy):
@@ -250,7 +259,16 @@ def load_policy_checkpoint(path: str | Path, device="cpu", *,
                 f"model config requires {want_observation}.{hint}"
             )
     policy = NavPolicy(config).to(device)
-    policy.load_state_dict(checkpoint["model"])
+    state = checkpoint["model"]
+    if belief_checkpoint:
+        # DAgger and pose-only actor evaluation deliberately provide the same
+        # three goal features from exact pose instead of the carried belief.
+        # The actor itself is byte-for-byte the same graph; strip only its
+        # module prefix and reject any missing actor tensor strictly below.
+        state = {key.removeprefix("actor."): value
+                 for key, value in state.items()
+                 if key.startswith("actor.")}
+    policy.load_state_dict(state)
     return policy.eval()
 
 
@@ -302,7 +320,8 @@ def _validate(policy, corpus: ShardCorpus, config: BCConfig,
 
 def train_bc(data: str | Path, output: str | Path,
              config: BCConfig | None = None, *, device: str | None = None,
-             resume: str | Path | None = None) -> dict[str, Any]:
+             resume: str | Path | None = None,
+             init: str | Path | None = None) -> dict[str, Any]:
     """Train and return the final checkpoint metadata.
 
     Checkpoints are written only at shard boundaries, so a power loss replays at
@@ -314,6 +333,8 @@ def train_bc(data: str | Path, output: str | Path,
                                          else "cpu"))
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    if resume is not None and init is not None:
+        raise ValueError("resume and init are mutually exclusive")
     if resume is None:
         occupied = [name for name in ("latest.pt", "final.pt", "metrics.jsonl")
                     if (output / name).exists()]
@@ -340,7 +361,9 @@ def train_bc(data: str | Path, output: str | Path,
         raise ValueError("batch_size is larger than every training shard")
     total_steps = steps_per_epoch * config.epochs
 
-    policy = NavPolicy().to(device_obj)
+    policy = (load_policy_checkpoint(init, device=device_obj)
+              if init is not None else NavPolicy().to(device_obj))
+    initial_checkpoint = str(init) if init is not None else None
     optimizer_kwargs = {"lr": config.learning_rate,
                         "weight_decay": config.weight_decay}
     if device_obj.type == "cuda":
@@ -369,6 +392,7 @@ def train_bc(data: str | Path, output: str | Path,
         start_cursor = int(saved["shard_cursor"])
         global_step = int(saved["global_step"])
         best_validation = float(saved["best_validation"])
+        initial_checkpoint = saved.get("initial_checkpoint")
 
     if start_epoch >= config.epochs:
         # A completed checkpoint is already a valid final artifact. Treating a
@@ -405,6 +429,8 @@ def train_bc(data: str | Path, output: str | Path,
     if resume is not None:
         print(f"[BC] resumed epoch {start_epoch + 1}, shard {start_cursor}, "
               f"step {global_step:,}")
+    elif init is not None:
+        print(f"[BC] initialized actor from {init}")
 
     latest = output / "latest.pt"
     run_started = time.perf_counter()
@@ -469,7 +495,8 @@ def train_bc(data: str | Path, output: str | Path,
                 saved = _checkpoint(
                     policy, optimizer, scheduler, config, corpus, epoch=epoch,
                     shard_cursor=completed, global_step=global_step,
-                    best_validation=best_validation)
+                    best_validation=best_validation,
+                    initial_checkpoint=initial_checkpoint)
                 atomic_torch_save(saved, latest)
 
         train_input_wait = corpus.input_wait_seconds - input_wait_started
@@ -512,13 +539,15 @@ def train_bc(data: str | Path, output: str | Path,
             best = _checkpoint(
                 policy, optimizer, scheduler, config, corpus, epoch=epoch + 1,
                 shard_cursor=0, global_step=global_step,
-                best_validation=best_validation)
+                best_validation=best_validation,
+                initial_checkpoint=initial_checkpoint)
             atomic_torch_save(best, output / "best.pt")
 
         final = _checkpoint(
             policy, optimizer, scheduler, config, corpus, epoch=epoch + 1,
             shard_cursor=0, global_step=global_step,
-            best_validation=best_validation)
+            best_validation=best_validation,
+            initial_checkpoint=initial_checkpoint)
         atomic_torch_save(final, latest)
         start_cursor = 0
 

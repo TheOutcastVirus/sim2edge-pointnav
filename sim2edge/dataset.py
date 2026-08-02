@@ -23,10 +23,12 @@ import numpy as np
 import torch
 
 from . import noise as noise_mod
-from .preprocess import bin_lidar, build_observation, goal_features, wrap_angle
-from .sensors import deskew, sweep_scan
+from .preprocess import (bin_lidar, build_observation, goal_features,
+                         rasterize_lidar, wrap_angle)
+from .sensors import deskew_history, sweep_scan
 from .spec import (DESKEW_WITH_GYRO, DT, HISTORY_FRAMES, LIDAR_SPIN_HZ,
-                   OMEGA_MAX, SPIN_TICKS, V_MAX, fingerprint)
+                   MOTION_HISTORY_FRAMES, OMEGA_MAX, SPIN_TICKS, V_MAX,
+                   fingerprint)
 
 __all__ = ["Shard", "SequenceBatch", "save_shard", "load_shard"]
 
@@ -41,6 +43,8 @@ class SequenceBatch:
     """
 
     lidar: torch.Tensor          # (T, N, H, B) binned, deskewed, corrupted
+    raw_lidar: torch.Tensor      # (T, N, H, R) metric, uniform-angle ranges
+    raw_valid: torch.Tensor      # (T, N, H, R) valid-return mask
     gyro: torch.Tensor           # (T, N, H) measured yaw increment, radians
     previous_action: torch.Tensor  # (T, N, H, 2) normalized commands
     action: torch.Tensor         # (T, N, 2) oracle label, SI units
@@ -54,10 +58,12 @@ class SequenceBatch:
     #: column: the belief loss has to assign credit through the whole
     #: recurrence, while this one lands on the step that produced the error.
     translation: torch.Tensor
+    valid_steps: torch.Tensor     # (T, N) false only for padded episode tails
 
     def to(self, device) -> "SequenceBatch":
-        for name in ("lidar", "gyro", "previous_action", "action", "belief",
-                     "initial_belief", "translation"):
+        for name in ("lidar", "raw_lidar", "raw_valid", "gyro",
+                     "previous_action", "action", "belief",
+                     "initial_belief", "translation", "valid_steps"):
             setattr(self, name, getattr(self, name).to(device))
         return self
 
@@ -86,8 +92,11 @@ class Shard:
     outcome: torch.Tensor | None = None      # (T,) uint8: reached/collision/timeout
     steps_to_end: torch.Tensor | None = None # (T,) int32, zero at final sample
     driver: str = "oracle"                    # oracle or policy (DAgger)
+    motion_model_version: int = 1
     #: Lazily derived, never loaded. See the ``episode_start`` property.
     _episode_start: torch.Tensor | None = field(
+        default=None, repr=False, compare=False)
+    _episode_end: torch.Tensor | None = field(
         default=None, repr=False, compare=False)
 
     def __len__(self) -> int:
@@ -104,6 +113,7 @@ class Shard:
         # is a single segment scan; silently indexing a CPU tensor into GPU data
         # is a device-mismatch crash three call frames away from the cause.
         self._episode_start = None
+        self._episode_end = None
         return self
 
     def batches(self, batch_size: int, noise_scale: float = 1.0,
@@ -184,6 +194,17 @@ class Shard:
             self._episode_start = starts[ordinal]
         return self._episode_start
 
+    @property
+    def episode_end(self) -> torch.Tensor:
+        """(T,) index of the final sample of each sample's own episode."""
+        if self._episode_end is None:
+            first = noise_mod._episode_starts(self.episode)
+            starts = torch.nonzero(first, as_tuple=False).squeeze(1)
+            ends = torch.cat((starts[1:] - 1, starts.new_tensor([len(self) - 1])))
+            ordinal = torch.cumsum(first.long(), dim=0) - 1
+            self._episode_end = ends[ordinal]
+        return self._episode_end
+
     def sequence_starts(self, seq_len: int) -> torch.Tensor:
         """Indices where ``seq_len`` further samples stay inside one episode.
 
@@ -223,18 +244,55 @@ class Shard:
             yield self._assemble_sequence(selection, seq_len, noise_scale,
                                           generator)
 
-    def _assemble_sequence(self, starts, seq_len, noise_scale, generator):
+    def episode_batches(self, batch_size: int, noise_scale: float = 1.0,
+                        shuffle: bool = True,
+                        generator: torch.Generator | None = None):
+        """Yield padded complete episodes, initializing belief only at reset.
+
+        Unlike overlapping fixed windows, this path never resets a belief in the
+        middle of a trajectory. Padding repeats the terminal sensor sample and is
+        excluded from every loss by ``valid_steps``.
+        """
+        starts = torch.nonzero(noise_mod._episode_starts(self.episode),
+                               as_tuple=False).squeeze(1)
+        lengths = self.episode_end[starts] - starts + 1
+        if shuffle:
+            # Randomize ties, sort by length to minimize padded timesteps, then
+            # randomize whole batches so optimization does not see a short-to-
+            # long curriculum. On the production corpus this removes ~20% of
+            # sensor/model work while preserving every episode exactly once.
+            tie_order = torch.randperm(starts.numel(), generator=generator,
+                                       device=starts.device)
+            starts, lengths = starts[tie_order], lengths[tie_order]
+            length_order = torch.argsort(lengths, stable=True)
+            starts, lengths = starts[length_order], lengths[length_order]
+            groups = list(range(0, starts.numel(), batch_size))
+            group_order = torch.randperm(len(groups), generator=generator,
+                                         device=starts.device).cpu().tolist()
+            groups = [groups[index] for index in group_order]
+        else:
+            groups = list(range(0, starts.numel(), batch_size))
+        for i in groups:
+            selected = starts[i:i + batch_size]
+            selected_lengths = lengths[i:i + batch_size]
+            yield self._assemble_sequence(
+                selected, int(selected_lengths.max()), noise_scale, generator,
+                lengths=selected_lengths)
+
+    def _assemble_sequence(self, starts, seq_len, noise_scale, generator,
+                           lengths=None):
         device = self.ranges.device
         n = starts.numel()
         # Raw frames needed per window: the sequence itself, plus the actor's
         # history, plus one revolution of scan history behind the oldest of
         # those. Clamped at the episode's first sample, which repeats -- the
         # same convention `_history_indices` uses for the non-sequence path.
-        pad = (HISTORY_FRAMES - 1) + (SPIN_TICKS - 1)
+        pad = (MOTION_HISTORY_FRAMES - 1) + (SPIN_TICKS - 1)
         width = pad + seq_len
         offsets = torch.arange(width, device=device)
         raw = (starts[:, None] - pad + offsets[None, :])
         raw = torch.maximum(raw, self.episode_start[starts][:, None])
+        raw = torch.minimum(raw, self.episode_end[starts][:, None])
 
         ranges = self.ranges[raw].float()                     # (n, W, B)
         beams = ranges.shape[-1]
@@ -247,6 +305,16 @@ class Shard:
             generator, bearing_bias=bias.repeat_interleave(width, dim=0))
         noisy = noisy.reshape(n, width, beams)
         angles = angles.reshape(n, width, beams)
+        # A clamped episode-boundary frame is one physical scan repeated in the
+        # FIFO, not several independent range-noise draws of that scan. Match
+        # the live reset path before assembling overlapping sweeps.
+        repeated = raw[:, 1:] == raw[:, :-1]
+        for frame in range(1, width):
+            same = repeated[:, frame - 1]
+            noisy[:, frame] = torch.where(
+                same[:, None], noisy[:, frame - 1], noisy[:, frame])
+            angles[:, frame] = torch.where(
+                same[:, None], angles[:, frame - 1], angles[:, frame])
 
         gyro_all = self._sequence_gyro(raw, noise_scale, generator)  # (n, W)
 
@@ -254,42 +322,67 @@ class Shard:
         # window rather than being redrawn: consecutive observations must not
         # share a freshest bearing.
         phase0 = torch.rand((n,), **kw)
-        binned = []
-        for j in range(SPIN_TICKS - 1, width):
-            window = noisy[:, j - SPIN_TICKS + 1:j + 1]        # (n, K, B)
-            phase = (phase0 + LIDAR_SPIN_HZ * DT * j) % 1.0
-            swept, ages = sweep_scan(window, phase)
-            frame_angles = angles[:, j]
-            if DESKEW_WITH_GYRO:
-                # Rate over the tick, from the gyro, as the robot would have it.
-                rate = gyro_all[:, j] / DT
-                speed = self.action[raw[:, j], 0]
-                swept, frame_angles = deskew(swept, frame_angles, ages, rate,
-                                             speed)
-            binned.append(bin_lidar(swept, frame_angles))
-        binned = torch.stack(binned, dim=1)                    # (n, T+H-1, bins)
+        # Assemble every output time in one batched sensor pass. The previous
+        # implementation looped over ~150 timesteps and launched several tiny
+        # CUDA kernels for each one, leaving a 4090 around 40% utilized. Time is
+        # just another batch dimension here; flattening it removes that launch
+        # bottleneck without changing any sensor arithmetic.
+        outputs = width - SPIN_TICKS + 1
+        windows = noisy.unfold(1, SPIN_TICKS, 1).permute(0, 1, 3, 2)
+        flat_windows = windows.reshape(n * outputs, SPIN_TICKS, beams)
+        j = torch.arange(SPIN_TICKS - 1, width, device=device)
+        phase = ((phase0[:, None] + LIDAR_SPIN_HZ * DT * j[None]) % 1.0)
+        swept, ages = sweep_scan(flat_windows, phase.reshape(-1))
+        frame_angles = angles[:, SPIN_TICKS - 1:].reshape(n * outputs, beams)
+        if DESKEW_WITH_GYRO:
+            gyro_windows = gyro_all.unfold(1, SPIN_TICKS, 1)
+            raw_windows = raw.unfold(1, SPIN_TICKS, 1)
+            speed_windows = self.prev_action[
+                raw_windows.reshape(-1), 0
+            ].reshape(n * outputs, SPIN_TICKS)
+            swept, frame_angles = deskew_history(
+                swept, frame_angles, ages,
+                gyro_windows.reshape(n * outputs, SPIN_TICKS), speed_windows)
+        binned = bin_lidar(swept, frame_angles).reshape(n, outputs, -1)
+        metric, metric_valid = rasterize_lidar(swept, frame_angles, beams)
+        metric = metric.reshape(n, outputs, beams)
+        metric_valid = metric_valid.reshape(n, outputs, beams)
 
-        # Actor history: frames [t-H+1 .. t] for each output step.
+        # Motion estimation gets a one-second metric/IMU/action baseline while
+        # the warm-started actor retains its original four-frame observation.
         step = torch.arange(seq_len, device=device)
         frame = torch.arange(HISTORY_FRAMES, device=device)
-        history = step[:, None] + frame[None, :]               # (T, H)
-        lidar = binned[:, history]                             # (n, T, H, bins)
+        history = (step[:, None] + (MOTION_HISTORY_FRAMES - HISTORY_FRAMES)
+                   + frame[None, :])                           # (T, actor H)
+        motion_frame = torch.arange(MOTION_HISTORY_FRAMES, device=device)
+        motion_history = step[:, None] + motion_frame[None, :] # (T, motion H)
+        lidar = binned[:, history]                             # (n, T, actor H, bins)
+        raw_lidar = metric[:, motion_history]
+        raw_valid = metric_valid[:, motion_history]
 
         out = raw[:, pad:]                                     # (n, T) sample ids
-        gyro_history = gyro_all[:, history + (SPIN_TICKS - 1)]  # (n, T, H)
+        gyro_history = gyro_all[:, motion_history + (SPIN_TICKS - 1)]
         commands = self.prev_action[raw[:, SPIN_TICKS - 1:].reshape(-1)].clone()
-        commands = commands.reshape(n, seq_len + HISTORY_FRAMES - 1, 2)
-        commands[..., 0] = commands[..., 0] * self._slip(
-            commands, noise_scale, generator)
+        commands = commands.reshape(
+            n, seq_len + MOTION_HISTORY_FRAMES - 1, 2)
+        if self.motion_model_version < 2:
+            commands[..., 0] = commands[..., 0] * self._legacy_command_scale(
+                commands, noise_scale, generator)
         previous_history = _normalize_action(
             commands.reshape(-1, 2)
-        ).reshape(n, seq_len + HISTORY_FRAMES - 1, 2)[:, history]
+        ).reshape(n, seq_len + MOTION_HISTORY_FRAMES - 1, 2)[:, motion_history]
 
         belief = self._true_belief(out.reshape(-1)).reshape(n, seq_len, 2)
         translation = self._true_translation(out)
+        valid_steps = torch.ones(n, seq_len, dtype=torch.bool, device=device)
+        if lengths is not None:
+            valid_steps = (torch.arange(seq_len, device=device)[None]
+                           < lengths[:, None])
         transpose = lambda value: value.transpose(0, 1).contiguous()
         return SequenceBatch(
             lidar=transpose(lidar),
+            raw_lidar=transpose(raw_lidar),
+            raw_valid=transpose(raw_valid),
             gyro=transpose(gyro_history),
             previous_action=transpose(previous_history),
             action=transpose(self.action[out.reshape(-1)].reshape(
@@ -297,10 +390,11 @@ class Shard:
             belief=transpose(belief),
             initial_belief=belief[:, 0].contiguous(),
             translation=transpose(translation),
+            valid_steps=transpose(valid_steps),
         )
 
-    def _slip(self, commands: torch.Tensor, noise_scale: float,
-              generator) -> torch.Tensor:
+    def _legacy_command_scale(self, commands: torch.Tensor, noise_scale: float,
+                              generator) -> torch.Tensor:
         """(n, W) multiplier turning true motion into a *believed* command.
 
         The corpus was collected against a simulator that tracked commands
@@ -325,14 +419,10 @@ class Shard:
               "dtype": commands.dtype}
         systematic = torch.randn((n, 1), **kw) * (
             noise_mod.WHEEL_SLIP_SCALE * noise_scale)
-        random_walk = torch.randn((n, width), **kw) * (
-            noise_mod.WHEEL_SLIP_STD * noise_scale)
-        turning = commands[..., 1].abs() * (
-            noise_mod.WHEEL_SLIP_TURN * noise_scale)
-        # Clamped away from zero: a slip factor at or past 1 would invert the
-        # command, which is not a thing wheels do.
-        slip = (systematic + random_walk + turning).clamp(-0.5, 0.5)
-        return 1.0 / (1.0 - slip)
+        factor = noise_mod.wheel_motion_factor(
+            systematic, commands[..., 1], noise_scale=noise_scale,
+            generator=generator)
+        return factor.reciprocal()
 
     def _true_translation(self, out: torch.Tensor) -> torch.Tensor:
         """(n, T, 2) exact body-frame displacement over each preceding tick.
@@ -371,7 +461,14 @@ class Shard:
             dim=1)
         white = torch.randn((n, width), **kw) * (
             noise_mod.GYRO_ARW_RAD_PER_SQRT_S * noise_scale * math.sqrt(DT))
-        return increment * (1.0 + scale_error) + (bias0 + walk) * DT + white
+        measured = (increment * (1.0 + scale_error)
+                    + (bias0 + walk) * DT + white)
+        # Clamped history repeats the first sample of an episode. No motion
+        # interval precedes that sample, so neither gyro noise nor the previous
+        # episode is allowed to invent one. This matches synthesize_gyro and the
+        # live reset path.
+        measured[raw == self.episode_start[raw]] = 0.0
+        return measured
 
     def _true_belief(self, index: torch.Tensor) -> torch.Tensor:
         """(M, 2) exact goal offset in the body frame -- the supervision target.
@@ -397,20 +494,68 @@ class Shard:
             yield sel
 
     def _assemble_batch(self, sel, noise_scale, generator):
-        history = _history_indices(sel, self.episode, HISTORY_FRAMES)
-        ranges = self.ranges[history].float()
-        flat_ranges = ranges.flatten(0, 1)
-        r, a = noise_mod.corrupt_lidar(flat_ranges, self.angles, noise_scale,
-                                       generator)
-        lidar = bin_lidar(r, a).reshape(
-            sel.numel(), HISTORY_FRAMES, -1)
-        # At an episode boundary the first raw frame is repeated. Corrupt it
-        # once semantically as the live FIFO does, rather than presenting four
-        # independent noise draws of one instant during training only.
+        # Each actor frame is a full motor sweep assembled from several stored
+        # instantaneous scans. The previous path binned four instantaneous
+        # scans directly, so BC trained on a different sensor than Isaac and
+        # hardware even after the spinning-lidar contract was introduced.
+        n = sel.numel()
+        width = HISTORY_FRAMES + SPIN_TICKS - 1
+        offsets = torch.arange(width, device=sel.device)
+        raw = sel[:, None] - (width - 1) + offsets[None]
+        raw = torch.maximum(raw, self.episode_start[sel][:, None])
+
+        ranges = self.ranges[raw].float()                    # (n, W, beams)
+        beams = ranges.shape[-1]
+        kw = {"generator": generator, "device": ranges.device,
+              "dtype": torch.float32}
+        bearing_bias = torch.randn((n, 1), **kw) * (
+            noise_mod.BEARING_BIAS_RAD * noise_scale)
+        noisy, angles = noise_mod.corrupt_lidar(
+            ranges.reshape(n * width, beams), self.angles, noise_scale,
+            generator,
+            bearing_bias=bearing_bias.repeat_interleave(width, dim=0))
+        noisy = noisy.reshape(n, width, beams)
+        angles = angles.reshape(n, width, beams)
+        repeated = raw[:, 1:] == raw[:, :-1]
+        for frame in range(1, width):
+            same = repeated[:, frame - 1]
+            noisy[:, frame] = torch.where(
+                same[:, None], noisy[:, frame - 1], noisy[:, frame])
+            angles[:, frame] = torch.where(
+                same[:, None], angles[:, frame - 1], angles[:, frame])
+
+        windows = noisy.unfold(1, SPIN_TICKS, 1).permute(0, 1, 3, 2)
+        flat_windows = windows.reshape(n * HISTORY_FRAMES, SPIN_TICKS, beams)
+        # Free-running phase derived from the stable sample/episode identity:
+        # deterministic clean validation, varied bearing freshness across the
+        # corpus, and exactly LIDAR_SPIN_HZ * DT advance between history frames.
+        history = raw[:, SPIN_TICKS - 1:]
+        phase = (
+            history.float() * (LIDAR_SPIN_HZ * DT)
+            + self.episode[history].float() * 0.61803398875
+        ).remainder(1.0)
+        swept, ages = sweep_scan(flat_windows, phase.reshape(-1))
+        frame_angles = angles[:, SPIN_TICKS - 1:].reshape(
+            n * HISTORY_FRAMES, beams)
+        if DESKEW_WITH_GYRO:
+            gyro = self._sequence_gyro(raw, noise_scale, generator)
+            gyro_windows = gyro.unfold(1, SPIN_TICKS, 1)
+            raw_windows = raw.unfold(1, SPIN_TICKS, 1)
+            speed = self.prev_action[
+                raw_windows.reshape(-1), 0
+            ].reshape(n * HISTORY_FRAMES, SPIN_TICKS)
+            swept, frame_angles = deskew_history(
+                swept, frame_angles, ages,
+                gyro_windows.reshape(n * HISTORY_FRAMES, SPIN_TICKS), speed)
+        lidar = bin_lidar(swept, frame_angles).reshape(
+            n, HISTORY_FRAMES, -1)
+        # ObservationHistory pushes one reset scan and repeats that *processed*
+        # frame across its actor FIFO. Recomputing the same raw scan at several
+        # synthetic phases would instead create different deskewed frames.
         for frame in range(1, HISTORY_FRAMES):
-            repeated = history[:, frame] == history[:, frame - 1]
+            same = history[:, frame] == history[:, frame - 1]
             lidar[:, frame] = torch.where(
-                repeated[:, None], lidar[:, frame - 1], lidar[:, frame])
+                same[:, None], lidar[:, frame - 1], lidar[:, frame])
         # Integrated drift first, then the instantaneous residual on top. Only
         # the second of those existed before; a policy evaluated without the
         # first has never been asked to cope with an error that does not come
@@ -517,6 +662,8 @@ def load_shard(path, device="cpu") -> Shard:
             steps_to_end=torch.from_numpy(
                 _steps_to_episode_end(episode_array)).to(device=device),
             driver=str(z["driver"]) if "driver" in z.files else "oracle",
+            motion_model_version=(int(z["motion_model_version"])
+                                  if "motion_model_version" in z.files else 1),
         )
 
 

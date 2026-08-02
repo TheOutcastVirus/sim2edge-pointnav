@@ -27,6 +27,7 @@ __all__ = ["LIDAR_BINS", "LIDAR_MIN_M", "LIDAR_MAX_M", "INVALID_FILL",
            "BIN_WIDTH_RAD", "HISTORY_FRAMES", "OBS_DIM", "fingerprint",
            "observation_fingerprint",
            "LIDAR_SPIN_HZ", "SPIN_TICKS", "DESKEW_WITH_GYRO", "GYRO_CHANNELS",
+           "MOTION_HISTORY_FRAMES",
            "sensor_model_fingerprint", "legacy_observation_fingerprint"]
 
 # ── Lidar ────────────────────────────────────────────────────────────────────
@@ -154,6 +155,12 @@ DESKEW_WITH_GYRO = True
 # pose -- not their layout. Same three numbers, same meaning, same encoder.
 GYRO_CHANNELS = HISTORY_FRAMES
 
+# The actor stays on four frames for checkpoint compatibility. Ego-motion is a
+# much smaller signal and needs a longer baseline: one second makes centimetres
+# of accumulated slip visible above per-beam lidar noise without introducing
+# opaque recurrent state.
+MOTION_HISTORY_FRAMES = 20
+
 
 def fingerprint() -> str:
     """16 hex chars over the raw sensor contract; stamped into datasets.
@@ -183,7 +190,8 @@ def sensor_model_fingerprint() -> str:
     :func:`fingerprint`, and it is why 104 GB of ``overnight_v2`` survived this
     change intact.
     """
-    values = [LIDAR_SPIN_HZ, SPIN_TICKS, DESKEW_WITH_GYRO]
+    values = [LIDAR_SPIN_HZ, SPIN_TICKS, DESKEW_WITH_GYRO,
+              "piecewise-deskew-v2", MOTION_HISTORY_FRAMES]
     return ";".join(repr(v) for v in values)
 
 
@@ -217,7 +225,9 @@ def observation_fingerprint(history_frames: int = HISTORY_FRAMES,
     identical shapes -- the second maintains state the first does not have -- so
     they must not share a fingerprint.
     """
-    layout = "belief-v1" if belief else "history-v1"
+    # v2 adds a 720-bin metric scan/mask stream and uncertainty-carrying runtime
+    # state. Old belief checkpoints must not silently load into that contract.
+    layout = "belief-v2" if belief else "history-v1"
     canon = (f"{fingerprint()};{layout};{history_frames};"
              f"{sensor_model_fingerprint()}")
     return hashlib.sha256(canon.encode()).hexdigest()[:16]

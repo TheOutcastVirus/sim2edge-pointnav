@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-175 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
+245 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -414,7 +414,172 @@ scripts/train_ppo.py             the rollout loop, and only that
 
 ---
 
-# Phase 4 — Export and deploy
+# Phase 4 — Odometry-free lidar/IMU point navigation
+
+The deployment goal is supplied once as `(x_forward, y_left)` in the reset base
+frame. Runtime inputs are the RPLIDAR sweep, gyro Z, and previously issued
+commands; wheel odometry and pose are not accepted by the model interface.
+
+## 1. Collect the current motion distribution
+
+The production corpus was collected with the command in Phase 1 §4, changing
+only the output to `data/overnight_v3`. Its 65,587 complete/truncated episodes
+span 8,192 layouts with a whole-layout 5% validation split. Wheel calibration
+is two-sided while random slip and turn scrub are loss-only; newly collected
+pose labels already contain those live dynamics and do not receive the legacy
+load-time slip adapter.
+
+The 8,192-environment collection needs about 11 GB just for the recorder. When
+another GPU process is resident, start at 4,096 environments; doubling is safe
+only if `nvidia-smi` leaves room for the transient completion spike.
+
+## 2. Train an actor on the actual spinning-lidar observation
+
+```bash
+.venv/bin/python scripts/train_bc.py data/overnight_v3 \
+  --out runs/bc_swept_v3 --epochs 2 --batch-size 4096 --no-compile
+```
+
+The loader constructs a free-running RPLIDAR sweep from raw scan history and
+applies gyro/command deskew before binning. It measured about 155k samples/s on
+the 4090 and completed 15.27M samples × 2 epochs in 218 s. The low validation
+loss did not by itself produce a good closed-loop actor (40.6% pose success), so
+keep the old PPO actor as the motion-estimator warm start until PPO adaptation
+beats it.
+
+## 3. Train and causally check the motion belief
+
+```bash
+.venv/bin/python scripts/train_belief.py \
+  --data data/overnight_v3 \
+  --warm-start runs/ppo_v1/best.pt \
+  --out runs/belief_motion_v4 \
+  --epochs 1 --batch-size 16 \
+  --mismatched-lidar-coef 20
+
+.venv/bin/python scripts/eval_belief_offline.py \
+  runs/belief_motion_v4/best.pt \
+  --data data/overnight_v3 \
+  --out runs/belief_motion_v4/offline_ablation.json
+```
+
+Complete episodes are the default. The goal belief is initialized only at an
+episode boundary, the actor is frozen, action imitation is off, and `best.pt` is
+selected on held-out validation episodes. The verified v4 checkpoint scored
+7.73 cm validation final error. On the paired 256-episode ablation it scored
+6.15 cm versus 7.01 cm for dead reckoning; shuffling lidar degraded it to
+6.25 cm and zeroing lidar to 7.01 cm. This is a narrow but positive causal lidar
+result. Do not start expensive PPO if `lidar_causal` is false.
+
+Resume at the next shard after the most recent periodic checkpoint:
+
+```bash
+.venv/bin/python scripts/train_belief.py \
+  --data data/overnight_v3 --out runs/belief_motion_v4 \
+  --epochs 1 --batch-size 16 --mismatched-lidar-coef 20 \
+  --resume runs/belief_motion_v4/latest.pt
+```
+
+## 4. Optional actor-only offline adaptation
+
+```bash
+.venv/bin/python scripts/train_belief.py \
+  --data data/overnight_v3 \
+  --belief-start runs/belief_motion_v4/best.pt \
+  --out runs/belief_actor_v6 \
+  --train-actor --freeze-estimator --batch-size 8
+```
+
+Eight is the safe batch size with roughly 5 GB free GPU memory. The measured
+probe took 77 s for 200 updates and regressed deterministic pose success to
+37.5%, so this branch is diagnostic rather than the current production path.
+Validation selects on dimensionless action loss and prints belief error
+separately.
+
+## 5. Adapt the actor in the closed loop
+
+```bash
+~/isaac-venv/bin/python scripts/train_belief_ppo.py \
+  --init runs/belief_motion_v4/best.pt \
+  --out runs/belief_ppo_v4 \
+  --num-envs 256 --num-layouts 1024 \
+  --iterations 2400 --freeze-estimator
+```
+
+This keeps policy gradients and privileged pose labels out of the validated
+motion estimator. With the competing 17–18 GB GPU process, 256 environments is
+the tested safe setting; without it, scale environments and layouts together.
+At 256 × 32, 2,400 PPO iterations provide the same 19.66M transitions as the
+earlier 300-iteration, 2,048-environment run.
+
+Resume preserves model, critic, exploration scale, optimizer, and iteration:
+
+```bash
+~/isaac-venv/bin/python scripts/train_belief_ppo.py \
+  --init runs/belief_motion_v4/best.pt \
+  --resume runs/belief_ppo_v4/latest.pt \
+  --out runs/belief_ppo_v4 \
+  --num-envs 256 --num-layouts 1024 \
+  --iterations 2400 --freeze-estimator
+```
+
+## 6. Evaluate and enforce the gates
+
+```bash
+~/isaac-venv/bin/python scripts/eval_belief.py \
+  runs/belief_ppo_v4/final.pt \
+  --reference runs/ppo_v1/best.pt --allow-legacy-reference \
+  --modes reference pose dead-reckoning belief lidar-shuffled lidar-zeroed \
+  --episodes 512 --num-layouts 512 --layout-seed 10000001 \
+  --noise-scales 0 1 2 --enforce-gates \
+  --out runs/belief_ppo_v4/eval.json
+```
+
+The evaluator disables privileged true-goal termination for belief modes, then
+ends only on model-declared arrival, collision, or timeout. Layouts and noise
+draws are paired across oracle-pose, command dead-reckoning, learned belief,
+shuffled-lidar, and zeroed-lidar modes. The gate requires at 1×: at least 85%
+correct declared arrivals, at most 5% false arrivals, at most 10% collisions,
+mean/p95 final belief error at most 5/12.5 cm, drift at most 2 cm/m, and lower
+final error than dead reckoning at 0×/1×/2×.
+
+The current best actor is
+`runs/belief_ppo_biasfix_v14/iter_1130.pt`.  It reaches 85.2% pose-fed success,
+8.6% collision, and 0.788 SPL on 128 held-out layouts.  The full paired result
+is `runs/belief_ppo_biasfix_v14/eval_full_128.json`: learned belief beats command
+dead reckoning at all three noise tiers, but the gate is still **false**.  At
+1× it has 75.8% navigation success, 72.7% correct declared arrival, 7.8% false
+arrival, 10.2% collision, 11.5/29.0 cm mean/p95 final error, and 2.94 cm/m drift.
+The actor is now adequate; recurrent localization on belief-policy trajectories
+is the binding constraint.  Treat every checkpoint as a development artifact
+until a full held-out evaluation writes `"passed": true`.
+
+Collect that distribution with the complete recurrent driver, not the
+pose-fed `--driver-checkpoint` compatibility path:
+
+```bash
+~/isaac-venv/bin/python scripts/collect_bc.py \
+  --num_envs 4096 --episodes 16384 \
+  --num_layouts 4096 --starts_per_layout 32 --seed 1501 \
+  --out data/belief_onpolicy_v15 --shard_steps 200000 \
+  --validation_fraction 0.05 --writer_queue 2 \
+  --belief-driver-checkpoint runs/belief_ppo_biasfix_v14/iter_1130.pt
+```
+
+The completed v15 corpus has 3.61M samples. One full-episode epoch at a constant
+3e-5 LR preserved lidar causality but changed held-out mean error only from
+9.49 to 9.46 cm. Do not repeat that branch with more epochs: the four-frame
+correction head, rather than the state distribution alone, is now the likely
+limitation.
+
+No external hardware pose reference is currently available. Robot trials can
+verify timestamps, coordinate signs, reset behavior, stationary drift, and
+qualitative navigation, but simulator acceptance must not be described as a
+measured sim-to-real result.
+
+---
+
+# Phase 5 — Export and deploy
 
 *(Not yet built. ExecuTorch export, INT8 calibration, C++ node, and the
 preprocessing parity test.)*
@@ -442,9 +607,10 @@ sim2edge/        simulator-free core: spec, grids, rooms, oracle,
                  preprocess, noise, dataset
 isaaclab_env/    Isaac Lab adapter -- owns no task definition
 scripts/         collect_bc.py, verify_shard.py, train_bc.py,
-                 eval_bc.py, train_ppo.py
+                 eval_bc.py, train_ppo.py, train_belief.py,
+                 train_belief_ppo.py, eval_belief.py
 tools/           convert_tb4.py
-tests/           175 tests, no GPU or simulator required
+tests/           245 passing tests, no GPU or simulator required
 docs/daily/      engineering log
 assets/, data/   generated; not in git
 ```

@@ -82,9 +82,11 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ..preprocess import build_observation, relative_goal_features
-from ..spec import DT, GOAL_MAX_M, HISTORY_FRAMES, LIDAR_BINS, V_MAX
+from ..spec import (DT, GOAL_MAX_M, GOAL_TOLERANCE_M, HISTORY_FRAMES,
+                    LIDAR_BINS, LIDAR_MAX_M, MOTION_HISTORY_FRAMES, V_MAX)
 from .nav_policy import NavPolicy, NavPolicyConfig, initialize_layer
 
 __all__ = ["BeliefNavPolicy", "BeliefNavPolicyConfig", "OdometryHead",
@@ -125,6 +127,8 @@ class BeliefNavPolicyConfig:
     odometry_channels: tuple[int, ...] = (32, 64)
     odometry_features: int = 96
     odometry_trunk: tuple[int, ...] = (128,)
+    raw_lidar_bins: int = 720
+    motion_history_frames: int = MOTION_HISTORY_FRAMES
     #: Ceiling on the learned forward correction, as a multiple of the distance
     #: a full-speed tick covers. Slip removes speed far more often than it adds
     #: it, but the bound is symmetric because a systematically low commanded
@@ -133,6 +137,24 @@ class BeliefNavPolicyConfig:
     #: Lateral scale, relative to the forward one. Differential drive cannot
     #: translate sideways; this is the wheel-slip residual only.
     lateral_correction_ratio: float = 0.15
+    arrival_sigma: float = 1.96
+    #: Belief-space stop radius. Deliberately tighter than the simulator's
+    #: 0.25 m truth tolerance so localization error has a safety margin rather
+    #: than turning every optimistic estimate into a false arrival.
+    arrival_radius_m: float = 0.15
+    arrival_confirm_ticks: int = 3
+    arrival_speed_m_s: float = 0.08
+    #: Carry a bounded forward wheel-scale correction across the episode. Old
+    #: checkpoints leave this false and retain their exact stateless behavior;
+    #: new estimator runs opt in after training through the recurrence.
+    persistent_calibration: bool = False
+    calibration_update_rate: float = 0.2
+    calibration_min: float = -0.5
+    calibration_max: float = 0.25
+    #: Optional learned episode memory for motion calibration. Zero preserves
+    #: the compact legacy/scalar state; positive values create a GRU whose
+    #: explicit hidden state is carried by the runtime alongside the belief.
+    motion_state_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -150,93 +172,214 @@ class BeliefNavPolicyConfig:
 
 
 class OdometryHead(nn.Module):
-    """Lidar history + gyro + previous commands -> a translation correction.
+    """Learn a bounded correction to command dead reckoning.
 
-    Its own convolutional stack rather than a branch off the actor's. The two
-    are asked different questions of the same scan -- the actor wants "where is
-    there space", the head wants "how did this scan move since the last one" --
-    and sharing a trunk between them made the actor's features drift toward
-    whichever objective had the larger gradient.
-
-    The head reads the *binned* 180-bin scans, not the raw 720-beam ones. One
-    tick of motion at full speed is 2.3 cm, which is barely above the 2 cm range
-    noise on a single beam, so this is never a per-beam measurement: it is an
-    aggregate over ~180 bins, where the noise falls by roughly sqrt(180) and the
-    two-degree bin width stops being the limiting term. If measured drift turns
-    out too high, raising this head's angular resolution is the first knob to
-    reach for -- it is deliberately the cheapest thing to change.
+    Equal-bearing range differences are not a valid scan matcher under
+    translation: depth discontinuities and newly occluded surfaces dominated
+    the sub-millimetre slip signal by two orders of magnitude. Rather than bake
+    that biased geometric estimate into the model, this head encodes the full
+    deskewed metric history and learns the residual directly under privileged
+    pose supervision. Commands and gyro provide the strong motion prior; lidar
+    supplies independent scene motion evidence. A learned confidence gate keeps
+    zero correction -- exact command dead reckoning -- as the fallback.
     """
 
     def __init__(self, config: BeliefNavPolicyConfig):
         super().__init__()
         self.config = config
-        frames = config.actor.history_frames
-        bins = config.actor.lidar_bins
-
-        conv: list[nn.Module] = []
-        # Consecutive frames enter as channels, so the very first convolution
-        # can difference them -- which is the entire signal this head lives on.
-        channels, length = frames, bins
-        for index, output_channels in enumerate(config.odometry_channels):
-            kernel = 5 if index == 0 else 3
-            padding = kernel // 2
-            conv.extend((
-                nn.Conv1d(channels, output_channels, kernel, stride=2,
-                          padding=padding),
-                nn.ReLU(),
-            ))
-            channels = output_channels
-            length = (length + 2 * padding - kernel) // 2 + 1
-        self.conv = nn.Sequential(*conv)
-        self.projection = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(channels * length, config.odometry_features),
+        frames = config.motion_history_frames
+        first, last = config.odometry_channels
+        self.conv = nn.Sequential(
+            nn.Conv1d(3 * frames, first, 7, stride=2, padding=3,
+                      padding_mode="circular"),
+            nn.ReLU(),
+            nn.Conv1d(first, last, 5, stride=2, padding=2,
+                      padding_mode="circular"),
             nn.ReLU(),
         )
-        # Gyro increments and previous commands are what tell the head how much
-        # of the observed change is rotation it should already have accounted
-        # for, and how much translation to expect before it looks.
+        # Preserve coarse bearing sectors. Global averaging made forward and
+        # lateral scan motion indistinguishable; 24 sectors retain orientation
+        # while keeping the dense projection small.
+        self.scan_projection = nn.Sequential(
+            nn.AdaptiveAvgPool1d(24), nn.Flatten(),
+            nn.Linear(last * 24, config.odometry_features), nn.ReLU(),
+        )
         self.motion_encoder = nn.Sequential(
             nn.Linear(3 * frames, 64), nn.ReLU(),
         )
-        trunk: list[nn.Module] = []
         width = config.odometry_features + 64
+        trunk: list[nn.Module] = []
         for output_width in config.odometry_trunk:
             trunk.extend((nn.Linear(width, output_width), nn.ReLU()))
             width = output_width
         self.trunk = nn.Sequential(*trunk)
-        self.head = nn.Linear(width, 2)
-
+        self.proposal_head = nn.Linear(width, 2)
+        self.confidence_head = nn.Sequential(nn.Linear(width + 1, 32), nn.ReLU(),
+                                             nn.Linear(32, 1))
+        self.variance_head = nn.Linear(width, 2)
+        if config.motion_state_size > 0:
+            # Encoded scan/motion, normalized proposal x/y, and confidence.
+            recurrent_inputs = width + 3
+            self.motion_memory = nn.GRUCell(
+                recurrent_inputs, config.motion_state_size)
+            # Bias-free is a structural fallback guarantee: a zero state can
+            # never create motion in the absence of scan evidence.
+            self.motion_scale_head = nn.Linear(
+                config.motion_state_size, 1, bias=False)
         self.apply(initialize_layer)
-        # Start a hair away from the dead-reckoning baseline, not exactly on it.
-        #
-        # Exactly zero is the tempting choice and it is wrong: with a zero final
-        # weight the gradient reaching the trunk is ``W.T @ grad`` = 0, so the
-        # convolutional stack gets no gradient at all on the first optimizer
-        # step and only unsticks once the head has drifted off zero by itself.
-        # A uniform 1e-3 leaves the initial correction at ~1e-4 m against a
-        # 2.3 cm commanded tick -- indistinguishable from dead reckoning -- while
-        # keeping the whole head differentiable from step one. Same reasoning,
-        # and the same constant, as ``NavPolicy.action_head``.
-        nn.init.uniform_(self.head.weight, -1.0e-3, 1.0e-3)
-        nn.init.zeros_(self.head.bias)
+        nn.init.uniform_(self.proposal_head.weight, -1.0e-3, 1.0e-3)
+        nn.init.zeros_(self.proposal_head.bias)
+        # Begin close to command dead reckoning without starving the residual
+        # branch of gradient as the old -6 gate did.
+        nn.init.zeros_(self.confidence_head[-1].weight)
+        nn.init.constant_(self.confidence_head[-1].bias, -2.0)
+        nn.init.zeros_(self.variance_head.weight)
+        nn.init.constant_(self.variance_head.bias, -12.0)
+        if config.motion_state_size > 0:
+            # Enabling memory starts from the verified stateless estimator.
+            # Training can add a recurrent residual without an initialization
+            # jump in the deployed translation.
+            nn.init.zeros_(self.motion_scale_head.weight)
+
+    @property
+    def head(self) -> nn.Linear:
+        """Compatibility handle for dead-reckoning ablations."""
+        return self.confidence_head[-1]
+
+    @staticmethod
+    def _rotate_scan(scan: torch.Tensor, valid: torch.Tensor,
+                     delta_yaw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a previous circular scan at bearings in the current frame."""
+        n, beams = scan.shape
+        base = torch.arange(beams, device=scan.device, dtype=scan.dtype)[None]
+        position = base + delta_yaw[:, None] * (beams / (2.0 * torch.pi))
+        low_float = torch.floor(position)
+        fraction = position - low_float
+        low = low_float.long().remainder(beams)
+        high = (low + 1).remainder(beams)
+        lo = torch.gather(scan, 1, low)
+        hi = torch.gather(scan, 1, high)
+        rotated = lo + fraction * (hi - lo)
+        usable = torch.gather(valid, 1, low) & torch.gather(valid, 1, high)
+        return rotated, usable
+
+    def _raw_inputs(self, lidar: torch.Tensor,
+                    raw_lidar: torch.Tensor | None,
+                    raw_valid: torch.Tensor | None
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if raw_lidar is None:
+            # Compatibility path for old callers and checkpoints: reconstruct a
+            # metric scan from the actor bins. New training always supplies raw.
+            metric = lidar * LIDAR_MAX_M
+            metric = F.interpolate(metric, size=self.config.raw_lidar_bins,
+                                   mode="linear", align_corners=False)
+            return metric, torch.ones_like(metric, dtype=torch.bool)
+        if raw_lidar.shape[-1] != self.config.raw_lidar_bins:
+            raise ValueError(
+                f"expected {self.config.raw_lidar_bins} raw lidar bins, got "
+                f"{raw_lidar.shape[-1]}")
+        valid = (torch.isfinite(raw_lidar) if raw_valid is None
+                 else raw_valid.to(torch.bool))
+        metric = torch.where(valid, raw_lidar,
+                             torch.full_like(raw_lidar, LIDAR_MAX_M))
+        return metric, valid
+
+    def _features(self, lidar: torch.Tensor, gyro: torch.Tensor,
+                  previous_action: torch.Tensor,
+                  raw_lidar: torch.Tensor | None,
+                  raw_valid: torch.Tensor | None
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode one sensor window and return hidden features plus overlap."""
+        metric, valid = self._raw_inputs(lidar, raw_lidar, raw_valid)
+        frames = self.config.motion_history_frames
+        if metric.shape[1] < frames:
+            pad = frames - metric.shape[1]
+            metric = torch.cat([metric[:, :1].expand(-1, pad, -1), metric], 1)
+            valid = torch.cat([valid[:, :1].expand(-1, pad, -1), valid], 1)
+        if gyro.shape[1] < frames:
+            gyro = F.pad(gyro, (frames - gyro.shape[1], 0))
+        if previous_action.shape[1] < frames:
+            pad = frames - previous_action.shape[1]
+            previous_action = torch.cat([
+                previous_action[:, :1].expand(-1, pad, -1), previous_action
+            ], 1)
+        normalized = metric / LIDAR_MAX_M
+        newest = normalized[:, -1:]
+        encoded = self.conv(torch.cat(
+            [normalized, newest - normalized, valid.float()], dim=1))
+        scan_features = self.scan_projection(encoded)
+        motion = torch.cat((gyro, previous_action.flatten(1)), dim=1)
+        hidden = self.trunk(torch.cat(
+            (scan_features, self.motion_encoder(motion)), dim=1))
+        overlap = (valid[:, -2] & valid[:, -1]).float().mean(1, keepdim=True)
+        return hidden, overlap
+
+    def _outputs(self, hidden: torch.Tensor, overlap: torch.Tensor
+                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode proposal, uncertainty and observability-gated confidence."""
+
+        raw = torch.tanh(self.proposal_head(hidden))
+        limit = self.config.forward_correction_scale * V_MAX * DT
+        proposal = torch.stack([
+            limit * raw[:, 0],
+            limit * self.config.lateral_correction_ratio * raw[:, 1],
+        ], dim=1)
+        confidence = torch.sigmoid(self.confidence_head(torch.cat(
+            [hidden, overlap], dim=1)))
+        # Observability is a hard constraint, not something training may learn
+        # around. With no overlapping returns the result is exactly the command
+        # prior even if a confidence bias later drifts upward.
+        confidence = confidence * (overlap / 0.5).clamp(0.0, 1.0)
+        variance = (F.softplus(self.variance_head(hidden)) + 1.0e-7).clamp(
+            1.0e-7, 0.05 ** 2)
+        return proposal, variance, confidence.squeeze(1)
 
     def forward(self, lidar: torch.Tensor, gyro: torch.Tensor,
-                previous_action: torch.Tensor) -> torch.Tensor:
-        """``(N, 2)`` body-frame translation correction in metres.
+                previous_action: torch.Tensor,
+                raw_lidar: torch.Tensor | None = None,
+                raw_valid: torch.Tensor | None = None,
+                *, return_uncertainty: bool = False,
+                return_proposal: bool = False):
+        """Return scan correction, optionally with diagonal motion variance.
 
         ``lidar`` is ``(N, H, B)``, ``gyro`` is ``(N, H)`` radians turned per
         tick, ``previous_action`` is ``(N, H, 2)`` normalized commands.
         """
-        motion = torch.cat((gyro, previous_action.flatten(1)), dim=1)
-        fused = torch.cat((self.projection(self.conv(lidar)),
-                           self.motion_encoder(motion)), dim=1)
-        raw = torch.tanh(self.head(self.trunk(fused)))
+        hidden, overlap = self._features(
+            lidar, gyro, previous_action, raw_lidar, raw_valid)
+        proposal, variance, confidence = self._outputs(hidden, overlap)
+        correction = confidence[:, None] * proposal
+        if return_uncertainty:
+            motion = proposal if return_proposal else correction
+            return motion, variance, confidence
+        return correction
+
+    def forward_memory(
+            self, state: torch.Tensor, lidar: torch.Tensor,
+            gyro: torch.Tensor, previous_action: torch.Tensor,
+            raw_lidar: torch.Tensor | None = None,
+            raw_valid: torch.Tensor | None = None,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                       torch.Tensor, torch.Tensor]:
+        """Return a recurrent forward-scale residual and next explicit state."""
+        if self.config.motion_state_size <= 0:
+            raise ValueError("motion memory is disabled in this checkpoint")
+        hidden, overlap = self._features(
+            lidar, gyro, previous_action, raw_lidar, raw_valid)
+        proposal, variance, confidence = self._outputs(hidden, overlap)
         limit = self.config.forward_correction_scale * V_MAX * DT
-        return torch.stack([
-            limit * raw[:, 0],
-            limit * self.config.lateral_correction_ratio * raw[:, 1],
-        ], dim=1)
+        normalized_proposal = proposal / torch.tensor(
+            [limit, limit * self.config.lateral_correction_ratio],
+            device=proposal.device, dtype=proposal.dtype)
+        memory_input = torch.cat(
+            [hidden, normalized_proposal, confidence[:, None]], dim=1)
+        proposed_state = self.motion_memory(memory_input, state)
+        evidence = (confidence / 0.1).clamp(0.0, 1.0)[:, None]
+        state = state + evidence * (proposed_state - state)
+        recurrent_scale = 0.25 * torch.tanh(
+            self.motion_scale_head(state).squeeze(1))
+        correction = confidence[:, None] * proposal
+        return correction, variance, confidence, state, recurrent_scale
 
 
 class BeliefNavPolicy(nn.Module):
@@ -263,7 +406,9 @@ class BeliefNavPolicy(nn.Module):
     # ── belief ───────────────────────────────────────────────────────────────
 
     def translation(self, lidar: torch.Tensor, gyro: torch.Tensor,
-                    previous_action: torch.Tensor) -> torch.Tensor:
+                    previous_action: torch.Tensor,
+                    raw_lidar: torch.Tensor | None = None,
+                    raw_valid: torch.Tensor | None = None) -> torch.Tensor:
         """Commanded displacement plus the learned correction, ``(N, 2)`` metres.
 
         The commanded speed is read from the newest previous-action frame rather
@@ -276,11 +421,77 @@ class BeliefNavPolicy(nn.Module):
         commanded_v = previous_action[:, -1, 0] * V_MAX
         dead_reckoned = torch.stack(
             [commanded_v * DT, torch.zeros_like(commanded_v)], dim=1)
-        return dead_reckoned + self.odometry(lidar, gyro, previous_action)
+        return dead_reckoned + self.odometry(
+            lidar, gyro, previous_action, raw_lidar, raw_valid)
+
+    def motion_estimate(self, lidar: torch.Tensor, gyro: torch.Tensor,
+                        previous_action: torch.Tensor,
+                        raw_lidar: torch.Tensor | None = None,
+                        raw_valid: torch.Tensor | None = None
+                        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Translation, diagonal process variance and scan confidence."""
+        commanded_v = previous_action[:, -1, 0] * V_MAX
+        dead_reckoned = torch.stack(
+            [commanded_v * DT, torch.zeros_like(commanded_v)], dim=1)
+        correction, variance, confidence = self.odometry(
+            lidar, gyro, previous_action, raw_lidar, raw_valid,
+            return_uncertainty=True)
+        return dead_reckoned + correction, variance, confidence
+
+    def calibrated_motion_estimate(
+            self, calibration: torch.Tensor, lidar: torch.Tensor,
+            gyro: torch.Tensor, previous_action: torch.Tensor,
+            raw_lidar: torch.Tensor | None = None,
+            raw_valid: torch.Tensor | None = None,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Estimate motion and update the episode's forward scale state.
+
+        The lidar head proposes a bounded correction at full speed. Its
+        confidence-gated forward component is interpreted as a wheel-scale
+        measurement and exponentially filtered across the episode. This lets
+        persistent tyre/floor calibration survive beyond the four scan frames
+        visible to the head, while zero evidence remains exact command dead
+        reckoning.
+        """
+        if not self.config.persistent_calibration:
+            if self.config.motion_state_size > 0:
+                (correction, variance, confidence, calibration,
+                 recurrent_scale) = self.odometry.forward_memory(
+                    calibration, lidar, gyro, previous_action,
+                    raw_lidar, raw_valid)
+                commanded_v = previous_action[:, -1, 0] * V_MAX
+                instant_scale = correction[:, 0] / (V_MAX * DT)
+                scale = (instant_scale + recurrent_scale).clamp(
+                    self.config.calibration_min,
+                    self.config.calibration_max)
+                translation = torch.stack([
+                    commanded_v * DT * (1.0 + scale), correction[:, 1]
+                ], dim=1)
+                return translation, variance, confidence, calibration
+            translation, variance, confidence = self.motion_estimate(
+                lidar, gyro, previous_action, raw_lidar, raw_valid)
+            return translation, variance, confidence, calibration
+
+        proposal, variance, confidence = self.odometry(
+            lidar, gyro, previous_action, raw_lidar, raw_valid,
+            return_uncertainty=True, return_proposal=True)
+        gated = confidence[:, None] * proposal
+        candidate = gated[:, 0] / (V_MAX * DT)
+        commanded_v = previous_action[:, -1, 0] * V_MAX
+        moving = (commanded_v.abs() / (0.2 * V_MAX)).clamp(0.0, 1.0)
+        alpha = self.config.calibration_update_rate * moving
+        calibration = (calibration + alpha * (candidate - calibration)).clamp(
+            self.config.calibration_min, self.config.calibration_max)
+        translation = torch.stack([
+            commanded_v * DT * (1.0 + calibration), gated[:, 1]
+        ], dim=1)
+        return translation, variance, confidence, calibration
 
     def update_belief(self, belief: torch.Tensor, lidar: torch.Tensor,
                       gyro: torch.Tensor,
-                      previous_action: torch.Tensor) -> torch.Tensor:
+                      previous_action: torch.Tensor,
+                      raw_lidar: torch.Tensor | None = None,
+                      raw_valid: torch.Tensor | None = None) -> torch.Tensor:
         """Advance the goal belief across the tick that has just elapsed.
 
         **Everything here looks backward, and that is the point.** The gyro
@@ -295,8 +506,29 @@ class BeliefNavPolicy(nn.Module):
         Rotation is the gyro's, unmodified, for the reason given in the module
         docstring. Nothing here reads a pose.
         """
-        step = self.translation(lidar, gyro, previous_action)
+        step = self.translation(lidar, gyro, previous_action,
+                                raw_lidar, raw_valid)
         return compose_belief(belief, step, gyro[:, -1])
+
+    @staticmethod
+    def _propagate_covariance(covariance: torch.Tensor,
+                              motion_variance: torch.Tensor,
+                              delta_yaw: torch.Tensor) -> torch.Tensor:
+        """Rotate a 2-D covariance and add translation process variance."""
+        cos, sin = torch.cos(delta_yaw), torch.sin(delta_yaw)
+        rotation = torch.stack([
+            torch.stack([cos, sin], dim=1),
+            torch.stack([-sin, cos], dim=1),
+        ], dim=1)
+        process = torch.diag_embed(motion_variance)
+        return rotation @ covariance @ rotation.transpose(1, 2) + process
+
+    @staticmethod
+    def _largest_covariance_eigenvalue(covariance: torch.Tensor) -> torch.Tensor:
+        """Closed-form largest eigenvalue of a symmetric 2x2 matrix."""
+        a, d = covariance[:, 0, 0], covariance[:, 1, 1]
+        b = 0.5 * (covariance[:, 0, 1] + covariance[:, 1, 0])
+        return 0.5 * (a + d + torch.sqrt((a - d).square() + 4.0 * b.square()))
 
     # ── acting ───────────────────────────────────────────────────────────────
 
@@ -309,7 +541,7 @@ class BeliefNavPolicy(nn.Module):
         which is exactly what makes the pretrained weights transfer.
         """
         return build_observation(lidar, relative_goal_features(belief),
-                                 previous_action)
+                                 previous_action[:, -self.config.actor.history_frames:])
 
     def step(self, belief: torch.Tensor, lidar: torch.Tensor,
              gyro: torch.Tensor, previous_action: torch.Tensor
@@ -329,9 +561,69 @@ class BeliefNavPolicy(nn.Module):
         action = self.actor(self.observation(lidar, belief, previous_action))
         return action, belief
 
+    def step_sensors(self, belief: torch.Tensor, lidar: torch.Tensor,
+                     raw_lidar: torch.Tensor, raw_valid: torch.Tensor,
+                     gyro: torch.Tensor, previous_action: torch.Tensor
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One tick using the high-resolution scan-motion input."""
+        belief = self.update_belief(belief, lidar, gyro, previous_action,
+                                    raw_lidar, raw_valid)
+        action = self.actor(self.observation(lidar, belief, previous_action))
+        return action, belief
+
+    def step_state(self, belief: torch.Tensor, covariance: torch.Tensor,
+                   arrival_count: torch.Tensor, lidar: torch.Tensor,
+                   raw_lidar: torch.Tensor, raw_valid: torch.Tensor,
+                   gyro: torch.Tensor, previous_action: torch.Tensor,
+                   calibration: torch.Tensor | None = None):
+        """Deployable recurrent step with uncertainty-aware arrival.
+
+        Returns ``(command, arrived, belief, covariance, arrival_count,
+        scan_confidence)``. All state is explicit; no pose or wheel odometry is
+        accepted by this interface.
+        """
+        if calibration is None:
+            if (self.config.persistent_calibration
+                    or self.config.motion_state_size > 0):
+                raise ValueError(
+                    "recurrent motion checkpoint requires carried state")
+            translation, variance, confidence = self.motion_estimate(
+                lidar, gyro, previous_action, raw_lidar, raw_valid)
+        else:
+            translation, variance, confidence, calibration = (
+                self.calibrated_motion_estimate(
+                    calibration, lidar, gyro, previous_action,
+                    raw_lidar, raw_valid))
+        delta_yaw = gyro[:, -1]
+        belief = compose_belief(belief, translation, delta_yaw)
+        covariance = self._propagate_covariance(
+            covariance, variance, delta_yaw)
+        command = self.actor(self.observation(lidar, belief, previous_action))
+
+        largest_variance = self._largest_covariance_eigenvalue(covariance)
+        upper_bound = (torch.linalg.vector_norm(belief, dim=1)
+                       + self.config.arrival_sigma
+                       * torch.sqrt(largest_variance.clamp_min(0.0)))
+        # Arrival must be able to stop a moving actor. Requiring the actor to
+        # slow down first creates a circular dependency: the inherited actor
+        # has no stop output, so it drives through a correct goal belief and
+        # the gate never fires. The uncertainty bound plus consecutive-tick
+        # confirmation are the false-positive safeguards; once they agree,
+        # stopping is the safe action regardless of current commanded speed.
+        candidate = upper_bound <= self.config.arrival_radius_m
+        arrival_count = torch.where(candidate, arrival_count + 1,
+                                    torch.zeros_like(arrival_count))
+        arrived = arrival_count >= self.config.arrival_confirm_ticks
+        command = torch.where(arrived[:, None], torch.zeros_like(command), command)
+        result = (command, arrived, belief, covariance, arrival_count,
+                  confidence)
+        return result if calibration is None else result + (calibration,)
+
     def rollout(self, lidar: torch.Tensor, gyro: torch.Tensor,
-                previous_action: torch.Tensor, belief0: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                previous_action: torch.Tensor, belief0: torch.Tensor,
+                raw_lidar: torch.Tensor | None = None,
+                raw_valid: torch.Tensor | None = None, *,
+                return_motion: bool = False):
         """Run a sequence through the recurrence. Gradients flow the whole way.
 
         Inputs are time-major: ``lidar`` ``(T, N, H, B)``, ``gyro`` ``(T, N, H)``,
@@ -347,15 +639,56 @@ class BeliefNavPolicy(nn.Module):
         """
         steps = lidar.shape[0]
         belief = belief0
+        calibration = self.initial_calibration(belief0)
         actions, beliefs = [], []
+        translations, variances, confidences = [], [], []
         for t in range(steps):
             if t > 0:
-                belief = self.update_belief(belief, lidar[t], gyro[t],
-                                            previous_action[t])
+                translation, variance, confidence, calibration = (
+                    self.calibrated_motion_estimate(
+                        calibration, lidar[t], gyro[t], previous_action[t],
+                        None if raw_lidar is None else raw_lidar[t],
+                        None if raw_valid is None else raw_valid[t]))
+                belief = compose_belief(belief, translation, gyro[t, :, -1])
+            else:
+                translation = belief.new_zeros(belief.shape)
+                variance = belief.new_zeros(belief.shape)
+                confidence = belief.new_zeros(belief.shape[0])
             beliefs.append(belief)
+            translations.append(translation)
+            variances.append(variance)
+            confidences.append(confidence)
             actions.append(self.actor(
                 self.observation(lidar[t], belief, previous_action[t])))
-        return torch.stack(actions), torch.stack(beliefs)
+        result = (torch.stack(actions), torch.stack(beliefs))
+        if return_motion:
+            return result + (torch.stack(translations),
+                             torch.stack(variances),
+                             torch.stack(confidences))
+        return result
+
+    def motion_rollout(self, lidar: torch.Tensor, gyro: torch.Tensor,
+                       previous_action: torch.Tensor,
+                       raw_lidar: torch.Tensor, raw_valid: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run only the motion recurrence, for causal counterfactual training."""
+        state = self.initial_calibration(lidar.new_zeros(lidar.shape[1], 2))
+        translations, variances, confidences = [], [], []
+        for t in range(lidar.shape[0]):
+            if t == 0:
+                translation = lidar.new_zeros(lidar.shape[1], 2)
+                variance = lidar.new_zeros(lidar.shape[1], 2)
+                confidence = lidar.new_zeros(lidar.shape[1])
+            else:
+                translation, variance, confidence, state = (
+                    self.calibrated_motion_estimate(
+                        state, lidar[t], gyro[t], previous_action[t],
+                        raw_lidar[t], raw_valid[t]))
+            translations.append(translation)
+            variances.append(variance)
+            confidences.append(confidence)
+        return (torch.stack(translations), torch.stack(variances),
+                torch.stack(confidences))
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
@@ -388,12 +721,50 @@ class BeliefNavPolicy(nn.Module):
         excess = (distance / GOAL_MAX_M).clamp_min(1.0)
         return goal_body / excess
 
+    def initial_state(self, goal_body: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Initialize explicit deployment state at an episode reset."""
+        belief = self.initial_belief(goal_body)
+        covariance = torch.eye(2, device=goal_body.device,
+                               dtype=goal_body.dtype)[None].repeat(
+                                   goal_body.shape[0], 1, 1) * 1.0e-8
+        count = torch.zeros(goal_body.shape[0], dtype=torch.long,
+                            device=goal_body.device)
+        return belief, covariance, count
+
+    def initial_calibration(self, goal_body: torch.Tensor) -> torch.Tensor:
+        """Zero scale correction is exact command dead reckoning at reset."""
+        if self.config.motion_state_size > 0:
+            return torch.zeros(goal_body.shape[0],
+                               self.config.motion_state_size,
+                               device=goal_body.device, dtype=goal_body.dtype)
+        return torch.zeros(goal_body.shape[0], device=goal_body.device,
+                           dtype=goal_body.dtype)
+
     def example_inputs(self, batch_size: int = 1, device=None):
         """The exact argument tuple :meth:`step` takes, for export tracing."""
         cfg = self.config.actor
         return (
             torch.zeros(batch_size, 2, device=device),
             torch.zeros(batch_size, cfg.history_frames, cfg.lidar_bins,
+                        device=device),
+            torch.zeros(batch_size, cfg.history_frames, device=device),
+            torch.zeros(batch_size, cfg.history_frames, 2, device=device),
+        )
+
+    def sensor_example_inputs(self, batch_size: int = 1, device=None):
+        """Exact argument tuple for tracing :meth:`step_state`."""
+        cfg = self.config.actor
+        goal = torch.zeros(batch_size, 2, device=device)
+        belief, covariance, count = self.initial_state(goal)
+        return (
+            belief, covariance, count,
+            torch.zeros(batch_size, cfg.history_frames, cfg.lidar_bins,
+                        device=device),
+            torch.full((batch_size, cfg.history_frames,
+                        self.config.raw_lidar_bins), LIDAR_MAX_M, device=device),
+            torch.zeros(batch_size, cfg.history_frames,
+                        self.config.raw_lidar_bins, dtype=torch.bool,
                         device=device),
             torch.zeros(batch_size, cfg.history_frames, device=device),
             torch.zeros(batch_size, cfg.history_frames, 2, device=device),

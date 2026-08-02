@@ -15,7 +15,9 @@ import torch
 from sim2edge.models import (BeliefNavPolicy, BeliefNavPolicyConfig, NavPolicy,
                              NavPolicyConfig, compose_belief)
 from sim2edge.preprocess import goal_features, relative_goal_features
-from sim2edge.spec import DT, GOAL_MAX_M, V_MAX
+from sim2edge.spec import (DT, GOAL_MAX_M, LIDAR_MAX_M, V_MAX, fingerprint,
+                           observation_fingerprint)
+from sim2edge.training import load_policy_checkpoint
 
 
 def _body_frame(pose: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
@@ -159,6 +161,115 @@ def test_initial_belief_clamps_to_the_trained_range():
     assert float(far[1].norm()) == pytest.approx(3.0, abs=1e-4)
 
 
+def test_persistent_calibration_filters_forward_scale_measurements():
+    config = BeliefNavPolicyConfig(
+        persistent_calibration=True, calibration_update_rate=0.2)
+    policy = BeliefNavPolicy(config).eval()
+    with torch.no_grad():
+        policy.odometry.proposal_head.weight.zero_()
+        policy.odometry.proposal_head.bias[:] = torch.tensor([
+            torch.atanh(torch.tensor(0.2)), 0.0])
+        policy.odometry.confidence_head[-1].weight.zero_()
+        policy.odometry.confidence_head[-1].bias.fill_(20.0)
+
+    lidar = torch.zeros(1, 4, 180)
+    gyro = torch.zeros(1, 4)
+    previous = torch.zeros(1, 4, 2)
+    previous[:, :, 0] = 1.0
+    raw = torch.ones(1, 4, 720)
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    calibration = policy.initial_calibration(torch.zeros(1, 2))
+
+    first, _, confidence, calibration = policy.calibrated_motion_estimate(
+        calibration, lidar, gyro, previous, raw, valid)
+    assert float(confidence.detach()) == pytest.approx(1.0, abs=1e-5)
+    assert float(calibration.detach()) == pytest.approx(0.02, abs=1e-5)
+    assert float(first[0, 0].detach()) == pytest.approx(
+        V_MAX * DT * 1.02, abs=1e-6)
+
+    second, _, _, calibration = policy.calibrated_motion_estimate(
+        calibration, lidar, gyro, previous, raw, valid)
+    assert float(calibration.detach()) == pytest.approx(0.036, abs=1e-5)
+    assert float(second[0, 0].detach()) == pytest.approx(
+        V_MAX * DT * 1.036, abs=1e-6)
+
+
+def test_persistent_calibration_requires_explicit_live_state():
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        persistent_calibration=True)).eval()
+    belief, covariance, count = policy.initial_state(torch.zeros(1, 2))
+    with pytest.raises(ValueError, match="requires carried state"):
+        policy.step_state(
+            belief, covariance, count, torch.zeros(1, 4, 180),
+            torch.zeros(1, 4, 720), torch.ones(1, 4, 720, dtype=torch.bool),
+            torch.zeros(1, 4), torch.zeros(1, 4, 2))
+
+
+def test_learned_motion_state_starts_from_verified_stateless_translation():
+    torch.manual_seed(19)
+    baseline = BeliefNavPolicy().eval()
+    recurrent = BeliefNavPolicy(BeliefNavPolicyConfig(
+        motion_state_size=16)).eval()
+    incompatible = recurrent.load_state_dict(baseline.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert all(key.startswith(("odometry.motion_memory.",
+                               "odometry.motion_scale_head."))
+               for key in incompatible.missing_keys)
+
+    lidar = torch.rand(3, 4, 180)
+    gyro = torch.randn(3, 4) * 0.01
+    previous = torch.rand(3, 4, 2) * 2.0 - 1.0
+    previous[:, -1, 0] = 1.0
+    raw = torch.rand(3, 4, 720) * LIDAR_MAX_M
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    expected = baseline.motion_estimate(
+        lidar, gyro, previous, raw, valid)[0]
+    state = recurrent.initial_calibration(torch.zeros(3, 2))
+    actual, _, _, next_state = recurrent.calibrated_motion_estimate(
+        state, lidar, gyro, previous, raw, valid)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    assert next_state.shape == (3, 16)
+    assert not torch.equal(next_state, state)
+
+
+def test_motion_rollout_backpropagates_into_learned_memory():
+    torch.manual_seed(20)
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(motion_state_size=8))
+    steps, envs = 5, 2
+    lidar = torch.rand(steps, envs, 4, 180)
+    gyro = torch.randn(steps, envs, 4) * 0.01
+    previous = torch.rand(steps, envs, 4, 2) * 2.0 - 1.0
+    raw = torch.rand(steps, envs, 4, 720) * LIDAR_MAX_M
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    translation, _, _ = policy.motion_rollout(
+        lidar, gyro, previous, raw, valid)
+    translation[1:, :, 0].sum().backward()
+    gradient = policy.odometry.motion_scale_head.weight.grad
+    assert gradient is not None
+    assert float(gradient.abs().sum()) > 0.0
+
+
+def test_learned_motion_memory_is_exact_dead_reckoning_without_returns():
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(motion_state_size=8)).eval()
+    lidar = torch.zeros(2, 4, 180)
+    gyro = torch.zeros(2, 4)
+    previous = torch.zeros(2, 4, 2)
+    previous[:, -1, 0] = torch.tensor([0.5, 1.0])
+    raw = torch.full((2, 4, 720), LIDAR_MAX_M)
+    valid = torch.zeros_like(raw, dtype=torch.bool)
+    state = policy.initial_calibration(torch.zeros(2, 2))
+    translation, _, confidence, next_state = (
+        policy.calibrated_motion_estimate(
+            state, lidar, gyro, previous, raw, valid))
+    expected = torch.stack([
+        previous[:, -1, 0] * V_MAX * DT,
+        torch.zeros(2),
+    ], dim=1)
+    torch.testing.assert_close(translation, expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(next_state, state, atol=0.0, rtol=0.0)
+    assert not confidence.any()
+
+
 def test_belief_policy_reads_no_pose_anywhere():
     """The point of the design, asserted against the signature.
 
@@ -169,3 +280,105 @@ def test_belief_policy_reads_no_pose_anywhere():
     import inspect
     parameters = set(inspect.signature(BeliefNavPolicy.step).parameters)
     assert parameters == {"self", "belief", "lidar", "gyro", "previous_action"}
+
+
+def test_belief_checkpoint_actor_loads_for_pose_driven_dagger(tmp_path):
+    """DAgger executes the actor on exact goal features while retaining labels."""
+    policy = BeliefNavPolicy().eval()
+    checkpoint = {
+        "algorithm": "belief-ppo",
+        "spec_fingerprint": fingerprint(),
+        "observation_fingerprint": observation_fingerprint(
+            policy.config.actor.history_frames, belief=True),
+        "model_config": policy.config.to_dict(),
+        "model": policy.state_dict(),
+    }
+    path = tmp_path / "belief.pt"
+    torch.save(checkpoint, path)
+    actor = load_policy_checkpoint(path)
+    observation = torch.randn(5, actor.config.observation_dim)
+    torch.testing.assert_close(actor(observation), policy.actor(observation))
+
+
+def test_scan_motion_solver_recovers_translation_in_a_circular_room():
+    """The estimator contains an actual scan-motion measurement."""
+    policy = BeliefNavPolicy().eval()
+    beams = policy.config.raw_lidar_bins
+    angle = ((torch.arange(beams) + 0.5) * (2 * math.pi / beams) - math.pi)
+    pose0 = torch.tensor([0.2, -0.3, 0.4])
+    distance, delta_yaw = 0.02, 0.03
+    pose1 = pose0.clone()
+    pose1[:2] += distance * torch.tensor([math.cos(0.4), math.sin(0.4)])
+    pose1[2] += delta_yaw
+
+    def scan(pose):
+        bearing = pose[2] + angle
+        b = pose[0] * torch.cos(bearing) + pose[1] * torch.sin(bearing)
+        c = pose[0].square() + pose[1].square() - 16.0
+        return -b + torch.sqrt(b.square() - c)
+
+    first, second = scan(pose0), scan(pose1)
+    raw = torch.stack([first, first, first, second])[None]
+    valid = torch.ones_like(raw, dtype=torch.bool)
+    lidar = torch.zeros(1, 4, 180)
+    gyro = torch.tensor([[0.0, 0.0, 0.0, delta_yaw]])
+    previous = torch.zeros(1, 4, 2)
+    previous[0, -1, 0] = distance / (V_MAX * DT)
+    with torch.no_grad():
+        policy.odometry.head.bias.fill_(10.0)
+        translation, _, confidence = policy.motion_estimate(
+            lidar, gyro, previous, raw, valid)
+    expected = torch.tensor([[distance, 0.0]])
+    torch.testing.assert_close(translation, expected, atol=2e-4, rtol=0.0)
+    assert float(confidence) > 0.99
+
+
+def test_invalid_scan_falls_back_to_command_dead_reckoning():
+    policy = BeliefNavPolicy().eval()
+    previous = torch.zeros(3, 4, 2)
+    previous[:, -1, 0] = 0.6
+    raw = torch.full((3, 4, 720), LIDAR_MAX_M)
+    valid = torch.zeros_like(raw, dtype=torch.bool)
+    with torch.no_grad():
+        translation, _, confidence = policy.motion_estimate(
+            torch.ones(3, 4, 180), torch.zeros(3, 4), previous, raw, valid)
+    expected = torch.full((3,), 0.6 * V_MAX * DT)
+    torch.testing.assert_close(translation[:, 0], expected, atol=1e-4, rtol=0.0)
+    assert float(translation[:, 1].abs().max()) < 1e-4
+    assert float(confidence.max()) < 0.01
+
+
+def test_uncertainty_aware_arrival_requires_three_quiet_ticks():
+    policy = BeliefNavPolicy().eval()
+    with torch.no_grad():
+        policy.actor.action_head.weight.zero_()
+        policy.actor.action_head.bias.copy_(torch.tensor([-10.0, 0.0]))
+    belief, covariance, count = policy.initial_state(torch.zeros(2, 2))
+    lidar = torch.ones(2, 4, 180)
+    raw = torch.full((2, 4, 720), LIDAR_MAX_M)
+    valid = torch.zeros_like(raw, dtype=torch.bool)
+    gyro = torch.zeros(2, 4)
+    previous = torch.zeros(2, 4, 2)
+    for tick in range(3):
+        _, arrived, belief, covariance, count, _ = policy.step_state(
+            belief, covariance, count, lidar, raw, valid, gyro, previous)
+        assert bool(arrived.all()) == (tick == 2)
+
+
+def test_arrival_stops_a_moving_actor_after_confirmation():
+    """A stop gate cannot require an actor with no stop state to stop first."""
+    policy = BeliefNavPolicy().eval()
+    with torch.no_grad():
+        policy.actor.action_head.weight.zero_()
+        policy.actor.action_head.bias.copy_(torch.tensor([10.0, 0.0]))
+    belief, covariance, count = policy.initial_state(torch.zeros(1, 2))
+    lidar = torch.ones(1, 4, 180)
+    raw = torch.full((1, 4, 720), LIDAR_MAX_M)
+    valid = torch.zeros_like(raw, dtype=torch.bool)
+    gyro = torch.zeros(1, 4)
+    previous = torch.zeros(1, 4, 2)
+    for _ in range(policy.config.arrival_confirm_ticks):
+        command, arrived, belief, covariance, count, _ = policy.step_state(
+            belief, covariance, count, lidar, raw, valid, gyro, previous)
+    assert bool(arrived)
+    torch.testing.assert_close(command, torch.zeros_like(command))

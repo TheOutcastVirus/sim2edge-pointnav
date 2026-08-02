@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.collect_bc import Collector
+from scripts.collect_bc import BeliefDriver, Collector
 from scripts.collect_bc import _assert_tracks, _measure_drive_response
 from sim2edge.spec import DT
 
@@ -147,6 +147,78 @@ def test_policy_driver_is_stamped_for_dagger_weighting(tmp_path):
     c.close(torch.zeros(3))
     with np.load(tmp_path / "bc_000.npz") as shard:
         assert str(shard["driver"]) == "policy"
+
+
+def test_belief_driver_initializes_only_reset_envs_and_carries_state():
+    from types import SimpleNamespace
+
+    class FakePolicy:
+        def initial_state(self, goal):
+            n = len(goal)
+            return (goal.clone(), torch.zeros(n, 2, 2),
+                    torch.zeros(n, dtype=torch.long))
+
+        @staticmethod
+        def observation(lidar, belief, previous_action):
+            return belief
+
+        @staticmethod
+        def actor(observation):
+            return observation
+
+        @staticmethod
+        def step_state(belief, covariance, count, lidar, raw, valid, gyro,
+                       previous_action):
+            next_belief = belief + 1.0
+            arrived = torch.ones(len(belief), dtype=torch.bool)
+            return (next_belief, arrived, next_belief, covariance,
+                    count + 1, torch.ones(len(belief)))
+
+    class FakeEnv:
+        num_envs = 2
+        device = "cpu"
+
+        def __init__(self):
+            self.pose = torch.tensor([[0.0, 0.0, 0.0],
+                                      [1.0, 1.0, 0.0]])
+            self._goal_w = torch.tensor([[2.0, 0.0], [1.0, 4.0]])
+            self.scene = SimpleNamespace(env_origins=torch.zeros(2, 3))
+            self._observation_history = SimpleNamespace(
+                lidar=torch.zeros(2, 4, 180))
+            self.actions = torch.zeros(2, 4, 2)
+            self.raw = torch.zeros(2, 4, 720)
+            self.valid = torch.ones(2, 4, 720, dtype=torch.bool)
+            self.gyro = torch.zeros(2, 4)
+
+        def _robot_pose(self):
+            return self.pose
+
+        def motion_action(self):
+            return self.actions
+
+        def motion_scan(self):
+            return self.raw, self.valid
+
+        def gyro_increment(self):
+            return self.gyro
+
+    env = FakeEnv()
+    driver = BeliefDriver(FakePolicy(), env, torch)
+
+    first, arrived = driver.action()
+    torch.testing.assert_close(first, torch.tensor([[2.0, 0.0], [0.0, 3.0]]))
+    assert not arrived.any()  # reset never double-integrates the opening tick
+
+    second, arrived = driver.action()
+    torch.testing.assert_close(second, torch.tensor([[3.0, 1.0], [1.0, 4.0]]))
+    assert arrived.all()
+
+    driver.reset(torch.tensor([True, False]))
+    env.pose[0] = torch.tensor([1.0, 0.0, 0.0])
+    env._goal_w[0] = torch.tensor([1.5, 0.0])
+    third, arrived = driver.action()
+    torch.testing.assert_close(third, torch.tensor([[0.5, 0.0], [2.0, 5.0]]))
+    assert not arrived[0] and arrived[1]
 
 
 def test_compression_runs_asynchronously(tmp_path, monkeypatch):
