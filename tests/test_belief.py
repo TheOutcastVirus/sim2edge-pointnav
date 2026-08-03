@@ -929,3 +929,114 @@ def test_carried_distance_widens_the_arrival_bound_with_travel():
     torch.testing.assert_close(result[-1] - travelled,
                                torch.full((2,), 0.5 * V_MAX * DT),
                                atol=1e-6, rtol=0.0)
+
+
+def test_step_state_return_arity_is_exactly_the_state_it_was_given():
+    """The evaluator unpacks this tuple positionally, so its length is a contract.
+
+    Six values always, then calibration if calibration went in, then travelled
+    if travelled did. Getting the order wrong assigns a distance to a
+    calibration state and drifts silently.
+    """
+    frames = BeliefNavPolicyConfig().motion_history_frames
+
+    def step(policy, **carried):
+        belief, covariance, count = policy.initial_state(torch.zeros(1, 2))
+        with torch.no_grad():
+            return policy.step_state(
+                belief, covariance, count, torch.zeros(1, 4, 180),
+                torch.full((1, frames, 720), LIDAR_MAX_M),
+                torch.zeros(1, frames, 720, dtype=torch.bool),
+                torch.zeros(1, frames), torch.zeros(1, frames, 2), **carried)
+
+    plain = BeliefNavPolicy().eval()
+    assert len(step(plain)) == 6
+
+    drifting = BeliefNavPolicy(BeliefNavPolicyConfig(
+        drift_scale_uncertainty=0.05)).eval()
+    result = step(drifting, travelled=drifting.initial_travel(torch.zeros(1, 2)))
+    assert len(result) == 7
+    assert result[-1].shape == (1,)
+
+    recurrent = BeliefNavPolicy(BeliefNavPolicyConfig(
+        persistent_calibration=True, drift_scale_uncertainty=0.05)).eval()
+    goal = torch.zeros(1, 2)
+    result = step(recurrent, calibration=recurrent.initial_calibration(goal),
+                  travelled=recurrent.initial_travel(goal))
+    assert len(result) == 8
+    # calibration is a scale correction and travelled is a distance; both are
+    # (1,) here, so only the order distinguishes them.
+    assert float(result[-1]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_scan_vote_reports_nothing_rather_than_a_grid_corner():
+    """No usable bearings must read as no evidence, not as maximum displacement.
+
+    Every candidate scores zero, so an unguarded argmax returns index 0, which
+    is the corner of the candidate grid and a ~3 cm displacement in both axes.
+    """
+    vote = _scan_vote()
+    difference = torch.zeros(2, 720)
+    weight = torch.zeros(2, 720)
+    estimate, surface, sharpness = vote(difference, weight)
+    torch.testing.assert_close(estimate, torch.zeros(2, 2), atol=0.0, rtol=0.0)
+    assert float(sharpness.abs().max()) == 0.0
+    assert float(surface.abs().max()) == 0.0
+
+
+def test_vote_residual_is_expressed_in_the_frame_the_head_answers_in():
+    """A frame error here is a bias that appears only while turning.
+
+    The vote compares scans aligned into the *newest* frame, but the head's
+    output is added to the commanded displacement in the body frame at the
+    *start* of the tick, and the two differ by one tick of yaw. A robot that
+    drives straight forward while turning must produce a purely forward
+    residual: leaving it in the newest frame instead would rotate it and
+    manufacture a lateral correction proportional to sin(yaw rate).
+    """
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(scan_vote_bins=41)).eval()
+    frames = policy.config.motion_history_frames
+    beams = policy.config.raw_lidar_bins
+    distance, turn, radius = 0.02, 0.09, 4.0
+
+    grid = -math.pi + (torch.arange(beams, dtype=torch.float64) + 0.5) * (
+        2 * math.pi / beams)
+
+    def scan(position, yaw):
+        """Exact ranges from ``position`` at ``yaw`` inside a centred circle."""
+        world = yaw + grid
+        b = position[0] * torch.cos(world) + position[1] * torch.sin(world)
+        c = position.square().sum() - radius ** 2
+        return (-b + torch.sqrt(b.square() - c)).float()
+
+    start = torch.tensor([0.35, -0.2], dtype=torch.float64)
+    # Forward along the *starting* heading, which is yaw zero, then turn.
+    finish = start + torch.tensor([distance, 0.0], dtype=torch.float64)
+
+    before, after = scan(start, 0.0), scan(finish, turn)
+    metric = torch.cat([before.expand(frames - 1, beams), after[None]])[None]
+    valid = torch.ones(1, frames, beams, dtype=torch.bool)
+    gyro = torch.zeros(1, frames)
+    gyro[:, -1] = turn
+    previous = torch.zeros(1, frames, 2)          # nothing was commanded
+
+    aligned, aligned_valid = policy.odometry._align_history(metric, valid, gyro)
+    with torch.no_grad():
+        features, _ = policy.odometry._vote_features(
+            aligned, aligned_valid, previous, gyro)
+    residual = features[:, -3:-1]                 # (residual_x, residual_y)
+
+    limit = policy.config.forward_correction_scale * V_MAX * DT
+    recovered = residual * limit
+    # Forward component is the motion; lateral is zero because the residual was
+    # rotated back into the frame the robot started the tick in.
+    assert abs(float(recovered[0, 0]) - distance) < 2.0e-3, recovered
+    assert abs(float(recovered[0, 1])) < 1.0e-3, recovered
+    # The test must be able to see the bug it is guarding against. Undoing the
+    # rotation reproduces what leaving the residual in the newest frame would
+    # have handed the head, and its lateral component is outside the tolerance
+    # above. It is about 2 mm at one tick of full-rate turn -- small per tick,
+    # systematic across every turning step, and it integrates.
+    unrotated = compose_belief(recovered, torch.zeros_like(recovered),
+                               torch.full((1,), turn))
+    assert abs(float(unrotated[0, 1])) > 1.0e-3, unrotated

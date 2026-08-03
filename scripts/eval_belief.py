@@ -413,6 +413,13 @@ def _evaluate_tier(env, policy, reference, mode, scale, seed, torch, noise_mod):
                         # the episode opened. ``rollout`` skips it identically.
                         belief, covariance, arrival_count = policy.initial_state(truth)
                         calibration = policy.initial_calibration(truth)
+                        # Cumulative path length, carried only when the
+                        # checkpoint declares a systematic drift term. Without
+                        # it a drift-aware checkpoint refuses to step rather
+                        # than silently restoring the random-walk bound.
+                        travelled = (policy.initial_travel(truth)
+                                     if policy.config.drift_scale_uncertainty > 0
+                                     else None)
                         command = actor(policy.observation(
                             history.lidar, belief, history.action))
                     else:
@@ -425,23 +432,22 @@ def _evaluate_tier(env, policy, reference, mode, scale, seed, torch, noise_mod):
                             estimator_ranges = torch.full_like(
                                 raw_history, LIDAR_MAX_M)
                             estimator_valid = torch.zeros_like(raw_valid_history)
-                        if (policy.config.persistent_calibration
-                                or policy.config.motion_state_size > 0):
-                            (command, model_arrived, belief, covariance,
-                             arrival_count, confidence,
-                             calibration) = policy.step_state(
-                                belief, covariance, arrival_count,
-                                history.lidar, estimator_ranges,
-                                estimator_valid, gyro_history,
-                                motion_action_history,
-                                calibration=calibration)
-                        else:
-                            (command, model_arrived, belief, covariance,
-                             arrival_count, confidence) = policy.step_state(
-                                belief, covariance, arrival_count,
-                                history.lidar, estimator_ranges,
-                                estimator_valid, gyro_history,
-                                motion_action_history)
+                        recurrent = (policy.config.persistent_calibration
+                                     or policy.config.motion_state_size > 0)
+                        stepped = policy.step_state(
+                            belief, covariance, arrival_count,
+                            history.lidar, estimator_ranges,
+                            estimator_valid, gyro_history,
+                            motion_action_history,
+                            calibration=calibration if recurrent else None,
+                            travelled=travelled)
+                        (command, model_arrived, belief, covariance,
+                         arrival_count, confidence) = stepped[:6]
+                        trailing = list(stepped[6:])
+                        if recurrent:
+                            calibration = trailing.pop(0)
+                        if travelled is not None:
+                            travelled = trailing.pop(0)
                         scan_confidence_sum[active] += confidence[active]
                 else:
                     drift = odometry.step(env._action[:, 1] * DT)

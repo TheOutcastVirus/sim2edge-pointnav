@@ -353,6 +353,22 @@ class ScanVote(nn.Module):
             spread = torch.softmax(score / peak_value * 40.0, dim=1)
             sharpness = spread.gather(1, best[:, None])
             surface = (score / peak_value).view(n, 1, self.bins, self.bins)
+
+            # With no usable bearings every candidate scores exactly zero, and
+            # argmax then returns index 0 -- a *corner* of the grid, which reads
+            # as a 3 cm displacement in both axes. Today the overlap gate zeroes
+            # the correction before that can reach the belief, so this is
+            # hygiene rather than a live bug; it stops being hygiene the moment
+            # anyone reads the vote without the gate in front of it.
+            informative = (weight.sum(-1, keepdim=True) > 0.0) & (
+                peak_value > 0.0)
+            estimate = torch.where(informative, estimate,
+                                   torch.zeros_like(estimate))
+            sharpness = torch.where(informative, sharpness,
+                                    torch.zeros_like(sharpness))
+            surface = torch.where(informative[:, :, None], surface.view(n, 1, -1),
+                                  torch.zeros_like(surface.view(n, 1, -1))
+                                  ).view(n, 1, self.bins, self.bins)
         return estimate.detach(), surface.detach(), sharpness.detach()
 
 
@@ -553,9 +569,21 @@ class OdometryHead(nn.Module):
             weight = weight * (newest < LIDAR_MAX_M - 1.0e-3).to(aligned.dtype)
             estimate, surface, sharpness = self.vote(difference, weight)
             commanded = self._commanded_displacement(previous_action, gyro, gap)
-            # Expressed as the correction it implies, in units of the correction
-            # limit, and clamped so an unbracketed vote cannot inject a spike.
-            residual = ((estimate - commanded) / limit).clamp(-4.0, 4.0)
+
+            # Both vectors above live in the *newest* frame, because that is the
+            # bearing grid the scans were aligned into. The head's output does
+            # not: it is added to ``dead_reckoned`` in :meth:`translation`, which
+            # is the body frame at the start of the tick. Rotating the residual
+            # back by the yaw accumulated over the gap puts it in the frame the
+            # head actually answers in. The gap is at most one tick of yaw here,
+            # so the correction is under a degree of a centimetre -- small, and
+            # systematic in exactly the turning steps where slip is largest.
+            turn = gyro[:, -gap:].sum(1)
+            residual = compose_belief(estimate - commanded,
+                                      torch.zeros_like(estimate), -turn)
+            # In units of the correction limit, and clamped so an unbracketed
+            # vote cannot inject a spike.
+            residual = (residual / limit).clamp(-4.0, 4.0)
             surfaces.append(surface)
             scalars.append(torch.cat([residual, sharpness], dim=1))
             sharpnesses.append(sharpness)
