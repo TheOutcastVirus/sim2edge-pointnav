@@ -543,6 +543,40 @@ Two things that matter and are easy to get wrong:
 Grid resolution is a mild knob: 1.10 cm/m at 21 bins, 1.04 at 31, 0.91 at 41,
 costing 0.42 / 0.86 / 1.43 ms of single-threaded CPU.
 
+### What the vote is worth, and why the loss has to change first
+
+`belief_vote_v22` scored **worse** on the mean than every checkpoint without the
+vote (9.38 cm against 8.53) while scoring **best** on lidar causality (+0.96 cm
+shuffled degradation against 0.67) with a gate that finally discriminates (0.757
+matched / 0.045 shuffled, against v14's 0.133 / 0.083). The head is using the
+scan more and doing worse, and that is arithmetic rather than a training
+failure:
+
+| estimator, over a 220-step episode | systematic | random | total |
+|---|---:|---:|---:|
+| command only | 8.77 cm | 1.52 cm | **8.90 cm** |
+| vote only, per tick | 3.24 cm | 8.40 cm | **9.00 cm** |
+| optimal blend, α ≈ 0.5 | 2.81 cm | 4.24 cm | **5.08 cm** |
+
+The vote's per-tick scatter (0.566 cm) is 5.5× the command's and consumes
+exactly the bias advantage it buys. **Filtering does not help**: averaging cuts
+per-sample variance but adds correlation that compensates in the sum, and belief
+error *is* the sum — so `--persistent-calibration` and `--motion-state-size` are
+not the fix, despite being the obvious next thing to reach for.
+
+The fix is the objective. `translation_coef` 20 against `belief_coef` 1
+evaluates to about 1.0 against 0.014 at the operating point — the per-tick term
+outweighs the integral it stands in for by **69×** — and per tick, inverse
+variance weighting gives the scan about 3% of the weight. Gradient descent has
+been correctly ignoring the lidar for four runs. `--translation-coef` and
+`--belief-coef` now exist to invert that; `belief_integral_v23` is the first run
+using them.
+
+Even a perfect blend lands at 5.08 cm, right at the gate. Beating it needs the
+vote's **scatter** below 0.46 cm (and below 0.27 cm for 3 cm of belief error).
+Grid resolution is not the limit — scatter is 0.56 cm at 21, 31 and 41 bins
+alike — so that is the open question.
+
 ### Honest arrival uncertainty
 
 `scripts/probe_arrival_honesty.py` measures whether the covariance describes the

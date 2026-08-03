@@ -95,6 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action-coef", type=float,
                         help="action imitation coefficient (default: 1 when "
                              "--train-actor, otherwise 0)")
+    parser.add_argument("--translation-coef", type=float,
+                        default=BeliefConfig.translation_coef,
+                        help="weight on per-tick translation error. This term "
+                             "rewards low variance, where command dead "
+                             "reckoning is unbeatable; the belief error that "
+                             "actually matters is an integral, where bias is")
+    parser.add_argument("--belief-coef", type=float,
+                        default=BeliefConfig.belief_coef,
+                        help="weight on accumulated belief error -- the "
+                             "integral the deployed system is judged on")
     parser.add_argument("--mismatched-lidar-coef", type=float,
                         default=BeliefConfig.mismatched_lidar_coef,
                         help="force mismatched scans back to command dead reckoning")
