@@ -708,16 +708,34 @@ not a board measurement.
 
 ### The scan vote stays out of the graph
 
-`--include-vote` exists to measure what including it costs, not to ship it.
-`ScanVote` holds no parameters — it is fixed geometry, the same status the
-deskew and the angular binning already have, and those live in the C++ node's
-preprocessing translation unit. Tracing it in adds `gather`, `cumsum`, `flip`,
-`remainder`, `floor` and a `set_grad_enabled` higher-order wrapper (41 → 56
-operators), none of which the reference models proved delegated. It is also an
-argmax over a surface measuring centimetres, which is not a thing to quantize.
+For a vote checkpoint the script computes the vote first, via
+`OdometryHead.compute_vote`, and traces the network with its outputs as ordinary
+inputs. `--include-vote` traces it in instead, and exists to measure what that
+costs. On the same checkpoint:
 
-It costs 0.42 ms single-threaded at 21 bins and 0.86 ms at 31, so it fits the
-preprocessing budget comfortably.
+| | operators | host latency |
+|---|---:|---:|
+| vote outside the graph (default) | 50 | 1.17 ms |
+| `--include-vote` | 56 | 2.46 ms |
+
+Tracing it in adds `gather`, `cumsum`, `flip`, `remainder`, `floor` and a
+`set_grad_enabled` higher-order wrapper, none of which the reference models
+proved delegated. It is also an argmax over a surface measuring centimetres,
+which is not a thing to quantize.
+
+**The seam is the parameter boundary, not the vote branch.** `ScanVote` and
+`_vote_surfaces` are fixed geometry and hold no weights — the same status the
+deskew and the angular binning have, and those already live in the C++ node's
+preprocessing translation unit. `_encode_vote`, the convolution that reads the
+vote surface, *does* have weights and stays in the graph; the surface crosses
+the boundary as a small image. Putting it on the preprocessing side instead
+would run learned weights in float on the CPU and split the model across the
+quantization boundary.
+
+A test requires the precomputed path to be bit-identical to computing the vote
+inline. A divergence there would appear only as an unexplained sim-to-real gap.
+
+The vote itself costs 0.42 ms single-threaded at 21 bins and 0.86 ms at 31.
 
 ## 2. Still to build
 
