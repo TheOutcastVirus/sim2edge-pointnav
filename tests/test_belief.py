@@ -1022,9 +1022,9 @@ def test_vote_residual_is_expressed_in_the_frame_the_head_answers_in():
 
     aligned, aligned_valid = policy.odometry._align_history(metric, valid, gyro)
     with torch.no_grad():
-        features, _ = policy.odometry._vote_features(
+        _, scalars, _ = policy.odometry._vote_surfaces(
             aligned, aligned_valid, previous, gyro)
-    residual = features[:, -3:-1]                 # (residual_x, residual_y)
+    residual = scalars[:, :2]                     # (residual_x, residual_y)
 
     limit = policy.config.forward_correction_scale * V_MAX * DT
     recovered = residual * limit
@@ -1040,3 +1040,54 @@ def test_vote_residual_is_expressed_in_the_frame_the_head_answers_in():
     unrotated = compose_belief(recovered, torch.zeros_like(recovered),
                                torch.full((1,), turn))
     assert abs(float(unrotated[0, 1])) > 1.0e-3, unrotated
+
+
+def test_precomputed_vote_is_bit_identical_to_computing_it_inline():
+    """The deployment split must not be a second implementation.
+
+    On the robot the vote runs ahead of the network, in float on the CPU, and
+    its outputs are handed to the quantized graph as ordinary inputs. That is
+    only safe if the two paths are the same arithmetic -- a divergence here is
+    the exact bug class ``rollout`` versus ``step`` was built to avoid, and it
+    would appear as a sim-to-real gap with no other symptom.
+    """
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        scan_vote_bins=21, derotate_scan_history=True)).eval()
+    frames = policy.config.motion_history_frames
+    torch.manual_seed(23)
+    raw = torch.rand(3, frames, 720) * 4.0 + 0.4
+    valid = torch.rand(3, frames, 720) > 0.2
+    raw = torch.where(valid, raw, torch.full_like(raw, LIDAR_MAX_M))
+    lidar = torch.rand(3, 4, 180)
+    gyro = torch.randn(3, frames) * 0.04
+    previous = torch.rand(3, frames, 2) * 2.0 - 1.0
+
+    with torch.no_grad():
+        inline = policy.translation(lidar, gyro, previous, raw, valid)
+        vote = policy.odometry.compute_vote(lidar, gyro, previous, raw, valid)
+        commanded = previous[:, -1, 0] * V_MAX
+        split = torch.stack(
+            [commanded * DT, torch.zeros_like(commanded)], dim=1
+        ) + policy.odometry(lidar, gyro, previous, raw, valid, vote=vote)
+
+    torch.testing.assert_close(split, inline, atol=0.0, rtol=0.0)
+
+
+def test_precomputed_vote_carries_no_learned_weights():
+    """Only the geometry leaves the graph; the convolution that reads it stays.
+
+    If a parameter ended up on the preprocessing side it would run in float on
+    the CPU, wasting the NPU and quietly splitting the model across the
+    quantization boundary.
+    """
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(scan_vote_bins=21)).eval()
+    assert list(policy.odometry.vote.parameters()) == []
+    frames = policy.config.motion_history_frames
+    surfaces, scalars, sharpness = policy.odometry.compute_vote(
+        torch.zeros(1, 4, 180), torch.zeros(1, frames),
+        torch.zeros(1, frames, 2), torch.rand(1, frames, 720) * 3.0 + 0.5,
+        torch.ones(1, frames, 720, dtype=torch.bool))
+    for tensor in (surfaces, scalars, sharpness):
+        assert not tensor.requires_grad
+    # The surface arrives as an image for the in-graph convolution to read.
+    assert surfaces.shape == (1, len(policy.config.scan_vote_gaps), 21, 21)

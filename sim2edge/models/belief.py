@@ -547,13 +547,26 @@ class OdometryHead(nn.Module):
             carried = compose_belief(carried, step, gyro[:, index])
         return -carried
 
-    def _vote_features(self, aligned: torch.Tensor, aligned_valid: torch.Tensor,
-                       previous_action: torch.Tensor, gyro: torch.Tensor
-                       ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Vote every configured gap. Returns ``(features, sharpness)``.
+    def _encode_vote(self, surfaces: torch.Tensor, scalars: torch.Tensor
+                     ) -> torch.Tensor:
+        """The *learned* half of the vote branch: read the surface as an image.
 
-        ``aligned`` must already sit in the newest frame's bearing grid, which is
-        what makes the residual a pure translation question.
+        Kept separate from :meth:`_vote_surfaces` so the deployment split falls
+        on the parameter boundary. Everything before this point is fixed
+        geometry and runs in float on the CPU; this convolution has weights, so
+        it belongs inside the quantized graph with the rest of the network.
+        """
+        return torch.cat(
+            [self.vote_projection(self.vote_encoder(surfaces)), scalars], dim=1)
+
+    def _vote_surfaces(self, aligned: torch.Tensor, aligned_valid: torch.Tensor,
+                       previous_action: torch.Tensor, gyro: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Vote every configured gap. Returns ``(surfaces, scalars, sharpness)``.
+
+        Parameter-free throughout. ``aligned`` must already sit in the newest
+        frame's bearing grid, which is what makes the residual a pure
+        translation question.
         """
         newest = aligned[:, -1]
         newest_valid = aligned_valid[:, -1]
@@ -587,10 +600,8 @@ class OdometryHead(nn.Module):
             surfaces.append(surface)
             scalars.append(torch.cat([residual, sharpness], dim=1))
             sharpnesses.append(sharpness)
-        encoded = self.vote_projection(
-            self.vote_encoder(torch.cat(surfaces, dim=1)))
-        features = torch.cat([encoded] + scalars, dim=1)
-        return features, torch.cat(sharpnesses, dim=1).mean(1, keepdim=True)
+        return (torch.cat(surfaces, dim=1), torch.cat(scalars, dim=1),
+                torch.cat(sharpnesses, dim=1).mean(1, keepdim=True))
 
     def _raw_inputs(self, lidar: torch.Tensor,
                     raw_lidar: torch.Tensor | None,
@@ -613,12 +624,9 @@ class OdometryHead(nn.Module):
                              torch.full_like(raw_lidar, LIDAR_MAX_M))
         return metric, valid
 
-    def _features(self, lidar: torch.Tensor, gyro: torch.Tensor,
-                  previous_action: torch.Tensor,
-                  raw_lidar: torch.Tensor | None,
-                  raw_valid: torch.Tensor | None
-                  ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode one sensor window and return hidden features plus overlap."""
+    def _padded_window(self, lidar, raw_lidar, raw_valid, gyro,
+                       previous_action):
+        """Left-pad every channel to the full motion history by repetition."""
         metric, valid = self._raw_inputs(lidar, raw_lidar, raw_valid)
         frames = self.config.motion_history_frames
         if metric.shape[1] < frames:
@@ -632,8 +640,55 @@ class OdometryHead(nn.Module):
             previous_action = torch.cat([
                 previous_action[:, :1].expand(-1, pad, -1), previous_action
             ], 1)
+        return metric, valid, gyro, previous_action
+
+    def compute_vote(self, lidar: torch.Tensor, gyro: torch.Tensor,
+                     previous_action: torch.Tensor,
+                     raw_lidar: torch.Tensor | None = None,
+                     raw_valid: torch.Tensor | None = None
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the vote alone, ahead of the network. Returns what to hand back.
+
+        This is the deployment split. The vote holds no parameters, so on the
+        robot it runs in float on the CPU beside the deskew and the angular
+        binning, and the quantized graph takes its two outputs as ordinary
+        inputs. Keeping it callable separately is what makes that split real
+        rather than a comment: :mod:`scripts.export_belief` traces the network
+        with these as inputs, and the operators the vote contributes -- gather,
+        cumsum, flip, argmax -- never enter the graph.
+
+        The split falls on the *parameter* boundary, not on the vote branch as a
+        whole. The convolution that reads the surface has weights and stays in
+        the graph; only the geometry leaves.
+        """
+        if self.vote is None:
+            raise ValueError("this checkpoint has no scan vote")
+        metric, valid, gyro, previous_action = self._padded_window(
+            lidar, raw_lidar, raw_valid, gyro, previous_action)
+        aligned, aligned_valid = self._align_history(metric, valid, gyro)
+        return self._vote_surfaces(aligned, aligned_valid, previous_action,
+                                   gyro)
+
+    def _features(self, lidar: torch.Tensor, gyro: torch.Tensor,
+                  previous_action: torch.Tensor,
+                  raw_lidar: torch.Tensor | None,
+                  raw_valid: torch.Tensor | None,
+                  vote: tuple[torch.Tensor, torch.Tensor] | None = None
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode one sensor window and return hidden features plus overlap.
+
+        ``vote`` accepts the output of :meth:`compute_vote` so the deployed
+        graph can be traced without the vote inside it.
+        """
+        metric, valid, gyro, previous_action = self._padded_window(
+            lidar, raw_lidar, raw_valid, gyro, previous_action)
         vote_features = sharpness = None
-        if self.vote is not None:
+        if vote is not None:
+            surfaces, scalars, sharpness = vote
+            vote_features = self._encode_vote(surfaces, scalars)
+            if self.config.derotate_scan_history:
+                metric, valid = self._align_history(metric, valid, gyro)
+        elif self.vote is not None:
             # The vote is a translation question, so it always reads aligned
             # frames regardless of what the convolution below is given. When
             # ``derotate_scan_history`` is on the alignment is shared rather than
@@ -643,8 +698,9 @@ class OdometryHead(nn.Module):
                 aligned, aligned_valid = metric, valid
             else:
                 aligned, aligned_valid = self._align_history(metric, valid, gyro)
-            vote_features, sharpness = self._vote_features(
+            surfaces, scalars, sharpness = self._vote_surfaces(
                 aligned, aligned_valid, previous_action, gyro)
+            vote_features = self._encode_vote(surfaces, scalars)
         elif self.config.derotate_scan_history:
             metric, valid = self._align_history(metric, valid, gyro)
         normalized = metric / LIDAR_MAX_M
@@ -667,7 +723,7 @@ class OdometryHead(nn.Module):
             difference = torch.where(valid & valid[:, -1:], difference,
                                      torch.zeros_like(difference))
             difference = difference * (
-                LIDAR_MAX_M / (V_MAX * DT * frames))
+                LIDAR_MAX_M / (V_MAX * DT * self.config.motion_history_frames))
         encoded = self.conv(torch.cat(
             [normalized, difference, valid.float()], dim=1))
         scan_features = self.scan_projection(encoded)
@@ -716,14 +772,15 @@ class OdometryHead(nn.Module):
                 raw_lidar: torch.Tensor | None = None,
                 raw_valid: torch.Tensor | None = None,
                 *, return_uncertainty: bool = False,
-                return_proposal: bool = False):
+                return_proposal: bool = False,
+                vote: tuple[torch.Tensor, torch.Tensor] | None = None):
         """Return scan correction, optionally with diagonal motion variance.
 
         ``lidar`` is ``(N, H, B)``, ``gyro`` is ``(N, H)`` radians turned per
         tick, ``previous_action`` is ``(N, H, 2)`` normalized commands.
         """
         hidden, overlap = self._features(
-            lidar, gyro, previous_action, raw_lidar, raw_valid)
+            lidar, gyro, previous_action, raw_lidar, raw_valid, vote)
         proposal, variance, confidence = self._outputs(hidden, overlap)
         correction = confidence[:, None] * proposal
         if return_uncertainty:
@@ -736,13 +793,14 @@ class OdometryHead(nn.Module):
             gyro: torch.Tensor, previous_action: torch.Tensor,
             raw_lidar: torch.Tensor | None = None,
             raw_valid: torch.Tensor | None = None,
+            vote: tuple[torch.Tensor, torch.Tensor] | None = None,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                        torch.Tensor, torch.Tensor]:
         """Return a recurrent forward-scale residual and next explicit state."""
         if self.config.motion_state_size <= 0:
             raise ValueError("motion memory is disabled in this checkpoint")
         hidden, overlap = self._features(
-            lidar, gyro, previous_action, raw_lidar, raw_valid)
+            lidar, gyro, previous_action, raw_lidar, raw_valid, vote)
         proposal, variance, confidence = self._outputs(hidden, overlap)
         limit = self.config.forward_correction_scale * V_MAX * DT
         normalized_proposal = proposal / torch.tensor(
@@ -804,7 +862,8 @@ class BeliefNavPolicy(nn.Module):
     def motion_estimate(self, lidar: torch.Tensor, gyro: torch.Tensor,
                         previous_action: torch.Tensor,
                         raw_lidar: torch.Tensor | None = None,
-                        raw_valid: torch.Tensor | None = None
+                        raw_valid: torch.Tensor | None = None,
+                        vote: tuple[torch.Tensor, torch.Tensor] | None = None
                         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Translation, diagonal process variance and scan confidence."""
         commanded_v = previous_action[:, -1, 0] * V_MAX
@@ -812,7 +871,7 @@ class BeliefNavPolicy(nn.Module):
             [commanded_v * DT, torch.zeros_like(commanded_v)], dim=1)
         correction, variance, confidence = self.odometry(
             lidar, gyro, previous_action, raw_lidar, raw_valid,
-            return_uncertainty=True)
+            return_uncertainty=True, vote=vote)
         return dead_reckoned + correction, variance, confidence
 
     def calibrated_motion_estimate(
@@ -820,6 +879,7 @@ class BeliefNavPolicy(nn.Module):
             gyro: torch.Tensor, previous_action: torch.Tensor,
             raw_lidar: torch.Tensor | None = None,
             raw_valid: torch.Tensor | None = None,
+            vote: tuple[torch.Tensor, torch.Tensor] | None = None,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Estimate motion and update the episode's forward scale state.
 
@@ -835,7 +895,7 @@ class BeliefNavPolicy(nn.Module):
                 (correction, variance, confidence, calibration,
                  recurrent_scale) = self.odometry.forward_memory(
                     calibration, lidar, gyro, previous_action,
-                    raw_lidar, raw_valid)
+                    raw_lidar, raw_valid, vote)
                 commanded_v = previous_action[:, -1, 0] * V_MAX
                 instant_scale = correction[:, 0] / (V_MAX * DT)
                 scale = (instant_scale + recurrent_scale).clamp(
@@ -846,12 +906,12 @@ class BeliefNavPolicy(nn.Module):
                 ], dim=1)
                 return translation, variance, confidence, calibration
             translation, variance, confidence = self.motion_estimate(
-                lidar, gyro, previous_action, raw_lidar, raw_valid)
+                lidar, gyro, previous_action, raw_lidar, raw_valid, vote)
             return translation, variance, confidence, calibration
 
         proposal, variance, confidence = self.odometry(
             lidar, gyro, previous_action, raw_lidar, raw_valid,
-            return_uncertainty=True, return_proposal=True)
+            return_uncertainty=True, return_proposal=True, vote=vote)
         gated = confidence[:, None] * proposal
         candidate = gated[:, 0] / (V_MAX * DT)
         commanded_v = previous_action[:, -1, 0] * V_MAX
@@ -986,7 +1046,8 @@ class BeliefNavPolicy(nn.Module):
                    raw_lidar: torch.Tensor, raw_valid: torch.Tensor,
                    gyro: torch.Tensor, previous_action: torch.Tensor,
                    calibration: torch.Tensor | None = None,
-                   travelled: torch.Tensor | None = None):
+                   travelled: torch.Tensor | None = None,
+                   vote: tuple[torch.Tensor, torch.Tensor] | None = None):
         """Deployable recurrent step with uncertainty-aware arrival.
 
         Returns ``(command, arrived, belief, covariance, arrival_count,
@@ -1008,12 +1069,12 @@ class BeliefNavPolicy(nn.Module):
                 raise ValueError(
                     "recurrent motion checkpoint requires carried state")
             translation, variance, confidence = self.motion_estimate(
-                lidar, gyro, previous_action, raw_lidar, raw_valid)
+                lidar, gyro, previous_action, raw_lidar, raw_valid, vote)
         else:
             translation, variance, confidence, calibration = (
                 self.calibrated_motion_estimate(
                     calibration, lidar, gyro, previous_action,
-                    raw_lidar, raw_valid))
+                    raw_lidar, raw_valid, vote))
         delta_yaw = gyro[:, -1]
         belief = compose_belief(belief, translation, delta_yaw)
         step_length = torch.linalg.vector_norm(translation, dim=1)

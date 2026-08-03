@@ -87,17 +87,20 @@ class DeployedStep(nn.Module):
 class NetworkOnlyStep(nn.Module):
     """The step with the parameter-free vote lifted out into its inputs.
 
-    This is the graph that ships. The vote runs ahead of it on the CPU, in
-    float, and hands in three small tensors.
+    This is the graph that ships. The vote runs ahead of it, in float, on the
+    CPU, and hands in two small tensors. Deleting the vote module instead would
+    not work and is worth saying out loud: the trunk's first layer is sized to
+    include the vote's features, so a checkpoint trained with it produces a
+    shape error, not a graceful fallback.
     """
 
     def __init__(self, policy: BeliefNavPolicy):
         super().__init__()
         self.policy = policy
-        self.policy.odometry.vote = None
 
-    def forward(self, *state_and_sensors):
-        return self.policy.step_state(*state_and_sensors)
+    def forward(self, surfaces, scalars, sharpness, *state_and_sensors):
+        return self.policy.step_state(
+            *state_and_sensors, vote=(surfaces, scalars, sharpness))
 
 
 def operator_report(exported) -> dict[str, int]:
@@ -211,12 +214,20 @@ def main() -> None:
     generator = torch.Generator().manual_seed(args.seed)
     inputs = adversarial_inputs(policy, args.batch_size, generator)
 
-    module = (DeployedStep(policy) if args.include_vote
-              else NetworkOnlyStep(policy))
+    if args.include_vote or policy.config.scan_vote_bins == 0:
+        module, traced_inputs = DeployedStep(policy), inputs
+    else:
+        # The vote's inputs are the raw scan history, the gyro and the previous
+        # commands -- exactly the tensors already in `inputs`, at the positions
+        # step_state takes them.
+        lidar, raw, valid, gyro, previous = inputs[3:8]
+        with torch.no_grad():
+            vote = policy.odometry.compute_vote(lidar, gyro, previous, raw, valid)
+        module, traced_inputs = NetworkOnlyStep(policy), (*vote, *inputs)
     module.eval()
 
     started = time.perf_counter()
-    exported = torch.export.export(module, inputs, strict=False)
+    exported = torch.export.export(module, traced_inputs, strict=False)
     export_seconds = time.perf_counter() - started
 
     report = {
@@ -227,8 +238,8 @@ def main() -> None:
         "export_seconds": export_seconds,
         "parameter_count": policy.parameter_count,
         "operators": operator_report(exported),
-        "parity": parity(module, exported, inputs),
-        "latency": measure_latency(module, inputs, args.latency_repeats),
+        "parity": parity(module, exported, traced_inputs),
+        "latency": measure_latency(module, traced_inputs, args.latency_repeats),
     }
     report["operator_count"] = len(report["operators"])
 
