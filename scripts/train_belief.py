@@ -77,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--scaled-scan-difference", action="store_true",
         help="mask and rescale the cross-frame range difference channel")
     parser.add_argument(
+        "--scan-vote-bins", type=int, default=0,
+        help="enable the consensus scan vote on a BINS x BINS candidate grid "
+             "(0 disables); requires --reset-odometry, since it changes the "
+             "head's input width")
+    parser.add_argument(
+        "--scan-vote-sigma", type=float,
+        help="consensus kernel width in metres (default 0.01)")
+    parser.add_argument(
         "--confidence-gate-bias", type=float,
         help="initial bias of the learned confidence gate (default -2.0); "
              "requires --reset-odometry, since it is an initialization")
@@ -205,6 +213,24 @@ def main() -> None:
         policy.config = replace(policy.config, scaled_scan_difference=True)
         policy.odometry.config = policy.config
         print("[belief] masking and rescaling the scan difference channel")
+    if args.scan_vote_bins and not policy.config.scan_vote_bins:
+        if resume is not None:
+            raise ValueError("cannot enable the scan vote while resuming")
+        if not args.reset_odometry:
+            raise ValueError("--scan-vote-bins widens the head's trunk input; "
+                             "pass --reset-odometry")
+        policy.config = replace(policy.config,
+                                scan_vote_bins=args.scan_vote_bins)
+        policy.odometry.config = policy.config
+        print(f"[belief] consensus scan vote on a {args.scan_vote_bins}x"
+              f"{args.scan_vote_bins} candidate grid")
+    if args.scan_vote_sigma is not None:
+        if not args.scan_vote_bins:
+            raise ValueError("--scan-vote-sigma requires --scan-vote-bins")
+        policy.config = replace(policy.config,
+                                scan_vote_sigma_m=args.scan_vote_sigma)
+        policy.odometry.config = policy.config
+        print(f"[belief] vote kernel width {args.scan_vote_sigma * 100:.1f} cm")
     if args.confidence_gate_bias is not None:
         if not args.reset_odometry:
             raise ValueError("--confidence-gate-bias only takes effect on a "

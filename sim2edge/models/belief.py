@@ -77,6 +77,7 @@ translation, and the gyro is the other way round.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -90,7 +91,7 @@ from ..spec import (DT, GOAL_MAX_M, GOAL_TOLERANCE_M, HISTORY_FRAMES,
 from .nav_policy import NavPolicy, NavPolicyConfig, initialize_layer
 
 __all__ = ["BeliefNavPolicy", "BeliefNavPolicyConfig", "OdometryHead",
-           "compose_belief"]
+           "ScanVote", "compose_belief"]
 
 
 def compose_belief(belief: torch.Tensor, translation: torch.Tensor,
@@ -138,6 +139,28 @@ class BeliefNavPolicyConfig:
     #: translate sideways; this is the wheel-slip residual only.
     lateral_correction_ratio: float = 0.15
     arrival_sigma: float = 1.96
+    #: Relative uncertainty in the forward scale, as a fraction of distance
+    #: travelled. This is the *systematic* half of the error budget and the
+    #: variance head cannot supply it: that head is calibrated against per-step
+    #: squared error, which propagates as a random walk, while wheel slip is a
+    #: scale error that accumulates linearly in distance.
+    #:
+    #: Calibrated by measurement, not by the drift figure: on
+    #: ``belief_onpolicy_v15`` the v14 checkpoint drifts 3.56 cm/m, and the
+    #: setting that makes the 1.96-sigma bound cover its nominal 95% is 0.05
+    #: (measured 94.2%, against 78.3% at 0.03 and 9.5% with no term at all).
+    #:
+    #: Be clear about what an honest bound costs. At 0.05 the bound widens by
+    #: 1.96 * 0.05 * s, which is 49 cm after five metres -- far outside
+    #: ``arrival_radius_m``. A calibrated robot therefore *declines to declare
+    #: arrival* on a long episode rather than declaring it wrongly. That is the
+    #: correct behaviour and it converts false arrivals into timeouts, but it
+    #: does not manufacture accuracy: reaching the 85% correct-arrival gate
+    #: needs an estimator that actually drifts less, not a wider bound.
+    #:
+    #: Zero reproduces every existing checkpoint exactly, and is why it is the
+    #: default.
+    drift_scale_uncertainty: float = 0.0
     #: Belief-space stop radius. Deliberately tighter than the simulator's
     #: 0.25 m truth tolerance so localization error has a safety margin rather
     #: than turning every optimistic estimate into a false arrival.
@@ -171,6 +194,32 @@ class BeliefNavPolicyConfig:
     #: rather than a gate. 0.0 starts it mid-range where it has usable dynamic
     #: range in both directions. The default reproduces existing checkpoints.
     confidence_gate_bias: float = -2.0
+    #: Side of the square candidate grid the scan vote scores, or 0 to disable
+    #: the branch entirely and keep the pooled-sector encoder alone. See
+    #: :class:`ScanVote` for why voting replaces the least-squares family, and
+    #: :meth:`OdometryHead._vote_features` for what the head does with it.
+    scan_vote_bins: int = 0
+    #: Candidate extent as a multiple of a full-speed tick. The vote must bracket
+    #: the true displacement; 1.5 leaves margin above ``V_MAX`` without spending
+    #: resolution on displacements the base cannot produce.
+    scan_vote_extent_scale: float = 1.5
+    #: Consensus kernel width in metres. This is the scale at which a bearing
+    #: counts as agreeing, so it tracks range noise rather than the signal.
+    #: 0.01 measured best at both 0x and 1x sensor noise; widening it to 0.03
+    #: admits more bearings as inliers and costs accuracy.
+    scan_vote_sigma_m: float = 0.01
+    #: Refinement window around the vote's peak, in grid cells. See
+    #: :meth:`ScanVote.forward` for why the soft-argmax must not be global.
+    scan_vote_radius: int = 3
+    #: Frame gaps the vote is computed over. Gap 1 only, and that is measured
+    #: rather than assumed: a longer baseline carries proportionally more
+    #: displacement against the same range noise, so it looked like free signal,
+    #: but the vote degrades sharply with it -- 0.96 cm/m of drift at gap 1,
+    #: 10.8 at gap 2, 81 at gap 4. The range-flow model behind the vote is
+    #: first-order in displacement and compares equal bearings, and both
+    #: assumptions fail once the robot has moved far enough to shift scene
+    #: content between bearings and to open and close occlusions.
+    scan_vote_gaps: tuple[int, ...] = (1,)
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -181,10 +230,130 @@ class BeliefNavPolicyConfig:
     def from_dict(cls, value: dict[str, Any]) -> "BeliefNavPolicyConfig":
         value = dict(value)
         value["actor"] = NavPolicyConfig.from_dict(value.get("actor", {}))
-        for key in ("odometry_channels", "odometry_trunk"):
+        for key in ("odometry_channels", "odometry_trunk", "scan_vote_gaps"):
             if key in value:
                 value[key] = tuple(value[key])
         return cls(**value)
+
+
+class ScanVote(nn.Module):
+    """Consensus vote for the translation between two scans. No parameters.
+
+    Why voting rather than fitting
+    ==============================
+    Both geometric solvers tried against this corpus -- a point-to-line solve and
+    a full ICP, each validated exact on analytic rooms -- recovered nothing from
+    real scans (ICP correlation +0.089 against a true +10.4 cm displacement).
+    Both minimize a sum of squared residuals, and roughly a quarter to a third of
+    bearings here are gross outliers at depth edges, where a surface visible in
+    one frame is occluded in the next. A squared residual is unbounded, so those
+    bearings do not merely add noise: each one outweighs a hundred good bearings
+    and relocates the minimum. Least squares has a breakdown point of zero, which
+    is the wrong estimator for this data no matter how it is tuned.
+
+    Scoring by agreement instead of by squared error inverts that. For each
+    candidate translation, every bearing contributes
+
+        exp(-(dr + dx cos theta + dy sin theta)^2 / 2 sigma^2)
+
+    which is bounded in ``[0, 1]``. An outlier's residual is large under *every*
+    candidate, so it contributes ~0 to all of them and cannot move the peak -- it
+    abstains rather than votes. Inliers agree only near the true displacement, so
+    they accumulate there. Measured on ``belief_onpolicy_v15`` at gap 1, this
+    recovers the per-tick displacement to 0.51 cm mean error against 8.2 cm for
+    least squares on the *identical* residuals, and 1.89 cm for estimating zero.
+
+    Why it holds no parameters
+    ==========================
+    There is nothing here to learn: the projection geometry is exact and the
+    kernel width is the range noise. Gradients through it would have nowhere to
+    land, so the whole vote runs under ``no_grad`` and is detached. That is the
+    same status ``sensors.deskew_history`` and :meth:`OdometryHead._align_history`
+    have -- fixed sensor processing that happens to sit inside the model. The
+    learned part is how the head *reads* the surface this produces, which is where
+    the remaining judgement actually lives.
+    """
+
+    def __init__(self, beams: int, bins: int, extent: float, sigma: float,
+                 radius: int = 3, chunk: int = 64):
+        super().__init__()
+        self.beams, self.bins, self.sigma, self.chunk = beams, bins, sigma, chunk
+        self.radius = radius
+        # Bin-centre bearings matching ``preprocess.rasterize_lidar``, which
+        # floors ``(wrap_angle(angle) + pi) / width``. Half-a-width offset: a
+        # constant bearing error rotates every recovered translation, which reads
+        # as a null result rather than as a bug.
+        width = 2.0 * math.pi / beams
+        theta = -math.pi + (torch.arange(beams, dtype=torch.float32) + 0.5) * width
+        axis = torch.linspace(-extent, extent, bins, dtype=torch.float32)
+        grid_x, grid_y = torch.meshgrid(axis, axis, indexing="ij")
+        candidates = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=1)
+        # (C, B): the range change each candidate predicts at each bearing. Fixed
+        # geometry, so it is precomputed once rather than per forward pass.
+        projection = (candidates[:, :1] * torch.cos(theta)[None]
+                      + candidates[:, 1:] * torch.sin(theta)[None])
+        self.register_buffer("candidates", candidates, persistent=False)
+        self.register_buffer("projection", projection, persistent=False)
+
+    def forward(self, difference: torch.Tensor, weight: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(estimate, surface, sharpness)`` for one pair of scans.
+
+        ``difference`` is ``r_new - r_old_aligned`` per bearing and ``weight``
+        masks bearings usable in both frames. ``surface`` is the normalized vote
+        map, ``sharpness`` the peak's share of its mass -- an observability
+        measure that distinguishes a corridor's ridge from a corner's peak.
+        """
+        with torch.no_grad():
+            n = difference.shape[0]
+            total = self.candidates.shape[0]
+            score = difference.new_empty((n, total))
+            # Chunked over candidates: the (N, C, B) residual tensor is the only
+            # large intermediate and nothing downstream needs it, so it is built
+            # and discarded a slice at a time. At 720 beams and a 21x21 grid the
+            # full tensor would be 1.5 GB on a flattened training batch.
+            for start in range(0, total, self.chunk):
+                block = self.projection[start:start + self.chunk]
+                residual = difference[:, None, :] + block[None]
+                support = torch.exp(-0.5 * (residual / self.sigma) ** 2)
+                score[:, start:start + self.chunk] = (
+                    support * weight[:, None, :]).sum(-1)
+
+            # Normalizing by the peak makes the temperature independent of how
+            # many bearings happen to be valid, which varies by a factor of
+            # several between an open room and a corridor.
+            peak_value = score.amax(1, keepdim=True).clamp_min(1e-9)
+            best = score.argmax(1)
+
+            # Refine only inside a window around the peak. A soft-argmax over
+            # the whole grid is pulled toward the grid centre by whatever
+            # pedestal the surface carries, and because the grid is centred on
+            # zero while the robot is really moving ~2 cm forward, that
+            # shrinkage is a systematic *underestimate of travel* -- precisely
+            # the component that integrates into drift rather than averaging
+            # out. Measured on belief_onpolicy_v15: windowing drops drift from
+            # 1.30 to 0.96 cm/m, against 2.10 cm/m for command dead reckoning.
+            row, column = best // self.bins, best % self.bins
+            index = torch.arange(self.bins, device=score.device)
+            near = (((index[None] - row[:, None]).abs() <= self.radius)[:, :, None]
+                    & ((index[None] - column[:, None]).abs()
+                       <= self.radius)[:, None, :]).reshape(n, -1)
+            mass = torch.softmax(
+                torch.where(near, score / peak_value * 40.0,
+                            torch.full_like(score, -1.0e4)), dim=1)
+            estimate = mass @ self.candidates
+
+            # Sharpness stays global on purpose: a broad surface is only visible
+            # outside the refinement window. What it measures is how much
+            # bearing-diverse evidence the scan carries, *not* how corrupted it
+            # is -- outliers add a pedestal that dividing by the peak normalizes
+            # away, and 30% of them move sharpness by under 2%. It still
+            # correlates -0.46 with the vote's error on belief_onpolicy_v15,
+            # because sparse returns are the failure that actually occurs.
+            spread = torch.softmax(score / peak_value * 40.0, dim=1)
+            sharpness = spread.gather(1, best[:, None])
+            surface = (score / peak_value).view(n, 1, self.bins, self.bins)
+        return estimate.detach(), surface.detach(), sharpness.detach()
 
 
 class OdometryHead(nn.Module):
@@ -224,14 +393,42 @@ class OdometryHead(nn.Module):
             nn.Linear(3 * frames, 64), nn.ReLU(),
         )
         width = config.odometry_features + 64
+        self.vote = None
+        if config.scan_vote_bins > 0:
+            self.vote = ScanVote(
+                config.raw_lidar_bins, config.scan_vote_bins,
+                config.scan_vote_extent_scale * V_MAX * DT,
+                config.scan_vote_sigma_m, config.scan_vote_radius)
+            # The surface is read as a small image because its *shape* is the
+            # information a scalar estimate throws away: an isolated peak, a
+            # ridge along one axis, and a broad plateau are three different
+            # reliabilities that share one argmax, and only the first deserves
+            # to move the belief.
+            self.vote_encoder = nn.Sequential(
+                nn.Conv2d(len(config.scan_vote_gaps), 16, 3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Flatten(),
+            )
+            side = -(-config.scan_vote_bins // 4)
+            self.vote_projection = nn.Sequential(
+                nn.Linear(16 * side * side, 64), nn.ReLU())
+            # Per gap: the displacement the vote implies, already expressed as a
+            # correction to the command in units of the correction limit, plus
+            # the peak sharpness. Handing the head the answer in the units it
+            # must output makes a near-identity weight the solution, which is the
+            # same reason the model predicts a residual rather than a pose.
+            width += 64 + 3 * len(config.scan_vote_gaps)
         trunk: list[nn.Module] = []
         for output_width in config.odometry_trunk:
             trunk.extend((nn.Linear(width, output_width), nn.ReLU()))
             width = output_width
         self.trunk = nn.Sequential(*trunk)
         self.proposal_head = nn.Linear(width, 2)
-        self.confidence_head = nn.Sequential(nn.Linear(width + 1, 32), nn.ReLU(),
-                                             nn.Linear(32, 1))
+        # Overlap, plus peak sharpness when the vote branch supplies it.
+        observability = 2 if config.scan_vote_bins > 0 else 1
+        self.confidence_head = nn.Sequential(
+            nn.Linear(width + observability, 32), nn.ReLU(), nn.Linear(32, 1))
         self.variance_head = nn.Linear(width, 2)
         if config.motion_state_size > 0:
             # Encoded scan/motion, normalized proposal x/y, and confidence.
@@ -317,6 +514,56 @@ class OdometryHead(nn.Module):
             delta.reshape(n * frames))
         return rotated.view(n, frames, beams), usable.view(n, frames, beams)
 
+    def _commanded_displacement(self, previous_action: torch.Tensor,
+                                gyro: torch.Tensor, gap: int) -> torch.Tensor:
+        """Commanded displacement over the last ``gap`` ticks, in the newest frame.
+
+        The vote reports displacement between two frames that have been rotated
+        into a common orientation, so the command it is compared against must be
+        composed through the same rotations rather than summed. For ``gap`` 1
+        this reduces to ``v * DT`` forward, which is what
+        :meth:`BeliefNavPolicy.translation` uses.
+        """
+        carried = previous_action.new_zeros((previous_action.shape[0], 2))
+        for index in range(-gap, 0):
+            speed = previous_action[:, index, 0] * V_MAX
+            step = torch.stack([speed * DT, torch.zeros_like(speed)], dim=1)
+            carried = compose_belief(carried, step, gyro[:, index])
+        return -carried
+
+    def _vote_features(self, aligned: torch.Tensor, aligned_valid: torch.Tensor,
+                       previous_action: torch.Tensor, gyro: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vote every configured gap. Returns ``(features, sharpness)``.
+
+        ``aligned`` must already sit in the newest frame's bearing grid, which is
+        what makes the residual a pure translation question.
+        """
+        newest = aligned[:, -1]
+        newest_valid = aligned_valid[:, -1]
+        limit = self.config.forward_correction_scale * V_MAX * DT
+        surfaces, scalars, sharpnesses = [], [], []
+        for gap in self.config.scan_vote_gaps:
+            older = aligned[:, -1 - gap]
+            difference = newest - older
+            weight = (newest_valid & aligned_valid[:, -1 - gap]).to(aligned.dtype)
+            # A max-range fill paired against a real return is a missing
+            # measurement, not a range change. Letting it vote is what
+            # manufactures a 9 m "closure" out of a bearing that saw nothing.
+            weight = weight * (newest < LIDAR_MAX_M - 1.0e-3).to(aligned.dtype)
+            estimate, surface, sharpness = self.vote(difference, weight)
+            commanded = self._commanded_displacement(previous_action, gyro, gap)
+            # Expressed as the correction it implies, in units of the correction
+            # limit, and clamped so an unbracketed vote cannot inject a spike.
+            residual = ((estimate - commanded) / limit).clamp(-4.0, 4.0)
+            surfaces.append(surface)
+            scalars.append(torch.cat([residual, sharpness], dim=1))
+            sharpnesses.append(sharpness)
+        encoded = self.vote_projection(
+            self.vote_encoder(torch.cat(surfaces, dim=1)))
+        features = torch.cat([encoded] + scalars, dim=1)
+        return features, torch.cat(sharpnesses, dim=1).mean(1, keepdim=True)
+
     def _raw_inputs(self, lidar: torch.Tensor,
                     raw_lidar: torch.Tensor | None,
                     raw_valid: torch.Tensor | None
@@ -357,7 +604,20 @@ class OdometryHead(nn.Module):
             previous_action = torch.cat([
                 previous_action[:, :1].expand(-1, pad, -1), previous_action
             ], 1)
-        if self.config.derotate_scan_history:
+        vote_features = sharpness = None
+        if self.vote is not None:
+            # The vote is a translation question, so it always reads aligned
+            # frames regardless of what the convolution below is given. When
+            # ``derotate_scan_history`` is on the alignment is shared rather than
+            # repeated.
+            if self.config.derotate_scan_history:
+                metric, valid = self._align_history(metric, valid, gyro)
+                aligned, aligned_valid = metric, valid
+            else:
+                aligned, aligned_valid = self._align_history(metric, valid, gyro)
+            vote_features, sharpness = self._vote_features(
+                aligned, aligned_valid, previous_action, gyro)
+        elif self.config.derotate_scan_history:
             metric, valid = self._align_history(metric, valid, gyro)
         normalized = metric / LIDAR_MAX_M
         newest = normalized[:, -1:]
@@ -384,9 +644,19 @@ class OdometryHead(nn.Module):
             [normalized, difference, valid.float()], dim=1))
         scan_features = self.scan_projection(encoded)
         motion = torch.cat((gyro, previous_action.flatten(1)), dim=1)
-        hidden = self.trunk(torch.cat(
-            (scan_features, self.motion_encoder(motion)), dim=1))
+        parts = [scan_features, self.motion_encoder(motion)]
+        if vote_features is not None:
+            parts.append(vote_features)
+        hidden = self.trunk(torch.cat(parts, dim=1))
         overlap = (valid[:, -2] & valid[:, -1]).float().mean(1, keepdim=True)
+        if sharpness is not None:
+            # The gate's question is "is this scan evidence about my motion?"
+            # and peak sharpness answers it geometrically: a corridor's ridge
+            # and a corner's peak are the same argmax and different evidence.
+            # Unlike the learned gate, this reaches the confidence head without
+            # passing through a proposal initialized near zero, so it carries
+            # gradient from the first step.
+            overlap = torch.cat([overlap, sharpness], dim=1)
         return hidden, overlap
 
     def _outputs(self, hidden: torch.Tensor, overlap: torch.Tensor
@@ -403,8 +673,12 @@ class OdometryHead(nn.Module):
             [hidden, overlap], dim=1)))
         # Observability is a hard constraint, not something training may learn
         # around. With no overlapping returns the result is exactly the command
-        # prior even if a confidence bias later drifts upward.
-        confidence = confidence * (overlap / 0.5).clamp(0.0, 1.0)
+        # prior even if a confidence bias later drifts upward. Column 0 is the
+        # both-frames-valid fraction; a vote checkpoint carries peak sharpness
+        # beside it, which the learned gate reads but the hard clamp does not --
+        # a hard floor on sharpness would suppress the open-room case the
+        # residual design already handles by falling back to the command.
+        confidence = confidence * (overlap[:, :1] / 0.5).clamp(0.0, 1.0)
         variance = (F.softplus(self.variance_head(hidden)) + 1.0e-7).clamp(
             1.0e-7, 0.05 ** 2)
         return proposal, variance, confidence.squeeze(1)
@@ -588,15 +862,48 @@ class BeliefNavPolicy(nn.Module):
     @staticmethod
     def _propagate_covariance(covariance: torch.Tensor,
                               motion_variance: torch.Tensor,
-                              delta_yaw: torch.Tensor) -> torch.Tensor:
-        """Rotate a 2-D covariance and add translation process variance."""
+                              delta_yaw: torch.Tensor,
+                              drift_variance: torch.Tensor | None = None
+                              ) -> torch.Tensor:
+        """Rotate a 2-D covariance and add translation process variance.
+
+        ``motion_variance`` is the per-step term the variance head declares, and
+        summing it down the episode is a random walk. ``drift_variance`` is the
+        separate, isotropic contribution of a *systematic* scale error, which
+        grows with distance travelled rather than with step count. Both are
+        needed: without the second the declared bound falls behind the true
+        error by roughly the square root of the episode length. Measured on
+        ``belief_onpolicy_v15`` with the random-walk term alone, the true error
+        was 8.8x the declared sigma and the 1.96-sigma bound covered 9.5% of
+        steps instead of 95%.
+        """
         cos, sin = torch.cos(delta_yaw), torch.sin(delta_yaw)
         rotation = torch.stack([
             torch.stack([cos, sin], dim=1),
             torch.stack([-sin, cos], dim=1),
         ], dim=1)
         process = torch.diag_embed(motion_variance)
-        return rotation @ covariance @ rotation.transpose(1, 2) + process
+        rotated = rotation @ covariance @ rotation.transpose(1, 2) + process
+        if drift_variance is None:
+            return rotated
+        return rotated + torch.diag_embed(
+            drift_variance[:, None].expand(-1, 2))
+
+    def _drift_variance(self, travelled: torch.Tensor,
+                        step_length: torch.Tensor) -> torch.Tensor:
+        """Variance a scale error adds over one step, given distance so far.
+
+        A relative scale uncertainty ``eps`` puts the standard deviation at
+        ``eps * s`` after travelling ``s``, so the *variance* increment across a
+        step is ``eps^2 * ((s + ds)^2 - s^2)``. Writing it as a difference of
+        squares rather than as ``eps^2 * ds^2`` is the whole point: the cross
+        term ``2 s ds`` is what makes the error accumulate linearly in distance
+        instead of as a random walk, and dropping it is exactly the mistake the
+        random-walk model makes.
+        """
+        epsilon = self.config.drift_scale_uncertainty
+        advanced = travelled + step_length
+        return (epsilon ** 2) * (advanced.square() - travelled.square())
 
     @staticmethod
     def _largest_covariance_eigenvalue(covariance: torch.Tensor) -> torch.Tensor:
@@ -650,13 +957,23 @@ class BeliefNavPolicy(nn.Module):
                    arrival_count: torch.Tensor, lidar: torch.Tensor,
                    raw_lidar: torch.Tensor, raw_valid: torch.Tensor,
                    gyro: torch.Tensor, previous_action: torch.Tensor,
-                   calibration: torch.Tensor | None = None):
+                   calibration: torch.Tensor | None = None,
+                   travelled: torch.Tensor | None = None):
         """Deployable recurrent step with uncertainty-aware arrival.
 
         Returns ``(command, arrived, belief, covariance, arrival_count,
-        scan_confidence)``. All state is explicit; no pose or wheel odometry is
+        scan_confidence)``, followed by ``calibration`` and ``travelled`` when
+        those were supplied. All state is explicit; no pose or wheel odometry is
         accepted by this interface.
+
+        ``travelled`` is cumulative path length and is required when the
+        checkpoint declares a ``drift_scale_uncertainty``. One float is the
+        whole cost of the systematic term in :meth:`_drift_variance`, and it
+        stays outside the quantized graph for the same reason the belief does.
         """
+        if travelled is None and self.config.drift_scale_uncertainty > 0.0:
+            raise ValueError(
+                "a drift-aware checkpoint requires carried travelled distance")
         if calibration is None:
             if (self.config.persistent_calibration
                     or self.config.motion_state_size > 0):
@@ -671,8 +988,14 @@ class BeliefNavPolicy(nn.Module):
                     raw_lidar, raw_valid))
         delta_yaw = gyro[:, -1]
         belief = compose_belief(belief, translation, delta_yaw)
+        step_length = torch.linalg.vector_norm(translation, dim=1)
+        drift = None
+        if travelled is not None and self.config.drift_scale_uncertainty > 0.0:
+            drift = self._drift_variance(travelled, step_length)
         covariance = self._propagate_covariance(
-            covariance, variance, delta_yaw)
+            covariance, variance, delta_yaw, drift)
+        if travelled is not None:
+            travelled = travelled + step_length
         command = self.actor(self.observation(lidar, belief, previous_action))
 
         largest_variance = self._largest_covariance_eigenvalue(covariance)
@@ -692,7 +1015,9 @@ class BeliefNavPolicy(nn.Module):
         command = torch.where(arrived[:, None], torch.zeros_like(command), command)
         result = (command, arrived, belief, covariance, arrival_count,
                   confidence)
-        return result if calibration is None else result + (calibration,)
+        if calibration is not None:
+            result = result + (calibration,)
+        return result if travelled is None else result + (travelled,)
 
     def rollout(self, lidar: torch.Tensor, gyro: torch.Tensor,
                 previous_action: torch.Tensor, belief0: torch.Tensor,
@@ -806,6 +1131,11 @@ class BeliefNavPolicy(nn.Module):
         count = torch.zeros(goal_body.shape[0], dtype=torch.long,
                             device=goal_body.device)
         return belief, covariance, count
+
+    def initial_travel(self, goal_body: torch.Tensor) -> torch.Tensor:
+        """Zero path length at reset, which is when the belief is exact."""
+        return torch.zeros(goal_body.shape[0], device=goal_body.device,
+                           dtype=goal_body.dtype)
 
     def initial_calibration(self, goal_body: torch.Tensor) -> torch.Tensor:
         """Zero scale correction is exact command dead reckoning at reset."""

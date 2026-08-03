@@ -502,8 +502,74 @@ to be meaningful and cannot be turned on with `--resume`.
 |---|---|
 | `--derotate-scan-history` | gyro-aligns every frame into the newest frame's bearing grid before encoding. Measured: **no material gain** (8.53 vs 8.56 cm paired, 8.51 vs 8.76 cm on the trainer's own validation). Correct and cheap, but not the constraint. |
 | `--scaled-scan-difference` | masks the cross-frame range difference to bearings valid in both frames and scales it by per-window travel instead of `LIDAR_MAX_M`. **No result yet.** |
-| `--confidence-coef` | ranks the confidence gate on matched vs mismatched scans. Without it the gate's gradient is ~740× below the proposal head's and it never leaves its initialization. **No result yet.** |
+| `--confidence-coef` | ranks the confidence gate on matched vs mismatched scans. Without it the gate's gradient is ~740× below the proposal head's and it never leaves its initialization. Run: `belief_gate_v21`, **8.95 cm** trainer validation against 8.76 (v19 control) and 8.51 (v19 derotated). The diagnosis of the starvation stands; fixing it did not move the number. |
 | `--confidence-gate-bias` | initial gate bias, default −2.0 (= 0.119). Does not fix the starvation on its own. |
+| `--scan-vote-bins` | the consensus scan vote, on a BINS×BINS candidate grid. This is the replacement for the 24-sector pooling; see below. Needs `--reset-odometry` because it widens the trunk input. |
+| `--scan-vote-sigma` | consensus kernel width, default 0.01 m. Measured best at both 0× and 1× sensor noise; 0.03 admits too many bearings as inliers and costs accuracy. |
+
+### The scan vote
+
+The 2026-08-02 log left the 24-sector average pooling as the prime suspect and
+`scripts/probe_scan_vote.py` settled it. On `belief_onpolicy_v15` at 1× noise,
+per-tick, against ground truth:
+
+| estimator | drift | scatter | mean error |
+|---|---:|---:|---:|
+| command dead reckoning | 2.10 cm/m | 0.10 cm | 0.08 cm |
+| **consensus vote** | **0.96 cm/m** | 0.57 cm | 0.44 cm |
+| least squares, same residuals | 89.3 cm/m | 11.0 cm | 7.65 cm |
+| estimating zero | 100.0 cm/m | 0.73 cm | 1.90 cm |
+
+Least squares reproduces the ICP failure the 08-02 log recorded (correlation
+0.084 here, +0.089 there) **on the identical residuals the vote succeeds on**,
+which locates the problem in the estimator rather than in the data. Roughly a
+quarter to a third of bearings are gross outliers at depth edges; a squared
+residual is unbounded so each one relocates the minimum, while a bounded
+agreement kernel lets them abstain.
+
+Two things that matter and are easy to get wrong:
+
+* **refine the peak locally.** A soft-argmax over the whole grid is pulled
+  toward the grid centre by the surface's pedestal, and because the grid is
+  centred on zero while the robot is really moving forward, that shrinkage is a
+  systematic *underestimate of travel* — the component that integrates into
+  drift rather than averaging out. Windowing cut drift from 1.30 to 0.96 cm/m.
+* **do not lengthen the baseline.** It looks like free signal, since
+  displacement grows with the gap while range noise does not. Measured: 0.96
+  cm/m at gap 1, 10.8 at gap 2, 81 at gap 4. The range-flow model is
+  first-order in displacement and compares equal bearings, and both assumptions
+  fail once the robot has moved far enough to shift content between bearings.
+
+Grid resolution is a mild knob: 1.10 cm/m at 21 bins, 1.04 at 31, 0.91 at 41,
+costing 0.42 / 0.86 / 1.43 ms of single-threaded CPU.
+
+### Honest arrival uncertainty
+
+`scripts/probe_arrival_honesty.py` measures whether the covariance describes the
+belief error. On `iter_1130.pt` it did not, by a wide margin: true error 8.8×
+the declared 1-sigma, and the 1.96-sigma bound the arrival test uses covered
+**9.5%** of steps instead of 95%. That is the mechanism behind declaring arrival
+at a true 31–34 cm.
+
+The cause is a model-form error, not a training one. `belief_losses` calibrates
+the variance head against *per-step* squared error and `_propagate_covariance`
+sums those independently, which is a random walk; the dominant error is a
+systematic scale error that grows linearly in distance. `drift_scale_uncertainty`
+adds that term, carrying cumulative path length as one more float of explicit
+state:
+
+| `drift_scale_uncertainty` | error / declared σ | 1.96σ coverage |
+|---|---:|---:|
+| 0.0 (existing checkpoints) | 8.76 | 9.5% |
+| 0.03 | 1.46 | 78.3% |
+| **0.05** | **0.96** | **94.2%** |
+
+0.05 is the calibrated setting for the current estimator. Note what it costs: the
+bound widens by `1.96 * 0.05 * s`, or 49 cm after five metres, so a calibrated
+robot **declines to declare arrival** on a long episode rather than declaring it
+wrongly. That converts false arrivals into timeouts, which is the right trade for
+hardware, but it does not manufacture accuracy — the 85% correct-arrival gate
+needs an estimator that drifts less, not a wider bound.
 
 One run holds ~16 GB, so do not run two on a 24 GB card. About 1,900 updates at
 roughly 2 steps/s on `belief_onpolicy_v15` at batch 8.
@@ -618,8 +684,52 @@ measured sim-to-real result.
 
 # Phase 5 — Export and deploy
 
-*(Not yet built. ExecuTorch export, INT8 calibration, C++ node, and the
-preprocessing parity test.)*
+The graph half is built and runs on the training host. INT8 calibration, the
+C++ node and the on-board lowering are not.
+
+## 1. Export the deployable step and check it
+
+```bash
+.venv/bin/python scripts/export_belief.py runs/belief_vote_v22/final.pt \
+    --out runs/belief_vote_v22/export
+```
+
+`torch.export` is the exact front end `to_edge_transform_and_lower` consumes, so
+signature and operator problems surface here rather than on the board. The
+script writes `belief_step.pt2` plus an `export_report.json` carrying the full
+operator histogram, and it **fails** if the exported program does not reproduce
+the eager module on adversarial state — non-trivial belief, inflated covariance,
+a partly elapsed arrival count and a scan with 25% missing returns.
+
+Measured on `belief_ppo_biasfix_v14/iter_1130.pt`: 41 distinct operators,
+491,159 parameters, parity exactly 0.0, and 0.69 ms median host-CPU latency
+against a 50 ms control period. The latency figure is a proxy for the budget,
+not a board measurement.
+
+### The scan vote stays out of the graph
+
+`--include-vote` exists to measure what including it costs, not to ship it.
+`ScanVote` holds no parameters — it is fixed geometry, the same status the
+deskew and the angular binning already have, and those live in the C++ node's
+preprocessing translation unit. Tracing it in adds `gather`, `cumsum`, `flip`,
+`remainder`, `floor` and a `set_grad_enabled` higher-order wrapper (41 → 56
+operators), none of which the reference models proved delegated. It is also an
+argmax over a surface measuring centimetres, which is not a thing to quantize.
+
+It costs 0.42 ms single-threaded at 21 bins and 0.86 ms at 31, so it fits the
+preprocessing budget comfortably.
+
+## 2. Still to build
+
+INT8 calibration from the final policy's own state distribution, the QNN
+lowering on the board, the C++ node, and the preprocessing parity test against
+it. `archive/v1-numpy-pipeline` holds a working version of all four —
+`tools/export_qnn.py`, `tools/parity_check.py`,
+`ros_ws/src/nav_policy_node/src/preprocess_parity.cpp` — and
+`docs/deployment.md` on that branch carries the board-specific facts (QNN SDK
+2.48, the two load-bearing ExecuTorch patches, `--soc-model QCS8300`, the
+semicolon-separated `ADSP_LIBRARY_PATH`). The quantization gate there is a
+**sim success-rate drop under 2 points**, not an action MSE.
 
 ---
 

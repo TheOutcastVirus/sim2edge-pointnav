@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from sim2edge.models import (BeliefNavPolicy, BeliefNavPolicyConfig, NavPolicy,
+                             ScanVote,
                              OdometryHead,
                              NavPolicyConfig, compose_belief)
 from sim2edge.preprocess import goal_features, relative_goal_features
@@ -691,3 +692,240 @@ def test_confidence_ranking_loss_is_zero_once_the_gate_separates():
     _, flat = belief_losses(policy, _synthetic_sequence_batch(), config)
     assert float(flat["confidence_loss"]) == pytest.approx(
         config.confidence_margin, abs=1e-3)
+
+
+# ── the scan vote ────────────────────────────────────────────────────────────
+#
+# These tests pin the *reason* the vote exists rather than its shapes. The
+# design claim is specifically that agreement-counting survives the gross
+# outliers that defeat least squares, so the outlier test below runs both
+# estimators on identical residuals and requires them to disagree. If someone
+# ever swaps the vote for a solve because it "does the same thing more
+# directly", that test is what stops them.
+
+
+def _circular_room_scan(position: torch.Tensor, beams: int,
+                        radius: float = 4.0) -> torch.Tensor:
+    """Exact ranges from ``position`` inside a circle centred on the origin."""
+    angle = -math.pi + (torch.arange(beams, dtype=torch.float64) + 0.5) * (
+        2 * math.pi / beams)
+    b = position[0] * torch.cos(angle) + position[1] * torch.sin(angle)
+    c = position.square().sum() - radius ** 2
+    return (-b + torch.sqrt(b.square() - c)).float()
+
+
+def _vote_inputs(translation, beams=720, outlier_fraction=0.0, seed=0):
+    """Two analytic scans separated by ``translation``, optionally corrupted."""
+    start = torch.tensor([0.2, -0.3], dtype=torch.float64)
+    first = _circular_room_scan(start, beams)
+    second = _circular_room_scan(start + translation.double(), beams)
+    difference = (second - first)[None]
+    weight = torch.ones_like(difference)
+    if outlier_fraction > 0.0:
+        generator = torch.Generator().manual_seed(seed)
+        corrupt = torch.rand(beams, generator=generator) < outlier_fraction
+        # Depth edges: a surface visible in one frame and occluded in the next
+        # produces a range jump of order the room, not of order the motion.
+        jump = (torch.rand(beams, generator=generator) - 0.5) * 2.0
+        difference = torch.where(corrupt[None], jump[None], difference)
+    return difference, weight
+
+
+def _scan_vote(bins=41, sigma=0.01, radius=3):
+    return ScanVote(720, bins, 1.5 * V_MAX * DT, sigma, radius)
+
+
+def test_scan_vote_recovers_a_known_translation_in_a_clean_room():
+    truth = torch.tensor([0.019, 0.004])
+    estimate, _, sharpness = _scan_vote()(*_vote_inputs(truth))
+    torch.testing.assert_close(estimate, truth[None], atol=1.5e-3, rtol=0.0)
+    assert float(sharpness) > 0.05
+
+
+def test_scan_vote_survives_outliers_that_defeat_least_squares():
+    """The whole reason this is a vote and not a solve.
+
+    Thirty per cent of bearings are replaced with metre-scale jumps, which is
+    the depth-edge rate measured on ``belief_onpolicy_v15``. A squared residual
+    is unbounded, so those bearings relocate a least-squares minimum; a bounded
+    agreement kernel lets them abstain instead.
+    """
+    truth = torch.tensor([0.019, 0.004])
+    angle = -math.pi + (torch.arange(720, dtype=torch.float32) + 0.5) * (
+        2 * math.pi / 720)
+    direction = torch.stack([torch.cos(angle), torch.sin(angle)], dim=1)
+    vote = _scan_vote()
+
+    # Averaged over seeds: which bearings happen to be corrupted moves the
+    # least-squares answer a long way, and the point being pinned is the
+    # systematic difference between the estimators, not one draw of it.
+    vote_errors, solve_errors = [], []
+    for seed in range(5):
+        difference, weight = _vote_inputs(truth, outlier_fraction=0.3, seed=seed)
+        estimate, _, _ = vote(difference, weight)
+        solved = torch.linalg.lstsq(direction, -difference[0]).solution
+        vote_errors.append(float((estimate[0] - truth).norm()))
+        solve_errors.append(float((solved - truth).norm()))
+
+    worst_vote = max(vote_errors)
+    typical_solve = sorted(solve_errors)[len(solve_errors) // 2]
+    # The vote stays well inside a grid cell of the truth on every draw...
+    assert worst_vote < 5.0e-4, vote_errors
+    # ...while least squares is off by most of the signal it is measuring.
+    assert typical_solve > 5.0e-3, solve_errors
+    assert typical_solve > 20.0 * worst_vote
+
+
+def test_scan_vote_sharpness_falls_when_geometry_stops_constraining():
+    """Sharpness is an observability claim, so it must fail where geometry does.
+
+    What it detects is *how much bearing-diverse evidence there is*, which is
+    the quantity that decides whether the surface has an isolated peak. It does
+    not detect corruption: outliers add a pedestal that dividing by the peak
+    normalizes away, and 30% of them move sharpness by under 2%. Measured on
+    ``belief_onpolicy_v15`` it still correlates -0.46 with the vote's error,
+    because sparse returns are what actually go wrong in a real room.
+    """
+    truth = torch.tensor([0.015, 0.0])
+    vote = _scan_vote()
+    _, _, dense = vote(*_vote_inputs(truth))
+
+    difference, weight = _vote_inputs(truth)
+    weight = weight.clone()
+    weight[:, 60:] = 0.0            # one small arc still returning
+    _, _, sparse = vote(difference, weight)
+    assert float(sparse) < 0.5 * float(dense), (float(dense), float(sparse))
+
+
+def test_scan_vote_is_absent_by_default_and_costs_nothing():
+    """Every existing checkpoint keeps its exact architecture."""
+    assert BeliefNavPolicyConfig().scan_vote_bins == 0
+    assert BeliefNavPolicy(BeliefNavPolicyConfig()).odometry.vote is None
+    voting = BeliefNavPolicy(BeliefNavPolicyConfig(scan_vote_bins=21))
+    assert voting.odometry.vote is not None
+    assert (voting.odometry_parameter_count
+            > BeliefNavPolicy().odometry_parameter_count)
+
+
+def test_scan_vote_carries_no_parameters_and_no_gradient():
+    """It is fixed sensor processing, like the deskew, not a learned layer."""
+    vote = _scan_vote()
+    assert list(vote.parameters()) == []
+    difference, weight = _vote_inputs(torch.tensor([0.019, 0.0]))
+    difference.requires_grad_(True)
+    estimate, surface, sharpness = vote(difference, weight)
+    assert not estimate.requires_grad
+    assert not surface.requires_grad
+    assert not sharpness.requires_grad
+
+
+def test_vote_head_still_falls_back_to_dead_reckoning_without_returns():
+    """The fallback guarantee must survive the new branch."""
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(scan_vote_bins=21)).eval()
+    frames = policy.config.motion_history_frames
+    previous = torch.zeros(2, frames, 2)
+    previous[:, -1, 0] = 0.5
+    raw = torch.full((2, frames, 720), LIDAR_MAX_M)
+    valid = torch.zeros(2, frames, 720, dtype=torch.bool)
+    with torch.no_grad():
+        translation = policy.translation(
+            torch.zeros(2, 4, 180), torch.zeros(2, frames), previous, raw, valid)
+    expected = torch.tensor([[0.5 * V_MAX * DT, 0.0]]).repeat(2, 1)
+    torch.testing.assert_close(translation, expected, atol=1e-7, rtol=0.0)
+
+
+def test_vote_gradients_reach_the_trunk_through_the_surface_encoder():
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(scan_vote_bins=21))
+    frames = policy.config.motion_history_frames
+    torch.manual_seed(5)
+    raw = torch.rand(2, frames, 720) * 4.0 + 0.5
+    valid = torch.ones(2, frames, 720, dtype=torch.bool)
+    policy.translation(torch.rand(2, 4, 180), torch.randn(2, frames) * 0.02,
+                       torch.rand(2, frames, 2), raw, valid).sum().backward()
+    gradient = policy.odometry.vote_encoder[0].weight.grad
+    assert gradient is not None and float(gradient.abs().sum()) > 0.0
+
+
+# ── honest uncertainty ───────────────────────────────────────────────────────
+
+
+def test_drift_variance_accumulates_linearly_in_distance():
+    """The property the random-walk term cannot have.
+
+    A scale error is systematic, so its standard deviation must grow in
+    proportion to distance travelled. Summing independent per-step variances
+    grows as the square root instead, which is precisely how the declared bound
+    fell 8.8x behind the true error.
+    """
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        drift_scale_uncertainty=0.03))
+    step, steps = 0.02, 50
+    travelled = torch.zeros(1)
+    variance = torch.zeros(1)
+    for _ in range(steps):
+        variance = variance + policy._drift_variance(
+            travelled, torch.full((1,), step))
+        travelled = travelled + step
+    # sigma == eps * distance, exactly.
+    expected = 0.03 * step * steps
+    torch.testing.assert_close(variance.sqrt(), torch.tensor([expected]),
+                               atol=1e-7, rtol=0.0)
+    # And it is genuinely superlinear against a random walk of the same steps.
+    random_walk = (0.03 * step) * math.sqrt(steps)
+    assert float(variance.sqrt()) > 5.0 * random_walk
+
+
+def test_drift_term_is_absent_by_default_and_changes_nothing():
+    assert BeliefNavPolicyConfig().drift_scale_uncertainty == 0.0
+    policy = BeliefNavPolicy().eval()
+    belief, covariance, count = policy.initial_state(torch.zeros(2, 2))
+    variance = torch.full((2, 2), 1e-4)
+    delta_yaw = torch.tensor([0.1, -0.2])
+    with_none = policy._propagate_covariance(covariance, variance, delta_yaw)
+    with_zero = policy._propagate_covariance(
+        covariance, variance, delta_yaw, torch.zeros(2))
+    torch.testing.assert_close(with_none, with_zero, atol=0.0, rtol=0.0)
+
+
+def test_drift_aware_checkpoint_refuses_to_run_without_carried_distance():
+    """Silently dropping the state would restore the old, dishonest bound."""
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        drift_scale_uncertainty=0.03)).eval()
+    belief, covariance, count = policy.initial_state(torch.zeros(1, 2))
+    frames = policy.config.motion_history_frames
+    with pytest.raises(ValueError, match="travelled"):
+        policy.step_state(
+            belief, covariance, count, torch.zeros(1, 4, 180),
+            torch.full((1, frames, 720), LIDAR_MAX_M),
+            torch.zeros(1, frames, 720, dtype=torch.bool),
+            torch.zeros(1, frames), torch.zeros(1, frames, 2))
+
+
+def test_carried_distance_widens_the_arrival_bound_with_travel():
+    """Two robots, same belief, different history: the further one is less sure."""
+    policy = BeliefNavPolicy(BeliefNavPolicyConfig(
+        drift_scale_uncertainty=0.03)).eval()
+    frames = policy.config.motion_history_frames
+    belief, covariance, count = policy.initial_state(torch.zeros(2, 2))
+    previous = torch.zeros(2, frames, 2)
+    previous[:, -1, 0] = 0.5
+    travelled = torch.tensor([0.0, 5.0])
+    with torch.no_grad():
+        result = policy.step_state(
+            belief, covariance, count, torch.zeros(2, 4, 180),
+            torch.full((2, frames, 720), LIDAR_MAX_M),
+            torch.zeros(2, frames, 720, dtype=torch.bool),
+            torch.zeros(2, frames), previous, travelled=travelled)
+    covariance = result[3]
+    sigma = policy._largest_covariance_eigenvalue(covariance).sqrt()
+    # At zero travel the bound is the variance head's floor (~0.25 cm); five
+    # metres in, the systematic term dominates it several times over. The ratio
+    # is not larger only because a single step is being compared -- the point is
+    # that identical sensors and an identical belief produce different
+    # confidence purely because of how far the robot has come.
+    assert float(sigma[1]) > 3.5 * float(sigma[0])
+    # The carried distance advances by the step actually taken. The tolerance
+    # is float32 accumulation against a five-metre base, not model error.
+    torch.testing.assert_close(result[-1] - travelled,
+                               torch.full((2,), 0.5 * V_MAX * DT),
+                               atol=1e-6, rtol=0.0)
