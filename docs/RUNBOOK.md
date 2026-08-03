@@ -622,8 +622,12 @@ measure the misalignment that remains. A correct reconstruction answers zero.
 
 | | 0x sensor noise | 1x sensor noise |
 |---|---:|---:|
-| baseline 1 tick | **0.665 cm** | 0.629 cm |
-| baseline 4 ticks | **7.81 cm** | 7.13 cm |
+| baseline 1 tick | **1.095 cm** | 0.862 cm |
+| baseline 4 ticks | **8.560 cm** | 9.051 cm |
+| baseline 9 ticks | **23.045 cm** | 23.672 cm |
+
+against a matcher floor of 0.21-0.27 cm measured on analytic rooms at the same
+settings, so this is the reconstruction and not the instrument.
 
 Sensor noise is irrelevant — the two columns agree, so this is the
 reconstruction disagreeing with itself. And the 4-tick figure is the sweep
@@ -646,10 +650,33 @@ information than this simulator supplies. The conclusion is not that lidar
 cannot measure ego-motion here; it is that this corpus cannot answer the
 question.
 
-Fix `sensors.py` first — sub-tick beam placement, deskew against the true
-elapsed interval — then recollect, then re-run the estimator comparison. The
-acceptance test is the table above. `probe_correlative_match.py` and
-`probe_scan_to_map.py` reproduce it.
+**Sub-tick beam placement was tried and does not fix it.**
+`SIM2EDGE_SUBTICK_SWEEP=1` interpolates both the range and the motion
+correction at each beam's true acquisition time, kept consistent with each
+other (`sensors.sweep_scan(subtick=)`, `sensors.deskew_history(subtick=)`). It
+measures 1.151 / 9.251 / 22.056 cm — no change. Beam-age quantization is a real
+approximation and is not the binding one. The flag stays, off by default and
+tested, on the same footing as `--derotate-scan-history`.
+
+Ruled out so far: sensor noise (0x and 1x agree), beam-age quantization
+(measured), and search failure in the instrument (the fixed +/-10 cm extent in
+the probe's first version, now scaled to the baseline).
+
+Next candidate, with arithmetic but not yet a measurement: `rasterize_lidar`
+snaps every deskewed return back onto a fixed 720-bin grid. At the corpus's
+median valid range of 1.23 m one 0.5 deg bin subtends 1.08 cm of arc, so uniform
+quantization contributes 0.311 cm RMS -- a third of the measured floor, and
+already 4x the slip signal on its own. That is a representation fix rather than
+a sensor fix: keep the deskewed `(range, exact bearing)` pairs for the
+estimator instead of re-binning, since only the actor's 180-bin observation
+needs a grid.
+
+Run the acceptance test before and after any change here:
+
+```bash
+PYTHONPATH=scripts .venv/bin/python scripts/probe_sensor_consistency.py \
+    --data data/belief_onpolicy_v15
+```
 
 ### Honest arrival uncertainty
 

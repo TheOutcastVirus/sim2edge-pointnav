@@ -14,6 +14,8 @@ time and spend more wall clock in kernel launches than in arithmetic.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
@@ -26,6 +28,15 @@ from . import noise as noise_mod
 from .preprocess import (bin_lidar, build_observation, goal_features,
                          rasterize_lidar, wrap_angle)
 from .sensors import deskew_history, sweep_scan
+
+#: Reconstruct each sweep at sub-tick resolution rather than rounding every
+#: beam's acquisition time to the nearest stored scan. Off by default so every
+#: existing corpus reads back bit-identically; see ``sensors.sweep_scan`` for
+#: the 0.665 cm / 7.8 cm frame inconsistency that motivates turning it on, and
+#: ``scripts/probe_sensor_consistency.py`` for the acceptance measurement.
+#: Set by SIM2EDGE_SUBTICK_SWEEP=1 so a probe can flip it without a config
+#: migration on every checkpoint.
+SUBTICK_SWEEP = os.environ.get("SIM2EDGE_SUBTICK_SWEEP", "0") == "1"
 from .spec import (DESKEW_WITH_GYRO, DT, HISTORY_FRAMES, LIDAR_SPIN_HZ,
                    MOTION_HISTORY_FRAMES, OMEGA_MAX, SPIN_TICKS, V_MAX,
                    fingerprint)
@@ -332,7 +343,8 @@ class Shard:
         flat_windows = windows.reshape(n * outputs, SPIN_TICKS, beams)
         j = torch.arange(SPIN_TICKS - 1, width, device=device)
         phase = ((phase0[:, None] + LIDAR_SPIN_HZ * DT * j[None]) % 1.0)
-        swept, ages = sweep_scan(flat_windows, phase.reshape(-1))
+        swept, ages = sweep_scan(flat_windows, phase.reshape(-1),
+                                 subtick=SUBTICK_SWEEP)
         frame_angles = angles[:, SPIN_TICKS - 1:].reshape(n * outputs, beams)
         if DESKEW_WITH_GYRO:
             gyro_windows = gyro_all.unfold(1, SPIN_TICKS, 1)
@@ -342,7 +354,8 @@ class Shard:
             ].reshape(n * outputs, SPIN_TICKS)
             swept, frame_angles = deskew_history(
                 swept, frame_angles, ages,
-                gyro_windows.reshape(n * outputs, SPIN_TICKS), speed_windows)
+                gyro_windows.reshape(n * outputs, SPIN_TICKS), speed_windows,
+                subtick=SUBTICK_SWEEP)
         binned = bin_lidar(swept, frame_angles).reshape(n, outputs, -1)
         metric, metric_valid = rasterize_lidar(swept, frame_angles, beams)
         metric = metric.reshape(n, outputs, beams)
@@ -534,7 +547,8 @@ class Shard:
             history.float() * (LIDAR_SPIN_HZ * DT)
             + self.episode[history].float() * 0.61803398875
         ).remainder(1.0)
-        swept, ages = sweep_scan(flat_windows, phase.reshape(-1))
+        swept, ages = sweep_scan(flat_windows, phase.reshape(-1),
+                                 subtick=SUBTICK_SWEEP)
         frame_angles = angles[:, SPIN_TICKS - 1:].reshape(
             n * HISTORY_FRAMES, beams)
         if DESKEW_WITH_GYRO:

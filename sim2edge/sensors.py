@@ -48,11 +48,19 @@ from .noise import (GYRO_ARW_RAD_PER_SQRT_S, GYRO_BIAS_RAD_S,
 from .preprocess import wrap_angle
 from .spec import DT, LIDAR_SPIN_HZ, SPIN_TICKS
 
-__all__ = ["SPIN_PERIOD_S", "beam_ages", "advance_phase", "sweep_scan",
-           "deskew", "deskew_history", "GyroModel", "synthesize_gyro"]
+__all__ = ["SPIN_PERIOD_S", "EDGE_TOLERANCE_M", "beam_ages", "advance_phase",
+           "sweep_scan", "deskew", "deskew_history", "GyroModel",
+           "synthesize_gyro"]
 
 #: Seconds per revolution. The quantity every function here is really about.
 SPIN_PERIOD_S = 1.0 / LIDAR_SPIN_HZ
+
+#: Above this, two stored samples of one bearing are a depth discontinuity
+#: rather than the same surface seen from two poses, and interpolating between
+#: them would invent a return in free space. A control tick covers at most
+#: ``V_MAX * DT`` = 2.3 cm of range change on a surface facing the robot, so
+#: 25 cm is an order of magnitude of headroom over real motion.
+EDGE_TOLERANCE_M = 0.25
 
 
 def beam_ages(phase: torch.Tensor, beams: int) -> torch.Tensor:
@@ -81,8 +89,8 @@ def advance_phase(phase: torch.Tensor, dt: float = DT) -> torch.Tensor:
     return (phase + LIDAR_SPIN_HZ * dt) % 1.0
 
 
-def sweep_scan(ranges_history: torch.Tensor,
-               phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def sweep_scan(ranges_history: torch.Tensor, phase: torch.Tensor,
+               subtick: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Stitch one revolution out of stored instantaneous scans.
 
     ``ranges_history`` is ``(N, K, B)``, oldest to newest, where ``K`` is at
@@ -96,10 +104,26 @@ def sweep_scan(ranges_history: torch.Tensor,
     *implicit* in the result rather than synthesized on top of it, which is why
     there is no reprojection step here and no appeal to ground-truth pose.
 
-    Quantizing acquisition time to the nearest stored tick costs at most half a
-    control period of age, or 25 ms -- against beam ages that span 182 ms. The
-    alternative is re-raycasting per beam sector, which costs a full extra
-    sensor update per sub-tick for an error already well under the range noise.
+    Rounding acquisition time to the nearest stored tick was originally priced
+    at "half a control period, or 25 ms -- well under the range noise". That
+    reasoning compares the error against *range* noise, and the quantity this
+    sensor feeds is *ego-motion*, where 25 ms is 1.15 cm at full speed against a
+    per-tick slip signal of 0.078 cm. Measured on ``belief_onpolicy_v15``: two
+    reconstructed frames placed by the **true** relative pose, at **zero** sensor
+    noise, still disagree by 0.665 cm one tick apart and 7.8 cm four ticks apart
+    -- the latter being the 8.4 cm a full revolution covers. That is the ceiling
+    every estimator in Phase 4 ran into.
+
+    ``subtick`` interpolates between the two stored scans bracketing each beam's
+    true acquisition time instead. Interpolating a range across a depth
+    discontinuity would invent a surface that exists at neither time, so it is
+    applied only where the two agree to within ``EDGE_TOLERANCE_M``; at an edge
+    the nearer sample is taken unchanged, which is the honest answer.
+
+    **This must move together with** :func:`deskew_history`. A beam's range and
+    the motion correction applied to it have to refer to the same instant: today
+    both round, which is at least self-consistent. Interpolating one alone is
+    strictly worse than rounding both.
     """
     n, k, beams = ranges_history.shape
     if k < SPIN_TICKS:
@@ -108,15 +132,33 @@ def sweep_scan(ranges_history: torch.Tensor,
             f"{SPIN_TICKS} ticks of scan history, got {k}")
 
     ages = beam_ages(phase, beams)                       # (N, B) seconds
-    # Ticks back from the newest frame, rounded to the nearest stored scan.
-    back = torch.round(ages / DT).long().clamp_(0, k - 1)
-    frame = (k - 1) - back                               # (N, B) into history
-    # Advanced indexing rather than gather: each (env, beam) pair selects its
-    # own frame, so the index is genuinely two-dimensional and gather would need
-    # a full expand over the beam axis to say the same thing.
     env = torch.arange(n, device=ranges_history.device)[:, None]
     beam = torch.arange(beams, device=ranges_history.device)[None, :]
-    return ranges_history[env, frame, beam], ages
+
+    if not subtick:
+        # Ticks back from the newest frame, rounded to the nearest stored scan.
+        back = torch.round(ages / DT).long().clamp_(0, k - 1)
+        frame = (k - 1) - back                           # (N, B) into history
+        # Advanced indexing rather than gather: each (env, beam) pair selects
+        # its own frame, so the index is genuinely two-dimensional and gather
+        # would need a full expand over the beam axis to say the same thing.
+        return ranges_history[env, frame, beam], ages
+
+    exact = (ages / DT).clamp(0.0, k - 1.0)
+    lower = exact.floor()
+    fraction = exact - lower
+    low = lower.long().clamp(0, k - 1)
+    high = (low + 1).clamp(max=k - 1)
+    near = ranges_history[env, (k - 1) - low, beam]
+    far = ranges_history[env, (k - 1) - high, beam]
+
+    blended = near + fraction * (far - near)
+    # A depth edge is where the two brackets disagree by more than any real
+    # motion could explain. Blending there manufactures a return in free space.
+    edge = (far - near).abs() > EDGE_TOLERANCE_M
+    both_finite = torch.isfinite(near) & torch.isfinite(far)
+    nearest = torch.where(fraction < 0.5, near, far)
+    return torch.where(edge | ~both_finite, nearest, blended), ages
 
 
 def deskew(ranges: torch.Tensor, angles: torch.Tensor, ages: torch.Tensor,
@@ -165,7 +207,7 @@ def deskew(ranges: torch.Tensor, angles: torch.Tensor, ages: torch.Tensor,
 
 def deskew_history(ranges: torch.Tensor, angles: torch.Tensor,
                    ages: torch.Tensor, gyro_increment: torch.Tensor,
-                   forward_speed: torch.Tensor
+                   forward_speed: torch.Tensor, subtick: bool = False
                    ) -> tuple[torch.Tensor, torch.Tensor]:
     """Deskew with the piecewise motion actually measured over a revolution.
 
@@ -205,10 +247,29 @@ def deskew_history(ranges: torch.Tensor, angles: torch.Tensor,
             heading = heading + gyro_increment[:, index]
         dx[:, back], dy[:, back], yaw[:, back] = x, y, heading
 
-    back = torch.round(ages / DT).long().clamp_(0, k - 1)
-    beam_dx = torch.gather(dx, 1, back)
-    beam_dy = torch.gather(dy, 1, back)
-    beam_yaw = torch.gather(yaw, 1, back)
+    if subtick:
+        # Interpolate the accumulated transform at the beam's true age. Unlike
+        # ranges these quantities are smooth in time -- they are integrals of
+        # velocity -- so linear interpolation is exact to second order and has
+        # no depth-edge analogue. This must be enabled together with
+        # ``sweep_scan(subtick=True)``: the range and the correction applied to
+        # it have to refer to the same instant.
+        exact = (ages / DT).clamp(0.0, k - 1.0)
+        lower = exact.floor()
+        fraction = exact - lower
+        low = lower.long().clamp(0, k - 1)
+        high = (low + 1).clamp(max=k - 1)
+
+        def at(table: torch.Tensor) -> torch.Tensor:
+            near = torch.gather(table, 1, low)
+            return near + fraction * (torch.gather(table, 1, high) - near)
+
+        beam_dx, beam_dy, beam_yaw = at(dx), at(dy), at(yaw)
+    else:
+        back = torch.round(ages / DT).long().clamp_(0, k - 1)
+        beam_dx = torch.gather(dx, 1, back)
+        beam_dy = torch.gather(dy, 1, back)
+        beam_yaw = torch.gather(yaw, 1, back)
 
     finite = torch.isfinite(ranges)
     safe = torch.where(finite, ranges, torch.zeros_like(ranges))

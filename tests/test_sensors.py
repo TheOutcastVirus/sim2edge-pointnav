@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from sim2edge.preprocess import wrap_angle
-from sim2edge.sensors import (SPIN_PERIOD_S, GyroModel, advance_phase,
+from sim2edge.sensors import (EDGE_TOLERANCE_M, SPIN_PERIOD_S, GyroModel,
+                              advance_phase,
                               beam_ages, deskew, deskew_history, sweep_scan,
                               synthesize_gyro)
 from sim2edge.spec import DT, LIDAR_SPIN_HZ, SPIN_TICKS
@@ -237,3 +238,122 @@ def test_synthesize_gyro_zeroes_the_first_sample_of_each_episode():
     measured = synthesize_gyro(yaw, episode, scale=1.0,
                                generator=torch.Generator().manual_seed(0))
     assert torch.allclose(measured[torch.tensor([0, 20, 40])], torch.zeros(3))
+
+
+# ── sub-tick sweep reconstruction ────────────────────────────────────────────
+#
+# The acceptance criterion these serve is in
+# ``scripts/probe_sensor_consistency.py``: two reconstructed frames placed by
+# the *true* relative pose must agree to better than the 0.078 cm/tick slip
+# signal the estimator exists to measure. These tests pin the mechanism, not
+# that number, which needs a corpus.
+
+
+def test_subtick_sweep_is_off_by_default_and_reproduces_rounding():
+    """Every existing corpus must read back bit-identically."""
+    torch.manual_seed(0)
+    ranges = torch.rand(3, SPIN_TICKS, 720) * 3.0 + 1.0
+    phase = torch.rand(3)
+    rounded, ages = sweep_scan(ranges, phase)
+    default, _ = sweep_scan(ranges, phase, subtick=False)
+    torch.testing.assert_close(default, rounded, atol=0.0, rtol=0.0)
+
+
+def test_subtick_sweep_agrees_with_rounding_on_tick_boundaries():
+    """Where a beam's age lands exactly on a stored tick there is nothing to
+    interpolate, so the two paths must give the identical measurement."""
+    beams = 720
+    # Phase zero puts beam 0 at age 0 and every other beam at a fraction of a
+    # revolution; pick the beams whose age is an exact multiple of DT.
+    phase = torch.zeros(1)
+    ranges = torch.rand(1, SPIN_TICKS, beams) * 3.0 + 1.0
+    rounded, ages = sweep_scan(ranges, phase)
+    blended, _ = sweep_scan(ranges, phase, subtick=True)
+    exact = ages / DT
+    on_tick = (exact - exact.round()).abs() < 1e-6
+    assert bool(on_tick.any())
+    torch.testing.assert_close(blended[on_tick], rounded[on_tick],
+                               atol=1e-6, rtol=0.0)
+
+
+def test_subtick_sweep_interpolates_a_smoothly_approaching_surface():
+    """A wall closing at constant rate is exactly what interpolation is for."""
+    beams = 8
+    # Age of beam 0 at phase 0.5 is half a revolution = 1.82 ticks, so it falls
+    # between stored scans and must be blended rather than snapped.
+    near, far = 2.0, 2.4
+    ranges = torch.stack([
+        torch.full((beams,), far), torch.full((beams,), far * 0.75),
+        torch.full((beams,), far * 0.5), torch.full((beams,), near * 1.1),
+        torch.full((beams,), near),
+    ])[None]
+    phase = torch.full((1,), 0.5)
+    blended, ages = sweep_scan(ranges, phase, subtick=True)
+    rounded, _ = sweep_scan(ranges, phase)
+    exact = ages / DT
+    between = (exact - exact.round()).abs() > 0.2
+    assert bool(between.any())
+    # The blended value must lie strictly between the two bracketing samples,
+    # which the rounded one cannot do.
+    low = exact.floor().long().clamp(0, SPIN_TICKS - 1)
+    high = (low + 1).clamp(max=SPIN_TICKS - 1)
+    lo = ranges[0, (SPIN_TICKS - 1) - low[0], torch.arange(beams)]
+    hi = ranges[0, (SPIN_TICKS - 1) - high[0], torch.arange(beams)]
+    inside = ((blended[0] - torch.minimum(lo, hi) >= -1e-6)
+              & (torch.maximum(lo, hi) - blended[0] >= -1e-6))
+    assert bool(inside[between[0]].all())
+    assert not torch.equal(blended[between], rounded[between])
+
+
+def test_subtick_sweep_refuses_to_blend_across_a_depth_edge():
+    """Blending a wall against the corridor behind it invents free space.
+
+    A surface that disappears between two stored ticks is an occlusion change,
+    not the same surface seen twice, and the midpoint of 1 m and 6 m is a
+    return where nothing exists.
+    """
+    beams = 8
+    close, distant = 1.0, 6.0
+    assert distant - close > EDGE_TOLERANCE_M
+    ranges = torch.stack([
+        torch.full((beams,), distant), torch.full((beams,), distant),
+        torch.full((beams,), distant), torch.full((beams,), close),
+        torch.full((beams,), close),
+    ])[None]
+    blended, _ = sweep_scan(ranges, torch.full((1,), 0.5), subtick=True)
+    # Every value is one of the two real surfaces, never between them.
+    on_a_surface = (((blended - close).abs() < 1e-6)
+                    | ((blended - distant).abs() < 1e-6))
+    assert bool(on_a_surface.all()), blended
+
+
+def test_subtick_deskew_reduces_to_rounding_at_integer_ages():
+    """The transform interpolation must be consistent with the range sourcing."""
+    beams = 720
+    torch.manual_seed(1)
+    ranges = torch.rand(2, beams) * 3.0 + 1.0
+    angles = torch.linspace(-math.pi, math.pi, beams)
+    gyro = torch.randn(2, SPIN_TICKS) * 0.02
+    speed = torch.rand(2, SPIN_TICKS) * 0.4
+    # Ages that are exact multiples of a control period.
+    ages = (torch.arange(beams) % SPIN_TICKS).float()[None].repeat(2, 1) * DT
+    rounded = deskew_history(ranges, angles, ages, gyro, speed)
+    blended = deskew_history(ranges, angles, ages, gyro, speed, subtick=True)
+    for want, got in zip(rounded, blended):
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=0.0)
+
+
+def test_subtick_deskew_moves_a_beam_between_the_bracketing_corrections():
+    """A half-tick-old beam is corrected by about half a tick of motion."""
+    beams = 4
+    ranges = torch.full((1, beams), 2.0)
+    angles = torch.zeros(beams)
+    gyro = torch.zeros(1, SPIN_TICKS)
+    speed = torch.full((1, SPIN_TICKS), 0.4)
+    half = torch.full((1, beams), 1.5 * DT)
+    one = torch.full((1, beams), 1.0 * DT)
+    two = torch.full((1, beams), 2.0 * DT)
+    mid, _ = deskew_history(ranges, angles, half, gyro, speed, subtick=True)
+    near, _ = deskew_history(ranges, angles, one, gyro, speed, subtick=True)
+    far, _ = deskew_history(ranges, angles, two, gyro, speed, subtick=True)
+    assert float(far[0, 0]) < float(mid[0, 0]) < float(near[0, 0])
