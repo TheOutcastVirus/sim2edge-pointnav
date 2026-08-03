@@ -567,6 +567,27 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._room_path_length = torch.tensor(
             path_lengths, device=self.device, dtype=torch.float32)
 
+    def _sample_task(self, n: int):
+        """``(layout, start index, yaw)`` for ``n`` resetting environments.
+
+        One seam, drawn in one place, so that a caller which needs to *hold* any
+        of the three fixed -- the interactive viewer respawning a robot without
+        changing the room under it -- overrides this rather than reimplementing
+        the rest of ``_reset_idx``, which also reseeds every noise model and
+        clears every sensor history. Duplicating that is how a respawn quietly
+        stops resetting something.
+
+        Draw order is part of the contract: layout, start, yaw, in that order,
+        so an override that defers to this for the entries it does not pin
+        consumes the generator exactly as the production path does.
+        """
+        return (
+            torch.randint(0, self.cfg.num_layouts, (n,), device=self.device),
+            torch.randint(0, self.cfg.starts_per_layout, (n,),
+                          device=self.device),
+            torch.rand(n, device=self.device) * (2.0 * math.pi),
+        )
+
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
         n = len(env_ids)
@@ -574,7 +595,7 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         # New layout per environment. Reassigning here rather than pinning one
         # layout per env for the run means an env sees the whole pool over
         # training, so pool size sets diversity rather than num_envs.
-        layout = torch.randint(0, self.cfg.num_layouts, (n,), device=self.device)
+        layout, start_id, start_yaw = self._sample_task(n)
         self._layout[env_ids] = layout
 
         origins = self.scene.env_origins[env_ids]            # (n, 3)
@@ -599,12 +620,10 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         # fresh every episode. The old fixed start/yaw turned 500k episodes into
         # repetitions of only 512 task templates and produced 95% memorized / 37%
         # held-out success.
-        start_id = torch.randint(
-            0, self.cfg.starts_per_layout, (n,), device=self.device)
         self._start_id[env_ids] = start_id
         start = torch.empty(n, 3, device=self.device)
         start[:, :2] = self._room_starts[layout, start_id]
-        start[:, 2] = torch.rand(n, device=self.device) * (2.0 * math.pi)
+        start[:, 2] = start_yaw
         self._optimal_path_m[env_ids] = self._room_path_length[layout, start_id]
         root = self.robot.data.default_root_state[env_ids].clone()
         root[:, :2] = start[:, :2] + origins[:, :2]

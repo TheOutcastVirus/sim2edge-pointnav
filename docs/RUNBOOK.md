@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-284 pass, 2 skipped without Isaac. No GPU or simulator required — keep it that way.
+307 pass, 3 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -886,6 +886,77 @@ semicolon-separated `ADSP_LIBRARY_PATH`). The quantization gate there is a
 
 ---
 
+# Driving a policy by hand
+
+```bash
+~/isaac-venv/bin/python scripts/interactive_nav.py                     # actor only
+~/isaac-venv/bin/python scripts/interactive_nav.py --driver localized  # full stack
+```
+
+One rendered environment on a held-out layout. **Left-click the floor to send
+the robot there**; the panel resets it, moves it elsewhere in the same room,
+draws a new room, pauses, and switches the noise tier live. A click is snapped
+to the nearest legal robot centre within 60 cm and refused beyond that, so a
+click inside an obstacle is rejected rather than driven at.
+
+This is a demonstration, not a measurement. One episode at a time is not a
+success rate, and nothing here writes a report. Use `eval_bc.py`,
+`eval_localized.py` or `eval_belief.py` for numbers.
+
+| | `--driver pose` (default) | `--driver localized` |
+|---|---|---|
+| goal features from | simulator truth | the robot's own estimate |
+| motion prior | — | Create3-style body-frame odometry increment + gyro |
+| correction | — | CPU exact-bearing scan-to-submap tracker |
+| arrival decided by | true distance | the robot's own uncertainty bound, 3 ticks |
+| answers | "is the actor good" | "would the robot do this" |
+| loop rate | ~12 Hz | ~9 Hz (the scan match is the cost) |
+
+Only `localized` is the deployable stack, and the orange disc it draws is where
+the robot *believes* the goal is — the gap between the two discs is the
+localization error, at the scale a person can see.
+
+**One input there is not end-to-end, and it is not conservative.** Under the
+default `--prior-source create3-ekf` the odometry increment is synthesized from
+achieved simulated motion plus encoder noise, exactly as in `eval_localized.py`,
+because the simulator has no wheel-encoder model. No ground-truth pose reaches
+the actor or the tracker — but an increment measured from achieved displacement
+*sees through* the wheel slip the simulator deliberately injects, where a real
+encoder counts rotations and would report the commanded travel instead. The
+prior therefore carries additive noise and none of the drivetrain scale error
+that `LocalPoseTracker.motion_scale` exists to estimate.
+
+`--prior-source command-gyro` is the fully self-contained configuration, and its
+three inputs are worth naming exactly: the **lidar** sweep, the **gyro** yaw
+increment, and the robot's **own commanded speed**. The last is not a
+measurement — the tracker integrates `commanded_speed * dt * motion_scale` — so
+it is blind to wheel slip in the same way a wheel encoder is, and `motion_scale`
+is the only thing that recovers it. That comes from the scan match, so here the
+lidar carries the whole translation correction by itself. This is the arm that
+missed the localization gate, which is why the evidence-gated fallback to
+Create3 odometry was exercised. Closing it properly needs either a wheel-encoder
+model in the simulator or the real Create3 `/odom`.
+
+Truth is read at one more point in both modes, and only one: the instant you
+click, to turn the clicked world point into an offset in the robot's frame. It
+is then stored in the tracker's frame and never consulted again — the same
+status `initial_goal` has in `eval_localized.py`. Somebody has to point at the
+map; nothing drives on it.
+
+The viewer loads `assets/turtlebot4_lite_visual.usd`, not the task's default
+`assets/turtlebot4_lite.usd`. The latter predates the `package://` fix in
+`tools/convert_tb4.py` and contains only the URDF's primitive wheel visuals, so
+the robot renders as a pair of wheels. Nothing else notices — collision is
+primitives and the lidar never sees the robot — and a viewer is the one consumer
+that does. `--robot-usd` overrides it.
+
+Neither collision nor arrival ends an episode here: the environment reports both
+and keeps rendering, and only a button or a click moves the robot. Wall-clock
+pacing holds the 20 Hz control period so the motion reads the way it will on
+hardware; `--speed 0` runs free.
+
+---
+
 ## Common failures
 
 | Symptom | Fix |
@@ -897,6 +968,7 @@ semicolon-separated `ADSP_LIBRARY_PATH`). The quantization gate there is a
 | RSS climbs and `ms/step` creeps up | Recorder buffers should be a fixed ceiling printed at startup. If not, something reintroduced per-step allocation. |
 | Every lidar bin reads 1.0 | Rays hit nothing — sensor targets not matching obstacle prims, or obstacles parked below the floor. |
 | Viewport looks empty | Rooms span `(0,0)`–`(size)` from the env origin, so the camera must aim at the middle. `--gui` frames env 0 after reset; `--dump-scene` gives coordinates. |
+| The robot renders as two floating wheels | The asset predates the `package://` fix and has no visual meshes. Use `assets/turtlebot4_lite_visual.usd`, or rebuild with `tools/convert_tb4.py`. |
 | `ValueError: shard ... was collected under spec X` | `spec.py` changed after collection. Recollect, or check out the spec that produced the shard. |
 | Yield looks great early, then collapses | Expected. Fast episodes finish first; wait until `kept + dropped` ≫ `num_envs`. |
 
@@ -904,13 +976,15 @@ semicolon-separated `ADSP_LIBRARY_PATH`). The quantization gate there is a
 
 ```
 sim2edge/        simulator-free core: spec, grids, rooms, oracle,
-                 preprocess, noise, dataset
-isaaclab_env/    Isaac Lab adapter -- owns no task definition
+                 preprocess, noise, dataset, localization
+isaaclab_env/    Isaac Lab adapter -- owns no task definition;
+                 nav_task.py (batch) and interactive.py (viewer)
 scripts/         collect_bc.py, verify_shard.py, train_bc.py,
                  eval_bc.py, train_ppo.py, train_belief.py,
-                 train_belief_ppo.py, eval_belief.py
+                 train_belief_ppo.py, eval_belief.py,
+                 eval_localized.py, interactive_nav.py
 tools/           convert_tb4.py
-tests/           245 passing tests, no GPU or simulator required
+tests/           307 passing tests, no GPU or simulator required
 docs/daily/      engineering log
 assets/, data/   generated; not in git
 ```
