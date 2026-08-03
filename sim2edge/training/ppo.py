@@ -52,7 +52,8 @@ import torch
 from torch import nn
 
 from ..models import NavActorCritic, NavPolicy
-from ..spec import fingerprint, observation_fingerprint
+from ..spec import (MOTION_PRIOR_SOURCE, SENSOR_CONTRACT_VERSION, fingerprint,
+                    observation_fingerprint)
 from .bc import atomic_torch_save
 
 __all__ = ["EpisodeStats", "PPOConfig", "PPOTrainer", "RolloutBuffer",
@@ -444,6 +445,8 @@ def ppo_checkpoint(policy: NavActorCritic, trainer: PPOTrainer,
         "format_version": 1,
         "algorithm": "ppo",
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "observation_fingerprint": observation_fingerprint(
             policy.config.history_frames),
         "model_config": policy.config.to_dict(),
@@ -468,6 +471,8 @@ def load_ppo_checkpoint(path: str | Path, policy: NavActorCritic,
                         device="cpu") -> dict[str, Any]:
     """Restore actor, critic, exploration scale and optimizer for a resume."""
     saved = torch.load(path, map_location=device, weights_only=False)
+    if saved.get("sensor_contract_version", "world-fixed-v1") != SENSOR_CONTRACT_VERSION:
+        raise ValueError("checkpoint uses a different sensor contract")
     if saved.get("spec_fingerprint") != fingerprint():
         raise ValueError("checkpoint uses a different spec")
     want = observation_fingerprint(policy.config.history_frames)

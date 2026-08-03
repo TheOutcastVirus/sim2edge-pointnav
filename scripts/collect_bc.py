@@ -877,9 +877,60 @@ def run_checks(env, torch) -> None:
     print(f"spinning in place   {spinning:.1%}")
     assert spinning < 0.5, "most robots are pinned at max spin; oracle is stranded"
 
+    run_sensor_contract_checks(env, torch)
+
     run_drive_checks(env, torch)
 
     print("--- all checks passed ---\n")
+
+
+def run_sensor_contract_checks(env, torch) -> None:
+    """Compare raw rays with exact room geometry at three controlled yaws."""
+    import math
+    import numpy as np
+    from sim2edge.rooms import analytic_lidar_ranges
+    from sim2edge.spec import LIDAR_MAX_M, LIDAR_MOUNT_XYZ
+
+    env_id = 0
+    room = env._rooms[int(env._layout[env_id])]
+    pose = env._robot_pose()[env_id].clone()
+    origin = env.scene.env_origins[env_id]
+    angles = env._beam_angles.detach().cpu().numpy()
+    zero = torch.zeros(env.num_envs, 2, device=env.device)
+    zero[:, 0] = -1.0  # normalized v=-1 is physical zero forward speed
+
+    for yaw in (0.0, math.pi / 2.0, math.pi):
+        root = env.robot.data.root_state_w[env_id:env_id + 1].clone()
+        root[:, :2] = pose[:2] + origin[:2]
+        root[:, 3:7] = torch.tensor(
+            [[math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)]],
+            device=env.device)
+        root[:, 7:] = 0.0
+        env.robot.write_root_state_to_sim(root, torch.tensor(
+            [env_id], device=env.device, dtype=torch.long))
+        env._planar_pose_target[env_id] = torch.tensor(
+            [float(root[0, 0]), float(root[0, 1]), yaw], device=env.device)
+        env._previous_yaw[env_id] = yaw
+        env.step(zero)
+
+        raw = env.raw_scan()[0][env_id].detach().cpu().float().numpy()
+        # The analytic ray origin includes the physical lidar translation,
+        # rotated into the room frame just as the configured offset is.
+        co, si = math.cos(yaw), math.sin(yaw)
+        lidar_pose = np.array([
+            float(pose[0]) + co * LIDAR_MOUNT_XYZ[0] - si * LIDAR_MOUNT_XYZ[1],
+            float(pose[1]) + si * LIDAR_MOUNT_XYZ[0] + co * LIDAR_MOUNT_XYZ[1],
+            yaw,
+        ])
+        expected = analytic_lidar_ranges(room, lidar_pose, angles, LIDAR_MAX_M)
+        usable = np.isfinite(raw) & np.isfinite(expected)
+        corr = float(np.corrcoef(raw[usable], expected[usable])[0, 1])
+        median = float(np.median(np.abs(raw[usable] - expected[usable])))
+        print(f"sensor yaw {math.degrees(yaw):>3.0f} deg corr {corr:.5f}  "
+              f"median disagreement {median * 100:.3f} cm")
+        assert corr >= 0.98, f"sensor/analytic correlation {corr:.4f} < 0.98"
+        assert median <= 0.02, (
+            f"sensor/analytic median disagreement {median * 100:.2f} cm > 2 cm")
 
 
 def run_drive_checks(env, torch) -> None:

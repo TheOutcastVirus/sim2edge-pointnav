@@ -58,7 +58,8 @@ def main() -> None:
     from isaaclab_env.nav_task import NavEnvCfg, Sim2EdgeNavEnv, normalize_action
     from sim2edge import noise as noise_mod
     from sim2edge.preprocess import ObservationHistory, bin_lidar, goal_features
-    from sim2edge.spec import (DT, GOAL_TOLERANCE_M, OMEGA_MAX, V_MAX,
+    from sim2edge.spec import (DT, GOAL_TOLERANCE_M, MOTION_PRIOR_SOURCE,
+                               OMEGA_MAX, SENSOR_CONTRACT_VERSION, V_MAX,
                                fingerprint, observation_fingerprint)
     from sim2edge.training import load_policy_checkpoint
 
@@ -68,7 +69,10 @@ def main() -> None:
     config.num_layouts = args.num_layouts
     config.layout_seed = args.layout_seed
     config.seed = args.layout_seed
-    config.collection_mode = True
+    # Use the environment's real swept/deskewed sensor path. Reconstructing an
+    # instantaneous scan in this evaluator made BC and closed loop consume two
+    # different sensors under one fingerprint.
+    config.collection_mode = False
 
     print(f"[eval] building {args.episodes} environments with held-out layout "
           f"seed {args.layout_seed} ...")
@@ -102,6 +106,8 @@ def main() -> None:
     result = {
         "checkpoint": str(args.checkpoint.resolve()),
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "observation_fingerprint": observation_fingerprint(
             policy.config.history_frames),
         "episodes": args.episodes,
@@ -130,7 +136,11 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
                    speed_cap_stop_m=None, speed_cap_full_m=0.60):
     """Run one initial episode per environment and aggregate on the GPU."""
     torch.manual_seed(seed)
-    env.reset(seed=seed)
+    env.cfg.observation_noise_scale = scale
+    env._gyro.scale = scale
+    env._odometry_drift.scale = scale
+    observation, _ = env.reset(seed=seed)
+    observation = observation["policy"]
     layout_ids = env._layout.detach().cpu().clone()
     n = env.num_envs
     device = torch.device(env.device)
@@ -141,9 +151,6 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
     distance = torch.zeros(n, device=device)
     jerk_sum = torch.zeros(n, device=device)
     previous = torch.zeros(n, 2, device=device)
-    history = ObservationHistory(
-        n, frames=policy.config.history_frames,
-        lidar_bins=policy.config.lidar_bins, device=device)
     success = torch.zeros(n, dtype=torch.bool, device=device)
     collision = torch.zeros(n, dtype=torch.bool, device=device)
     timeout = torch.zeros(n, dtype=torch.bool, device=device)
@@ -157,17 +164,14 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
     capped_steps = torch.zeros((), device=device)
     active_steps = torch.zeros((), device=device)
     while bool(active.any()):
+        # Pose-fed gate: isolate actor quality from localization. The sensor
+        # history is the real noisy swept/deskewed path, while the three goal
+        # features come from exact simulator pose by construction.
         pose = env._robot_pose()
-        ranges, angles = env.raw_scan()
         goal = env._goal_w - env.scene.env_origins[:, :2]
-        noisy_ranges, noisy_angles = noise_mod.corrupt_lidar(
-            ranges, angles, scale, noise_generator)
-        noisy_pose, noisy_goal = noise_mod.corrupt_goal(
-            pose, goal, scale, noise_generator)
-        last_action = torch.stack((env._action[:, 0] / v_max,
-                                   env._action[:, 1] / omega_max), dim=1)
-        history.push(bin_lidar(noisy_ranges, noisy_angles), last_action)
-        observation = history.observation(goal_features(noisy_pose, noisy_goal))
+        observation = env._observation_history.observation(
+            goal_features(pose, goal))
+        ranges, angles = env.raw_scan()
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -183,7 +187,7 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
         if speed_cap_stop_m is not None:
             uncapped_v = command[:, 0]
             command = _cap_forward_speed(
-                command, noisy_ranges, noisy_angles,
+                command, ranges, angles,
                 speed_cap_stop_m, speed_cap_full_m, v_max, torch)
             capped_steps += ((command[:, 0] < uncapped_v - 1.0e-6)
                              & active).sum()
@@ -199,7 +203,8 @@ def _evaluate_tier(env, policy, scale, seed, torch, noise_mod,
         steps[active] += 1
         previous[active] = command[active]
 
-        _, _, terminated, truncated, _ = env.step(normalize_action(command))
+        _, _, terminated, truncated, _ = env.step(
+            normalize_action(command))
         newly_done = active & (terminated | truncated)
         if bool(newly_done.any()):
             success[newly_done] = env._reached[newly_done]

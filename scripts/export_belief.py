@@ -62,7 +62,8 @@ import torch
 from torch import nn
 
 from sim2edge.models.belief import BeliefNavPolicy
-from sim2edge.spec import DT, LIDAR_MAX_M
+from sim2edge.spec import (DT, LIDAR_MAX_M, MOTION_PRIOR_SOURCE,
+                           SENSOR_CONTRACT_VERSION)
 from sim2edge.training.belief import load_belief_checkpoint
 
 
@@ -232,6 +233,8 @@ def main() -> None:
 
     report = {
         "checkpoint": str(args.checkpoint.resolve()),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "includes_scan_vote": bool(args.include_vote),
         "scan_vote_bins": policy.config.scan_vote_bins,
         "batch_size": args.batch_size,

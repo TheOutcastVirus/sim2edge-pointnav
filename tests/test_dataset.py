@@ -147,6 +147,13 @@ def test_fingerprint_mismatch_refuses_to_load(tmp_path, monkeypatch):
         ds.load_shard(p)
 
 
+def test_unknown_sensor_contract_refuses_even_shape_compatible_data(tmp_path):
+    p = tmp_path / "legacy.npz"
+    np.savez(p, fingerprint=np.array(fingerprint()), **_raw())
+    with pytest.raises(ValueError, match="world-fixed-v1.*body-frame-v2"):
+        ds.load_shard(p)
+
+
 def test_fingerprint_matches_a_fresh_shard(shard):
     assert fingerprint() == fingerprint()      # stable within a process
 

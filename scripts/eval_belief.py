@@ -97,7 +97,8 @@ def main() -> None:
 
     from isaaclab_env.nav_task import NavEnvCfg, Sim2EdgeNavEnv, normalize_action
     from sim2edge import noise as noise_mod
-    from sim2edge.spec import fingerprint, observation_fingerprint
+    from sim2edge.spec import (MOTION_PRIOR_SOURCE, SENSOR_CONTRACT_VERSION,
+                               fingerprint, observation_fingerprint)
     from sim2edge.training import load_belief_checkpoint, load_policy_checkpoint
 
     sys.stdout.reconfigure(line_buffering=True)
@@ -150,6 +151,8 @@ def main() -> None:
         "reference": (str(args.reference.resolve())
                       if args.reference is not None else None),
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "observation_fingerprint": observation_fingerprint(
             policy.config.actor.history_frames, belief=True),
         "episodes": args.episodes,

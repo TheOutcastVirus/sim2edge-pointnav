@@ -68,6 +68,23 @@ def test_lidar_beam_count_can_fill_every_bin():
     assert m.LIDAR_BEAMS >= LIDAR_BINS
 
 
+def test_beam_metadata_starts_at_isaac_pattern_origin_plus_mount():
+    """The configured Isaac pattern begins at -pi, not at zero."""
+    import math
+    from sim2edge.spec import LIDAR_MOUNT_YAW
+    m = importlib.import_module("isaaclab_env.nav_task")
+    source = inspect.getsource(m.Sim2EdgeNavEnv.__init__)
+    assert "-math.pi" in source
+    assert -math.pi + LIDAR_MOUNT_YAW == pytest.approx(-math.pi / 2.0)
+
+
+def test_ray_directions_follow_the_base_when_isaac_is_available():
+    m = importlib.import_module("isaaclab_env.nav_task")
+    if not m._HAVE_ISAACLAB:
+        pytest.skip("cfg objects need isaaclab")
+    assert m.NavEnvCfg.lidar_cfg.ray_alignment == "base"
+
+
 def test_live_lidar_bearing_bias_is_persistent_within_an_episode():
     """A mount calibration offset is not fresh angular jitter every tick."""
     m = importlib.import_module("isaaclab_env.nav_task")

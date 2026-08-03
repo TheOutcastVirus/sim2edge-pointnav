@@ -56,7 +56,7 @@ BEARING_BIAS_RAD = 0.02
 #     noise on top of the walk.
 #
 # These are the per-step standard deviations of the walk increments.
-ODOM_XY_WALK_M = 0.004          # ~1.8 cm over a 190-step episode (sqrt-t growth)
+ODOM_XY_WALK_M = 0.0013         # ~1.8 cm over a 190-step episode (sqrt-t growth)
 ODOM_YAW_WALK_RAD = 0.0015      # ~1.2 deg over the same episode
 #: Systematic yaw-rate error, constant within an episode. Scales with turning,
 #: not with time, so it punishes exactly the manoeuvres that need heading.

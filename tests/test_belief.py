@@ -18,7 +18,7 @@ from sim2edge.models import (BeliefNavPolicy, BeliefNavPolicyConfig, NavPolicy,
                              NavPolicyConfig, compose_belief)
 from sim2edge.preprocess import goal_features, relative_goal_features
 from sim2edge.spec import (DT, GOAL_MAX_M, LIDAR_MAX_M, MOTION_HISTORY_FRAMES,
-                           V_MAX, fingerprint,
+                           SENSOR_CONTRACT_VERSION, V_MAX, fingerprint,
                            observation_fingerprint)
 from sim2edge.training import load_policy_checkpoint
 
@@ -291,6 +291,7 @@ def test_belief_checkpoint_actor_loads_for_pose_driven_dagger(tmp_path):
     checkpoint = {
         "algorithm": "belief-ppo",
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
         "observation_fingerprint": observation_fingerprint(
             policy.config.actor.history_frames, belief=True),
         "model_config": policy.config.to_dict(),

@@ -70,11 +70,11 @@ from sim2edge.oracle import LayoutPool, oracle_action
 from sim2edge.preprocess import (ObservationHistory, bin_lidar, goal_features,
                                  rasterize_lidar, wrap_angle)
 from sim2edge.rooms import MAX_OBSTACLES, sample_room, sample_start_positions
-from sim2edge.sensors import (GyroModel, advance_phase, deskew_history,
-                              sweep_scan)
+from sim2edge.sensors import (GyroModel, PolarSweep, advance_phase,
+                              deskew_history, sweep_scan)
 from sim2edge.spec import (DESKEW_WITH_GYRO, DT, GOAL_MAX_M, GOAL_TOLERANCE_M,
                            HISTORY_FRAMES, LIDAR_MAX_M, LIDAR_MOUNT_XYZ,
-                           LIDAR_MOUNT_YAW, OBS_DIM, OMEGA_MAX, ROBOT_RADIUS_M,
+                           LIDAR_MIN_M, LIDAR_MOUNT_YAW, OBS_DIM, OMEGA_MAX, ROBOT_RADIUS_M,
                            MOTION_HISTORY_FRAMES, SPIN_TICKS, V_MAX)
 
 __all__ = ["NavEnvCfg", "Sim2EdgeNavEnv", "normalize_action",
@@ -277,9 +277,11 @@ class NavEnvCfg(DirectRLEnvCfg):
             rot=(math.cos(LIDAR_MOUNT_YAW / 2), 0.0, 0.0,
                  math.sin(LIDAR_MOUNT_YAW / 2)),
         ),
-        # Yaw-only alignment: the scan plane stays level when the base pitches
-        # over a threshold, which is what a real 2D lidar on a rigid mount does.
-        ray_alignment="yaw",
+        # Base alignment is the sensor-contract-v2 fix. In Isaac Lab's local
+        # yaw path origins follow base yaw but directions remain world-fixed.
+        # The planar controller keeps the base level, so full base alignment is
+        # both physically correct and free of pitch/roll ambiguity here.
+        ray_alignment="base",
         mesh_prim_paths=[
             MultiMeshRayCasterCfg.RaycastTargetCfg(
                 prim_expr="/World/envs/env_.*/Obstacle_.*",
@@ -432,10 +434,12 @@ class Sim2EdgeNavEnv(DirectRLEnv):
             device=torch.device(self.device).type)
         self._noise_generator.manual_seed(int(self.cfg.seed or 0) + 977)
 
-        # Beam bearings, rotated from the sensor frame into base_link once.
-        # Doing it here rather than per step keeps the hot path a single add.
+        # Isaac's LidarPattern starts at -pi.  Metadata must describe those
+        # exact rays in base_link; omitting the origin labels every beam pi away
+        # from the surface that produced it.
         beams = torch.arange(LIDAR_BEAMS, device=self.device, dtype=torch.float32)
-        self._beam_angles = (beams * (2.0 * math.pi / LIDAR_BEAMS)
+        self._beam_angles = (-math.pi
+                             + beams * (2.0 * math.pi / LIDAR_BEAMS)
                              + LIDAR_MOUNT_YAW)
         self._observation_history = ObservationHistory(
             n, device=self.device)
@@ -474,6 +478,13 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._motion_valid_history = torch.zeros(
             n, MOTION_HISTORY_FRAMES, LIDAR_BEAMS, dtype=torch.bool,
             device=self.device)
+        self._canonical_ranges = torch.full(
+            (n, LIDAR_BEAMS), LIDAR_MAX_M, device=self.device)
+        self._canonical_bearings = self._beam_angles[None].expand(n, -1).clone()
+        self._canonical_ages = torch.zeros(
+            n, LIDAR_BEAMS, device=self.device)
+        self._canonical_valid = torch.zeros(
+            n, LIDAR_BEAMS, dtype=torch.bool, device=self.device)
         self._odometry_drift = OdometryDrift(
             n, scale=float(self.cfg.observation_noise_scale),
             device=self.device, generator=self._noise_generator)
@@ -816,11 +827,20 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         self._deskew_gyro_history[reset] = increment[reset, None]
         self._deskew_speed_history[reset] = self._action[reset, 0, None]
 
-        swept, ages = sweep_scan(self._scan_history, self._spin_phase)
+        swept, ages = sweep_scan(self._scan_history, self._spin_phase,
+                                 subtick=True)
         if DESKEW_WITH_GYRO:
             swept, angles = deskew_history(
                 swept, angles, ages, self._deskew_gyro_history,
-                self._deskew_speed_history)
+                self._deskew_speed_history, subtick=True)
+        canonical_angles = (angles if angles.dim() == 2
+                            else angles[None].expand_as(swept))
+        canonical_valid = (torch.isfinite(swept)
+                           & (swept >= LIDAR_MIN_M) & (swept <= LIDAR_MAX_M))
+        self._canonical_ranges = swept
+        self._canonical_bearings = canonical_angles
+        self._canonical_ages = ages
+        self._canonical_valid = canonical_valid
         metric, metric_valid = rasterize_lidar(swept, angles, LIDAR_BEAMS)
         self._motion_scan_history[:, :-1] = self._motion_scan_history[:, 1:].clone()
         self._motion_valid_history[:, :-1] = self._motion_valid_history[:, 1:].clone()
@@ -879,6 +899,11 @@ class Sim2EdgeNavEnv(DirectRLEnv):
         checkpoints do not silently change meaning.
         """
         return self._motion_scan_history, self._motion_valid_history
+
+    def canonical_sweep(self) -> PolarSweep:
+        """Newest exact-bearing metric sweep for the CPU localizer."""
+        return PolarSweep(self._canonical_ranges, self._canonical_bearings,
+                          self._canonical_ages, self._canonical_valid)
 
     def motion_action(self) -> torch.Tensor:
         """Normalized command history spanning the motion-estimation window."""

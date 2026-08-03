@@ -25,7 +25,8 @@ import numpy as np
 from . import grids
 from .spec import BODY_RADIUS_M, GOAL_MAX_M, ROBOT_RADIUS_M
 
-__all__ = ["MAX_OBSTACLES", "Room", "sample_room", "sample_start_positions"]
+__all__ = ["MAX_OBSTACLES", "Room", "analytic_lidar_ranges", "sample_room",
+           "sample_start_positions"]
 
 #: Sampled obstacle slots.
 N_OBSTACLE_SLOTS = 24
@@ -174,6 +175,61 @@ class Room:
         """Geodesic metres from any sampled start position to this goal."""
         r, c = grids.world_to_cell(float(xy[0]), float(xy[1]), self.res)
         return float(self.geodesic[r, c])
+
+
+def analytic_lidar_ranges(room: Room, pose, bearings,
+                          max_distance: float) -> np.ndarray:
+    """Exact planar ray intersections with the primitives used by Isaac.
+
+    ``pose`` is the lidar origin ``(x, y, base_yaw)`` in room coordinates and
+    ``bearings`` are exact base-frame beam bearings.  Boxes are intersected in
+    their own frame with the slab method; cylinders use the quadratic solution.
+    This is intentionally independent of the occupancy raster so the simulator
+    bring-up compares geometry with geometry rather than with a 5 cm grid.
+    """
+    pose = np.asarray(pose, dtype=np.float64)
+    bearings = np.asarray(bearings, dtype=np.float64)
+    world = bearings + pose[2]
+    direction = np.stack((np.cos(world), np.sin(world)), axis=1)
+    origin = pose[:2]
+    best = np.full(bearings.shape, float(max_distance), dtype=np.float64)
+
+    for kind, centre, half, yaw, valid in zip(
+            room.kind, room.pos, room.half, room.yaw, room.valid):
+        if not valid:
+            continue
+        delta = origin - centre.astype(np.float64)
+        if kind == KIND_CYLINDER:
+            b = direction @ delta
+            c = float(delta @ delta - float(half[0]) ** 2)
+            disc = b * b - c
+            hit = np.full_like(best, np.inf)
+            ok = disc >= 0.0
+            hit[ok] = -b[ok] - np.sqrt(disc[ok])
+            hit[hit < 0.0] = np.inf
+        else:
+            co, si = math.cos(float(yaw)), math.sin(float(yaw))
+            # World -> obstacle coordinates, R(-yaw).
+            local_o = np.array([co * delta[0] + si * delta[1],
+                                -si * delta[0] + co * delta[1]])
+            local_d = np.stack((co * direction[:, 0] + si * direction[:, 1],
+                                -si * direction[:, 0] + co * direction[:, 1]),
+                               axis=1)
+            parallel = np.abs(local_d) <= 1.0e-12
+            safe = np.where(parallel, 1.0, local_d)
+            t0 = (-half.astype(np.float64) - local_o) / safe
+            t1 = (half.astype(np.float64) - local_o) / safe
+            inside_axis = np.abs(local_o) <= half.astype(np.float64)
+            low = np.where(parallel & inside_axis, -np.inf,
+                           np.where(parallel, np.inf, np.minimum(t0, t1)))
+            high = np.where(parallel & inside_axis, np.inf,
+                            np.where(parallel, -np.inf, np.maximum(t0, t1)))
+            enter = np.max(low, axis=1)
+            leave = np.min(high, axis=1)
+            hit = np.where((leave >= np.maximum(enter, 0.0)),
+                           np.maximum(enter, 0.0), np.inf)
+        best = np.minimum(best, hit)
+    return np.minimum(best, max_distance).astype(np.float32)
 
 
 def sample_start_positions(room: Room, rng: np.random.Generator,

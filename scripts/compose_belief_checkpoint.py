@@ -21,7 +21,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sim2edge.spec import fingerprint, observation_fingerprint
+from sim2edge.spec import (MOTION_PRIOR_SOURCE, SENSOR_CONTRACT_VERSION,
+                           fingerprint, observation_fingerprint)
 from sim2edge.training import load_belief_checkpoint, load_policy_checkpoint
 from sim2edge.training.bc import atomic_torch_save
 
@@ -36,6 +37,8 @@ def compose(actor_path: Path, estimator_path: Path, output: Path) -> dict:
         "format_version": 2,
         "algorithm": "belief-composed",
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "observation_fingerprint": observation_fingerprint(
             policy.config.actor.history_frames, belief=True),
         "model_config": policy.config.to_dict(),

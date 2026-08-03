@@ -30,16 +30,17 @@ from .preprocess import (bin_lidar, build_observation, goal_features,
 from .sensors import deskew_history, sweep_scan
 
 #: Reconstruct each sweep at sub-tick resolution rather than rounding every
-#: beam's acquisition time to the nearest stored scan. Off by default so every
-#: existing corpus reads back bit-identically; see ``sensors.sweep_scan`` for
+#: beam's acquisition time to the nearest stored scan. Sensor contract v2 makes
+#: this the default; the old nearest-tick path remains only for explicit probes.
+#: See ``sensors.sweep_scan`` for
 #: the 0.665 cm / 7.8 cm frame inconsistency that motivates turning it on, and
 #: ``scripts/probe_sensor_consistency.py`` for the acceptance measurement.
 #: Set by SIM2EDGE_SUBTICK_SWEEP=1 so a probe can flip it without a config
 #: migration on every checkpoint.
-SUBTICK_SWEEP = os.environ.get("SIM2EDGE_SUBTICK_SWEEP", "0") == "1"
+SUBTICK_SWEEP = os.environ.get("SIM2EDGE_SUBTICK_SWEEP", "1") == "1"
 from .spec import (DESKEW_WITH_GYRO, DT, HISTORY_FRAMES, LIDAR_SPIN_HZ,
-                   MOTION_HISTORY_FRAMES, OMEGA_MAX, SPIN_TICKS, V_MAX,
-                   fingerprint)
+                   MOTION_HISTORY_FRAMES, OMEGA_MAX, SENSOR_CONTRACT_VERSION,
+                   SPIN_TICKS, V_MAX, fingerprint)
 
 __all__ = ["Shard", "SequenceBatch", "save_shard", "load_shard"]
 
@@ -104,6 +105,7 @@ class Shard:
     steps_to_end: torch.Tensor | None = None # (T,) int32, zero at final sample
     driver: str = "oracle"                    # oracle or policy (DAgger)
     motion_model_version: int = 1
+    sensor_contract_version: str = SENSOR_CONTRACT_VERSION
     #: Lazily derived, never loaded. See the ``episode_start`` property.
     _episode_start: torch.Tensor | None = field(
         default=None, repr=False, compare=False)
@@ -623,6 +625,7 @@ def save_shard(path, ranges, angles, pose, goal, action, prev_action, episode,
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays = dict(
         fingerprint=np.array(fingerprint()),
+        sensor_contract_version=np.array(SENSOR_CONTRACT_VERSION),
         ranges=np.asarray(ranges, dtype=np.float16),
         angles=np.asarray(angles, dtype=np.float32),
         pose=np.asarray(pose, dtype=np.float32),
@@ -654,6 +657,16 @@ def load_shard(path, device="cpu") -> Shard:
     # harmless for one shard and exhausts file descriptors in a 623-shard
     # training pass, so every array is materialized inside the context manager.
     with np.load(Path(path), allow_pickle=False) as z:
+        contract = (str(z["sensor_contract_version"])
+                    if "sensor_contract_version" in z.files
+                    else "world-fixed-v1")
+        if contract != SENSOR_CONTRACT_VERSION:
+            raise ValueError(
+                f"shard {path} uses sensor contract {contract}, this process "
+                f"requires {SENSOR_CONTRACT_VERSION}; legacy scans may be used "
+                "only through the explicit actor-only adapter, never for "
+                "localization"
+            )
         got, want = str(z["fingerprint"]), fingerprint()
         if got != want:
             raise ValueError(
@@ -678,6 +691,7 @@ def load_shard(path, device="cpu") -> Shard:
             driver=str(z["driver"]) if "driver" in z.files else "oracle",
             motion_model_version=(int(z["motion_model_version"])
                                   if "motion_model_version" in z.files else 1),
+            sensor_contract_version=contract,
         )
 
 

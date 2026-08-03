@@ -23,7 +23,8 @@ import torch
 from torch import nn
 
 from ..models import NavPolicy, NavPolicyConfig
-from ..spec import (OMEGA_MAX, V_MAX, fingerprint,
+from ..spec import (MOTION_PRIOR_SOURCE, OMEGA_MAX, SENSOR_CONTRACT_VERSION,
+                    V_MAX, fingerprint,
                     legacy_observation_fingerprint, observation_fingerprint)
 from .data import ShardCorpus, ShardInfo
 
@@ -191,6 +192,8 @@ def _checkpoint(policy: NavPolicy, optimizer, scheduler, config: BCConfig,
     return {
         "format_version": 1,
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "observation_fingerprint": observation_fingerprint(
             policy.config.history_frames),
         "model_config": policy.config.to_dict(),
@@ -233,8 +236,14 @@ def load_policy_checkpoint(path: str | Path, device="cpu", *,
     time.
     """
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    contract = checkpoint.get("sensor_contract_version", "world-fixed-v1")
+    if contract != SENSOR_CONTRACT_VERSION and not allow_legacy_sensor_model:
+        raise ValueError(
+            f"checkpoint {path} uses sensor contract {contract}, this process "
+            f"requires {SENSOR_CONTRACT_VERSION}; pass "
+            "allow_legacy_sensor_model=True only for an explicit actor warm start")
     got, want = checkpoint.get("spec_fingerprint"), fingerprint()
-    if got != want:
+    if got != want and not allow_legacy_sensor_model:
         raise ValueError(
             f"checkpoint {path} uses spec {got}, this process is {want}"
         )
@@ -250,7 +259,7 @@ def load_policy_checkpoint(path: str | Path, device="cpu", *,
         config.history_frames, belief=belief_checkpoint)
     if got_observation is not None and got_observation != want_observation:
         legacy = legacy_observation_fingerprint(config.history_frames)
-        if not (allow_legacy_sensor_model and got_observation == legacy):
+        if not allow_legacy_sensor_model:
             hint = ("" if got_observation != legacy else
                     " This is a pre-spinning-sensor checkpoint; pass "
                     "allow_legacy_sensor_model=True to evaluate it anyway.")
@@ -361,7 +370,8 @@ def train_bc(data: str | Path, output: str | Path,
         raise ValueError("batch_size is larger than every training shard")
     total_steps = steps_per_epoch * config.epochs
 
-    policy = (load_policy_checkpoint(init, device=device_obj)
+    policy = (load_policy_checkpoint(init, device=device_obj,
+                                     allow_legacy_sensor_model=True)
               if init is not None else NavPolicy().to(device_obj))
     initial_checkpoint = str(init) if init is not None else None
     optimizer_kwargs = {"lr": config.learning_rate,
@@ -376,6 +386,8 @@ def train_bc(data: str | Path, output: str | Path,
     best_validation = float("inf")
     if resume is not None:
         saved = torch.load(resume, map_location=device_obj, weights_only=False)
+        if saved.get("sensor_contract_version", "world-fixed-v1") != SENSOR_CONTRACT_VERSION:
+            raise ValueError("resume checkpoint uses a different sensor contract")
         if saved.get("spec_fingerprint") != fingerprint():
             raise ValueError("resume checkpoint uses a different spec")
         if saved.get("observation_fingerprint") != observation_fingerprint():

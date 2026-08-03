@@ -30,7 +30,7 @@ import zipfile
 import numpy as np
 
 from ..dataset import Shard, load_shard
-from ..spec import fingerprint
+from ..spec import SENSOR_CONTRACT_VERSION, fingerprint
 
 __all__ = ["ShardCorpus", "ShardInfo"]
 
@@ -65,6 +65,16 @@ def inspect_shard(path: Path) -> ShardInfo:
         samples = int(_npy_shape(archive, "ranges.npy")[0])
         with archive.open("fingerprint.npy") as stream:
             got = str(np.lib.format.read_array(stream, allow_pickle=False))
+        contract_member = "sensor_contract_version.npy"
+        contract = "world-fixed-v1"
+        if contract_member in archive.namelist():
+            with archive.open(contract_member) as stream:
+                contract = str(np.lib.format.read_array(stream,
+                                                        allow_pickle=False))
+    if contract != SENSOR_CONTRACT_VERSION:
+        raise ValueError(
+            f"shard {path} uses sensor contract {contract}, this process "
+            f"requires {SENSOR_CONTRACT_VERSION}")
     want = fingerprint()
     if got != want:
         raise ValueError(
@@ -177,6 +187,7 @@ class ShardCorpus:
         value = {
             "root": str(self.root),
             "spec_fingerprint": fingerprint(),
+            "sensor_contract_version": SENSOR_CONTRACT_VERSION,
             "seed": self.seed,
             "train": [item.record(self.root) for item in self.train],
             "validation": [item.record(self.root) for item in self.validation],

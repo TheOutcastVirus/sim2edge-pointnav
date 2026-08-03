@@ -8,6 +8,13 @@ from sim2edge.models import NavPolicy, NavPolicyConfig
 from sim2edge.spec import LIDAR_BINS, OBS_DIM, OMEGA_MAX, V_MAX
 
 
+def test_lidar_convolutions_use_circular_padding():
+    policy = NavPolicy()
+    conv = [layer for layer in policy.lidar_conv
+            if isinstance(layer, torch.nn.Conv1d)]
+    assert conv and all(layer.padding_mode == "circular" for layer in conv)
+
+
 def test_policy_emits_physical_bounded_actions():
     policy = NavPolicy()
     output = policy(torch.randn(7, OBS_DIM))

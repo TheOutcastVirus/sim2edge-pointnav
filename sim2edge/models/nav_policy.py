@@ -90,7 +90,7 @@ def build_encoder(config: NavPolicyConfig) -> tuple[nn.Module, ...]:
         padding = kernel // 2
         conv.extend((
             nn.Conv1d(channels, output_channels, kernel, stride=2,
-                      padding=padding),
+                      padding=padding, padding_mode="circular"),
             nn.ReLU(),
         ))
         channels = output_channels

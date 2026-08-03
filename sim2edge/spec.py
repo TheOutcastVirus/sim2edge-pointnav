@@ -28,6 +28,7 @@ __all__ = ["LIDAR_BINS", "LIDAR_MIN_M", "LIDAR_MAX_M", "INVALID_FILL",
            "observation_fingerprint",
            "LIDAR_SPIN_HZ", "SPIN_TICKS", "DESKEW_WITH_GYRO", "GYRO_CHANNELS",
            "MOTION_HISTORY_FRAMES",
+           "SENSOR_CONTRACT_VERSION", "MOTION_PRIOR_SOURCE",
            "sensor_model_fingerprint", "legacy_observation_fingerprint"]
 
 # ── Lidar ────────────────────────────────────────────────────────────────────
@@ -96,6 +97,16 @@ LIDAR_MOUNT_XYZ = (0.0039, 0.0, 0.1395)
 # policy believes they are. This is in the fingerprint precisely because it
 # changes how the observation is constructed.
 LIDAR_MOUNT_YAW = math.pi / 2
+
+# Raw range/angle semantics.  This is deliberately human-readable in every
+# artifact as well as folded into the hash: a hash mismatch says that something
+# changed, while this field says whether a scan is safe to use for localization.
+SENSOR_CONTRACT_VERSION = "body-frame-v2"
+
+# Default prior used by the repaired localization stack.  An odometry-assisted
+# fallback must override and stamp this explicitly so its evidence cannot be
+# reported as lidar/IMU-only.
+MOTION_PRIOR_SOURCE = "command-gyro"
 
 # Four frames are the smallest planned temporal representation: at 20 Hz they
 # expose 150 ms of motion. The original build chose this to avoid recurrent
@@ -175,7 +186,7 @@ def fingerprint() -> str:
     # of the others and would only add redundant entropy.
     values = [LIDAR_BINS, LIDAR_MIN_M, LIDAR_MAX_M, INVALID_FILL, GOAL_MAX_M,
               V_MAX, OMEGA_MAX, ACCEL_MAX, ALPHA_MAX, DT, ROBOT_RADIUS_M,
-              LIDAR_MOUNT_XYZ, LIDAR_MOUNT_YAW]
+              LIDAR_MOUNT_XYZ, LIDAR_MOUNT_YAW, SENSOR_CONTRACT_VERSION]
     canon = ";".join(repr(v) for v in values)
     return hashlib.sha256(canon.encode()).hexdigest()[:16]
 
@@ -191,7 +202,7 @@ def sensor_model_fingerprint() -> str:
     change intact.
     """
     values = [LIDAR_SPIN_HZ, SPIN_TICKS, DESKEW_WITH_GYRO,
-              "piecewise-deskew-v2", MOTION_HISTORY_FRAMES]
+              "subtick-canonical-v3", MOTION_HISTORY_FRAMES]
     return ";".join(repr(v) for v in values)
 
 

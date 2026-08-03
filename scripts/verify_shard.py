@@ -25,7 +25,7 @@ import torch
 from sim2edge.dataset import load_shard
 from sim2edge.spec import (DT, HISTORY_FRAMES, INVALID_FILL, LIDAR_BINS,
                            LIDAR_MAX_M, LIDAR_MIN_M, OBS_DIM, OMEGA_MAX,
-                           V_MAX, fingerprint)
+                           SENSOR_CONTRACT_VERSION, V_MAX, fingerprint)
 
 PASS, FAIL, WARN = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m", "\033[33mWARN\033[0m"
 _failures: list[str] = []
@@ -55,7 +55,8 @@ def main() -> None:
     ep = shard.episode.numpy()
     ids = np.unique(ep)
 
-    print(f"\nspec fingerprint {fingerprint()}   steps {n}   episodes {len(ids)}")
+    print(f"\nsensor contract {SENSOR_CONTRACT_VERSION}   spec fingerprint "
+          f"{fingerprint()}   steps {n}   episodes {len(ids)}")
     print(f"dataset split {split}   layout seed {layout_seed}")
 
     # ── structure ───────────────────────────────────────────────────────────

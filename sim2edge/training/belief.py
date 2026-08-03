@@ -41,7 +41,8 @@ import torch
 from torch import nn
 
 from ..models import BeliefNavPolicy, BeliefNavPolicyConfig, NavPolicyConfig
-from ..spec import (DT, GOAL_TOLERANCE_M, V_MAX, fingerprint,
+from ..spec import (DT, GOAL_TOLERANCE_M, MOTION_PRIOR_SOURCE,
+                    SENSOR_CONTRACT_VERSION, V_MAX, fingerprint,
                     legacy_observation_fingerprint, observation_fingerprint)
 from .bc import atomic_torch_save, imitation_loss
 
@@ -364,8 +365,13 @@ def warm_start(path, device="cpu",
     it is exactly what the training run does.
     """
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    contract = checkpoint.get("sensor_contract_version", "world-fixed-v1")
+    if contract != SENSOR_CONTRACT_VERSION and not allow_legacy_sensor_model:
+        raise ValueError(
+            f"checkpoint {path} uses sensor contract {contract}, this process "
+            f"requires {SENSOR_CONTRACT_VERSION}")
     got, want = checkpoint.get("spec_fingerprint"), fingerprint()
-    if got != want:
+    if got != want and not allow_legacy_sensor_model:
         raise ValueError(f"checkpoint {path} uses spec {got}, this is {want}")
     actor_config = NavPolicyConfig.from_dict(checkpoint["model_config"])
     observed = checkpoint.get("observation_fingerprint")
@@ -392,6 +398,8 @@ def belief_checkpoint(policy: BeliefNavPolicy, optimizer, scheduler,
         "format_version": 2,
         "algorithm": "belief",
         "spec_fingerprint": fingerprint(),
+        "sensor_contract_version": SENSOR_CONTRACT_VERSION,
+        "motion_prior_source": MOTION_PRIOR_SOURCE,
         "observation_fingerprint": observation_fingerprint(
             policy.config.actor.history_frames, belief=True),
         "model_config": policy.config.to_dict(),
@@ -411,6 +419,11 @@ def belief_checkpoint(policy: BeliefNavPolicy, optimizer, scheduler,
 def load_belief_checkpoint(path, device="cpu") -> BeliefNavPolicy:
     """Load a trained belief policy, refusing a mismatched contract."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    contract = checkpoint.get("sensor_contract_version", "world-fixed-v1")
+    if contract != SENSOR_CONTRACT_VERSION:
+        raise ValueError(
+            f"checkpoint {path} uses sensor contract {contract}, this process "
+            f"requires {SENSOR_CONTRACT_VERSION}")
     got, want = checkpoint.get("spec_fingerprint"), fingerprint()
     if got != want:
         raise ValueError(f"checkpoint {path} uses spec {got}, this is {want}")

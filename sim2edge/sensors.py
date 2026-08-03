@@ -40,6 +40,7 @@ that is exactly known.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -48,7 +49,7 @@ from .noise import (GYRO_ARW_RAD_PER_SQRT_S, GYRO_BIAS_RAD_S,
 from .preprocess import wrap_angle
 from .spec import DT, LIDAR_SPIN_HZ, SPIN_TICKS
 
-__all__ = ["SPIN_PERIOD_S", "EDGE_TOLERANCE_M", "beam_ages", "advance_phase",
+__all__ = ["PolarSweep", "SPIN_PERIOD_S", "EDGE_TOLERANCE_M", "beam_ages", "advance_phase",
            "sweep_scan", "deskew", "deskew_history", "GyroModel",
            "synthesize_gyro"]
 
@@ -61,6 +62,33 @@ SPIN_PERIOD_S = 1.0 / LIDAR_SPIN_HZ
 #: ``V_MAX * DT`` = 2.3 cm of range change on a surface facing the robot, so
 #: 25 cm is an order of magnitude of headroom over real motion.
 EDGE_TOLERANCE_M = 0.25
+
+
+@dataclass(frozen=True)
+class PolarSweep:
+    """Canonical lidar representation used by CPU localization.
+
+    Every range keeps its exact body-frame bearing and acquisition age.  No
+    assumption of uniform angular spacing is made, and invalid returns remain
+    explicit rather than being confused with a maximum-range hit.
+    """
+
+    ranges: torch.Tensor
+    bearings: torch.Tensor
+    ages: torch.Tensor
+    valid: torch.Tensor
+
+    def __post_init__(self) -> None:
+        shape = self.ranges.shape
+        if any(value.shape != shape for value in
+               (self.bearings, self.ages, self.valid)):
+            raise ValueError("PolarSweep fields must have identical shapes")
+        if self.valid.dtype != torch.bool:
+            raise TypeError("PolarSweep.valid must be boolean")
+
+    def to(self, device) -> "PolarSweep":
+        return PolarSweep(self.ranges.to(device), self.bearings.to(device),
+                          self.ages.to(device), self.valid.to(device))
 
 
 def beam_ages(phase: torch.Tensor, beams: int) -> torch.Tensor:
