@@ -572,10 +572,45 @@ been correctly ignoring the lidar for four runs. `--translation-coef` and
 `--belief-coef` now exist to invert that; `belief_integral_v23` is the first run
 using them.
 
-Even a perfect blend lands at 5.08 cm, right at the gate. Beating it needs the
-vote's **scatter** below 0.46 cm (and below 0.27 cm for 3 cm of belief error).
-Grid resolution is not the limit — scatter is 0.56 cm at 21, 31 and 41 bins
-alike — so that is the open question.
+Inverting the weighting works, on the axis it targets. `belief_integral_v23`
+(`--translation-coef 2 --belief-coef 20`) scores 8.73 cm with **+1.80 cm of
+shuffled-lidar degradation** — against 0.96 for v22 and 0.67 for the best
+checkpoint without the vote. Removing the lidar sends it 8.73 → 10.53 cm, 91% of
+the way back to dead reckoning, so the estimator is finally lidar-driven rather
+than a command rescaling. The mean still does not beat the 8.53 cm baseline.
+
+### How much scan ego-motion this sensor supports — measured
+
+Before building anything else on longer baselines, read this.
+`scripts/probe_correlative_match.py` is a correlative scan matcher: Cartesian,
+no linearization, no bearing correspondence, robust by construction. On analytic
+rooms it recovers 30 cm displacements to **0.3 cm** including under 1.2 rad of
+rotation. On corpus scans it fails outright, and the reason is not the matcher:
+
+| baseline | travel | truth outscores zero displacement | median score ratio |
+|---|---:|---:|---:|
+| 1 tick | 2 cm | **97%** of windows | 1.12 |
+| 4 ticks | 9 cm | 43% | 0.95 |
+| 9 ticks | 21 cm | 41% | 0.88–0.95 |
+| 19 ticks | 40 cm | 44% | 0.88 |
+
+At one tick the motion is unambiguously in the scans. By four ticks a *static*
+alignment explains the newer scan better than the true one does. That is
+measured on the score surface with no search involved, so it bounds every
+frame-to-frame estimator, not just this one.
+
+**Consequence:** the `sqrt(S/L)` route to lower belief error is closed. Per-tick
+is the only regime available, so the per-tick scatter of 0.566 cm is a floor,
+and an optimally weighted blend near 5 cm is the ceiling of frame-to-frame scan
+matching on this sensor model. Grid resolution is not the limit — scatter is
+0.56 cm at 21, 31 and 41 bins alike.
+
+The suspect for the decay is sensor reconstruction, not estimation:
+`sweep_scan` stitches each frame from five stored ticks and quantizes each
+beam's acquisition time to the nearest tick, which its docstring costs at 25 ms
+— 1.15 cm of unmodelled per-beam position error at full speed, the same size as
+the per-tick signal. `LIDAR_SPIN_HZ = 5.5` also remains unverified against the
+A1. Look there, and at local-map accumulation, before trying another estimator.
 
 ### Honest arrival uncertainty
 
