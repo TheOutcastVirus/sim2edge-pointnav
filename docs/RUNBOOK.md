@@ -605,12 +605,51 @@ and an optimally weighted blend near 5 cm is the ceiling of frame-to-frame scan
 matching on this sensor model. Grid resolution is not the limit — scatter is
 0.56 cm at 21, 31 and 41 bins alike.
 
+**This is now confirmed and is the binding constraint on the whole phase.** See
+"The sensor model is the ceiling" below before doing any further estimator work.
+
 The suspect for the decay is sensor reconstruction, not estimation:
 `sweep_scan` stitches each frame from five stored ticks and quantizes each
 beam's acquisition time to the nearest tick, which its docstring costs at 25 ms
 — 1.15 cm of unmodelled per-beam position error at full speed, the same size as
 the per-tick signal. `LIDAR_SPIN_HZ = 5.5` also remains unverified against the
 A1. Look there, and at local-map accumulation, before trying another estimator.
+
+### The sensor model is the ceiling — read this before changing the estimator
+
+Place one reconstructed frame into another using the **true** relative pose and
+measure the misalignment that remains. A correct reconstruction answers zero.
+
+| | 0x sensor noise | 1x sensor noise |
+|---|---:|---:|
+| baseline 1 tick | **0.665 cm** | 0.629 cm |
+| baseline 4 ticks | **7.81 cm** | 7.13 cm |
+
+Sensor noise is irrelevant — the two columns agree, so this is the
+reconstruction disagreeing with itself. And the 4-tick figure is the sweep
+period: at `LIDAR_SPIN_HZ = 5.5` a revolution is 0.182 s = 3.6 ticks, and full
+speed covers **8.36 cm** in one. Frames more than a revolution apart are stitched
+from disjoint sub-scan sets whose distortions do not cancel.
+
+The slip residual the estimator must measure is **0.078 cm per tick**. The noise
+floor of its own input is 8x that at one tick and 100x at four. Nothing
+downstream can work, and that single fact accounts for every negative result in
+Phase 4 — the three-architecture plateau, the ICP null, derotation, the scaled
+difference, the gate fix, the vote's 0.03 slip correlation, the baseline decay,
+and scan-to-map.
+
+`sweep_scan` quantizes each beam's acquisition time to the nearest stored tick
+(25 ms, or 1.15 cm at full speed — the 1-tick figure above sits inside that) and
+the deskew then compensates each frame with the *commanded* speed. **A real
+RPLIDAR A1 timestamps every return**, so hardware has strictly better
+information than this simulator supplies. The conclusion is not that lidar
+cannot measure ego-motion here; it is that this corpus cannot answer the
+question.
+
+Fix `sensors.py` first — sub-tick beam placement, deskew against the true
+elapsed interval — then recollect, then re-run the estimator comparison. The
+acceptance test is the table above. `probe_correlative_match.py` and
+`probe_scan_to_map.py` reproduce it.
 
 ### Honest arrival uncertainty
 

@@ -277,8 +277,22 @@ def main() -> None:
             "scatter_rms_cm": float(scatter.pow(2).mean().sqrt()) * 100.0,
         }
 
+    # The decisive quantity. The command is already a good displacement
+    # estimate; the only thing an estimator can add is the *slip residual*
+    # truth - command. If (estimate - command) does not correlate with it, the
+    # estimator is reproducing the command and every improvement in its
+    # apparent accuracy is circular -- which is a live risk here, because the
+    # sweep reconstruction deskews shared beams using that same command.
+    residual_truth = truth - command
     result = {
         "samples": int(truth.shape[0]),
+        "slip_residual_cm": float(residual_truth.norm(dim=1).mean()) * 100.0,
+        "vote_recovers_slip_corr_x": correlation(
+            (vote - command)[:, 0], residual_truth[:, 0]),
+        "vote_recovers_slip_corr_y": correlation(
+            (vote - command)[:, 1], residual_truth[:, 1]),
+        "vote_vs_command_corr_x": correlation(vote[:, 0], command[:, 0]),
+        "vote_vs_truth_corr_x": correlation(vote[:, 0], truth[:, 0]),
         "gap": args.gap,
         "sigma_m": args.sigma,
         "noise_scale": args.noise_scale,
