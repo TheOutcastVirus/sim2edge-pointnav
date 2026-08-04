@@ -24,6 +24,7 @@ import math
 __all__ = ["LIDAR_BINS", "LIDAR_MIN_M", "LIDAR_MAX_M", "INVALID_FILL",
            "GOAL_MAX_M", "GOAL_TOLERANCE_M", "V_MAX", "OMEGA_MAX", "ACCEL_MAX", "ALPHA_MAX", "DT",
            "ROBOT_RADIUS_M", "BODY_RADIUS_M", "LIDAR_MOUNT_XYZ", "LIDAR_MOUNT_YAW",
+           "LIDAR_OCCLUSION_ARCS_RAD",
            "BIN_WIDTH_RAD", "HISTORY_FRAMES", "OBS_DIM", "fingerprint",
            "observation_fingerprint",
            "LIDAR_SPIN_HZ", "SPIN_TICKS", "DESKEW_WITH_GYRO", "GYRO_CHANNELS",
@@ -98,6 +99,42 @@ LIDAR_MOUNT_XYZ = (0.0039, 0.0, 0.1395)
 # changes how the observation is constructed.
 LIDAR_MOUNT_YAW = math.pi / 2
 
+# Bearings the robot's own camera mount permanently blocks, in base_link, as
+# (start, end) pairs swept counter-clockwise. An arc may run past +pi; the
+# consumer wraps.
+#
+# MEASURED, 2026-08-04, over 500 revolutions: 17.93% of beams returned nothing,
+# which reads as a 6x miss against DROPOUT_PROB = 0.03 until it is decomposed.
+#
+#   persistent -- the same bearings blocked in every single scan   14.51%
+#   everything else                                                 3.43%
+#
+# The random component was right all along. The 14.51% is three contiguous arcs
+# totalling 49.3 degrees, and the give-away that they are structure rather than
+# scene is that P(invalid | neighbour invalid) is 0.91 against a 0.18 base rate:
+# real dropout does not do that. Three arcs, three standoffs.
+#
+# 97% of it lies behind the robot -- the forward +/-35 degree sector the safety
+# node watches loses 3 bins of 210 -- which is the benign place for it, but the
+# simulator had no occlusion at all, so the policy has been trained believing it
+# has 360 degrees of coverage against the robot's ~308.
+#
+# This is a MOUNT property, like LIDAR_MOUNT_YAW above. Move the camera and it
+# is wrong, and wrong here is silent: it presents as a localizer that
+# mysteriously has fewer points on one side. Re-derive with
+# tools/capture_scans.py and tools/analyze_dropout.py rather than editing by
+# hand.
+#
+# It lives in sensor_model_fingerprint() and NOT fingerprint(), because it is
+# applied when an observation is built and not when a scan is collected -- the
+# shards still hold clean instantaneous ranges. Putting it in fingerprint()
+# would invalidate 51 GB of corpus for a mask the collector never saw.
+LIDAR_OCCLUSION_ARCS_RAD = (
+    (-2.96253, -2.72378),   # -169.7 to -156.1 deg, 42 of 1080 bins
+    (-2.38604, -2.16476),   # -136.7 to -124.0 deg, 39 bins
+    (+2.84898, +3.23331),   # +163.2 to +185.3 deg, 67 bins -- crosses +pi
+)
+
 # Raw range/angle semantics.  This is deliberately human-readable in every
 # artifact as well as folded into the hash: a hash mismatch says that something
 # changed, while this field says whether a scan is safe to use for localization.
@@ -125,19 +162,24 @@ OBS_DIM = HISTORY_FRAMES * LIDAR_BINS + 3 + HISTORY_FRAMES * 2
 # as an instantaneous 720-beam snapshot arriving every control tick. Neither
 # half of that is true, and both halves matter:
 #
-#   1. One revolution takes 1/LIDAR_SPIN_HZ. At 5.5 Hz that is 182 ms, which is
-#      3.6 control periods -- so a "scan" is stitched from beams acquired at
-#      three or four different robot poses. The result is motion skew, and the
+#   1. One revolution takes 1/LIDAR_SPIN_HZ. At the measured 7.32 Hz that is
+#      137 ms, which is 2.7 control periods -- so a "scan" is stitched from
+#      beams acquired at three different robot poses. The result is motion skew, and the
 #      skew is a function of the command just issued. It is worst exactly when
 #      the robot turns hard to avoid something.
 #   2. A complete fresh revolution is therefore *not* available every tick.
 #      Beam age varies continuously with bearing, from zero at the beam the
 #      sweep just passed to a full revolution at the beam in front of it.
 #
-# Nominal A1 spin is 5.5 Hz; the motor is PWM-adjustable to roughly 10 Hz.
-# Confirm what the unit is actually configured to before trusting sim2real
-# numbers -- this constant is the single place to change it.
-LIDAR_SPIN_HZ = 5.5
+# MEASURED on the physical unit, 2026-08-04: 7.32 Hz over 80 revolutions, with
+# the driver's own time_increment implying 7.63. It is NOT the 5.5 Hz nominal
+# this constant carried until then, and it is not the "scan frequency: 10.0 Hz"
+# the sllidar driver prints for Sensitivity mode either -- that figure is the
+# mode's nominal and the motor does not turn at it. 8000 samples/s over the
+# 1080 bins the driver emits is 7.4 rev/s, which is what arrives.
+#
+# Re-measure with tools/probe_scan.py if the scan mode or the motor PWM changes.
+LIDAR_SPIN_HZ = 7.32
 
 # How many control ticks of raw scan history one revolution spans, plus the
 # partial tick at each end. Anything reconstructing a swept scan needs this many
@@ -202,7 +244,8 @@ def sensor_model_fingerprint() -> str:
     change intact.
     """
     values = [LIDAR_SPIN_HZ, SPIN_TICKS, DESKEW_WITH_GYRO,
-              "subtick-canonical-v3", MOTION_HISTORY_FRAMES]
+              "subtick-canonical-v3", MOTION_HISTORY_FRAMES,
+              LIDAR_OCCLUSION_ARCS_RAD]
     return ";".join(repr(v) for v in values)
 
 

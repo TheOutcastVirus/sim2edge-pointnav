@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-311 pass, 3 skipped without Isaac. No GPU or simulator required — keep it that way.
+317 pass, 3 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -1323,7 +1323,7 @@ scripts/         collect_bc.py, verify_shard.py, train_bc.py,
                  train_belief_ppo.py, eval_belief.py,
                  eval_localized.py, interactive_nav.py
 tools/           convert_tb4.py
-tests/           311 passing tests, no GPU or simulator required
+tests/           317 passing tests, no GPU or simulator required
 docs/daily/      engineering log
 assets/, data/   generated; not in git
 ```

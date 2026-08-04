@@ -21,8 +21,8 @@ namespace sim2edge::spec
 inline constexpr const char * kSensorContractVersion = "body-frame-v2";
 inline constexpr const char * kMotionPriorSource = "command-gyro";
 inline constexpr const char * kRawFingerprint = "ccbc8969019cefb4";
-inline constexpr const char * kSensorModelFingerprint = "5.5;5;True;'subtick-canonical-v3';20";
-inline constexpr const char * kObservationFingerprint = "1ec0c65912173121";
+inline constexpr const char * kSensorModelFingerprint = "7.32;4;True;'subtick-canonical-v3';20;((-2.96253, -2.72378), (-2.38604, -2.16476), (2.84898, 3.23331))";
+inline constexpr const char * kObservationFingerprint = "3f2e3930e4147192";
 
 // ── Lidar ────────────────────────────────────────────────────────────────────
 // 180 bins over the full circle. Full circle rather than a forward arc because
@@ -39,9 +39,9 @@ inline constexpr float kBinWidthRad = 0.03490658503988659f;
 // ── Spinning sensor ──────────────────────────────────────────────────────────
 // The A1 is a motor at ~5.5 Hz: one revolution spans 3.6 control periods, so a
 // "scan" is stitched from beams acquired at three or four different poses.
-inline constexpr float kLidarSpinHz = 5.5f;
-inline constexpr float kSpinPeriodS = 0.18181818181818182f;
-inline constexpr int kSpinTicks = 5;
+inline constexpr float kLidarSpinHz = 7.32f;
+inline constexpr float kSpinPeriodS = 0.13661202185792348f;
+inline constexpr int kSpinTicks = 4;
 inline constexpr bool kDeskewWithGyro = true;
 inline constexpr int kMotionHistoryFrames = 20;
 

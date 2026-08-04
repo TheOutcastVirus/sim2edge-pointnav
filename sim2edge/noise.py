@@ -30,6 +30,20 @@ __all__ = ["RANGE_STD_M", "DROPOUT_PROB", "BEARING_BIAS_RAD", "ODOM_XY_STD_M",
 #: Gaussian range error, metres. Roughly constant over the A1's usable range.
 RANGE_STD_M = 0.02
 #: Per-beam probability of no return: dark, specular, or glancing surfaces.
+#:
+#: VALIDATED against hardware 2026-08-04 and deliberately unchanged. 500 real
+#: revolutions gave 17.93% of beams returning nothing, which looks like a 6x
+#: miss until it is decomposed: 14.51% is the camera mount blocking three fixed
+#: arcs, leaving 3.43% genuinely random against the 0.03 modelled here. The
+#: occlusion is geometry and lives in spec.LIDAR_OCCLUSION_ARCS_RAD; this
+#: constant only ever claimed to be the random part, and it was right.
+#:
+#: One known inaccuracy remains: this dropout is i.i.d. per beam, and the real
+#: 3.43% is not -- P(invalid | neighbour invalid) is 0.50 against a 0.034 base
+#: rate, because no-returns come from surfaces and surfaces are contiguous in
+#: bearing. For convolutions that wrap around bearing, 3% scattered and 3% in
+#: arcs are different inputs. Modelling that is a second-order fix behind the
+#: occlusion mask, and it is NOT done.
 DROPOUT_PROB = 0.03
 #: Whole-scan bearing offset, radians. The mount yaw is never exactly nominal,
 #: and unlike per-beam noise this one is *systematic within an episode*.
@@ -72,17 +86,24 @@ ODOM_YAW_STD_RAD = 0.005
 # so that this module remains the single answer to "what sensor error does this
 # project simulate"; ``sensors.py`` is their only consumer.
 #
-# Sized so integrated heading error lands around 1 degree per episode, which is
-# what makes the gyro worth having: the wheel-odometry yaw it replaces is worth
-# several degrees, and the goal tolerance is 0.25 m at up to 8 m of range.
+# These were sized as a design target of ~1 degree of integrated heading error
+# per episode. MEASURED on the actual OAK-D 2026-08-04 they are worse than that
+# target, and the constants below now carry the measurement rather than the
+# target: the episode figure is ~1.23 degrees. The gyro is still worth having --
+# the wheel-odometry yaw it replaces is worth several degrees, and 1.23 degrees
+# at 3 m is 6 cm against a 0.25 m goal tolerance.
 #
-#: Angle random walk: white rate noise, in rad/sqrt(s). Contributes ~0.03 deg
-#: over an episode -- negligible, and included only so its negligibility is
-#: demonstrated rather than assumed.
-GYRO_ARW_RAD_PER_SQRT_S = 1.75e-4
+#: Angle random walk: white rate noise, in rad/sqrt(s).
+#: MEASURED on the OAK-D, 2026-08-04: sigma 0.003514 rad/s at 200.4 Hz, so
+#: sigma*sqrt(dt) = 2.48e-4. Was 1.75e-4, assumed.
+GYRO_ARW_RAD_PER_SQRT_S = 2.48e-4
 #: Residual bias after power-on calibration, constant within an episode. The
-#: dominant term at short timescales: 1e-3 rad/s over 9.5 s is 0.55 degrees.
-GYRO_BIAS_RAD_S = 1.0e-3
+#: dominant term at short timescales.
+#: MEASURED on the OAK-D, 2026-08-04, at rest over 12 s: -0.002846 rad/s, i.e.
+#: 2.8x the 1.0e-3 previously assumed. Over one 137 ms revolution that is only
+#: 0.02 degrees, which is why deskew tolerates it; over 60 s it is 9.8 degrees,
+#: which is why the scan-match correction has to exist.
+GYRO_BIAS_RAD_S = 2.85e-3
 #: Rate random walk -- how fast the bias itself wanders, in rad/s per sqrt(s).
 GYRO_BIAS_WALK_RAD_S = 1.0e-4
 #: Scale-factor error, constant within an episode. Proportional to rotation

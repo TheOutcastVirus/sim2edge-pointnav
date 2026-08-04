@@ -8,9 +8,9 @@ between torch and the C++ standard library.
 
 **Why this file had to exist.** The first build modelled the A1 as an
 instantaneous 720-beam snapshot delivered every control tick. A real A1 is a
-motor spinning at about 5.5 Hz, so:
+motor spinning at a measured 7.32 Hz, so:
 
-* one revolution takes 182 ms, which is 3.6 control periods at 20 Hz;
+* one revolution takes 137 ms, which is 2.7 control periods at 20 Hz;
 * the beams in one "scan" were therefore acquired at three or four different
   robot poses, and the scan is smeared -- *motion skew*;
 * the smear is a function of the command just issued, so it is largest exactly
@@ -47,11 +47,11 @@ import torch
 from .noise import (GYRO_ARW_RAD_PER_SQRT_S, GYRO_BIAS_RAD_S,
                     GYRO_BIAS_WALK_RAD_S, GYRO_SCALE_ERROR)
 from .preprocess import wrap_angle
-from .spec import DT, LIDAR_SPIN_HZ, SPIN_TICKS
+from .spec import (DT, LIDAR_OCCLUSION_ARCS_RAD, LIDAR_SPIN_HZ, SPIN_TICKS)
 
 __all__ = ["PolarSweep", "SPIN_PERIOD_S", "EDGE_TOLERANCE_M", "beam_ages", "advance_phase",
            "sweep_scan", "deskew", "deskew_history", "GyroModel",
-           "synthesize_gyro"]
+           "synthesize_gyro", "occlusion_mask", "apply_mount_occlusion"]
 
 #: Seconds per revolution. The quantity every function here is really about.
 SPIN_PERIOD_S = 1.0 / LIDAR_SPIN_HZ
@@ -111,10 +111,49 @@ def beam_ages(phase: torch.Tensor, beams: int) -> torch.Tensor:
 def advance_phase(phase: torch.Tensor, dt: float = DT) -> torch.Tensor:
     """Move the sweep on by one control period.
 
-    At 5.5 Hz and 20 Hz control this is 0.275 of a revolution per tick, which is
-    why no two consecutive observations share a freshest bearing.
+    At 7.32 Hz and 20 Hz control this is 0.366 of a revolution per tick, which
+    is why no two consecutive observations share a freshest bearing.
     """
     return (phase + LIDAR_SPIN_HZ * dt) % 1.0
+
+
+def occlusion_mask(angles: torch.Tensor) -> torch.Tensor:
+    """``(..., B)`` bearings in base_link -> ``True`` where the mount blocks.
+
+    See :data:`~sim2edge.spec.LIDAR_OCCLUSION_ARCS_RAD`. An arc is tested by
+    rotating the bearing into the arc's own frame, so an arc running past
+    ``+pi`` needs no special case: ``(theta - start) mod 2pi <= width``.
+    """
+    blocked = torch.zeros_like(angles, dtype=torch.bool)
+    two_pi = 2.0 * math.pi
+    for start, end in LIDAR_OCCLUSION_ARCS_RAD:
+        width = (end - start) % two_pi
+        offset = (angles - start) % two_pi
+        blocked |= offset <= width
+    return blocked
+
+
+def apply_mount_occlusion(ranges: torch.Tensor,
+                          angles: torch.Tensor) -> torch.Tensor:
+    """Blank the bearings the robot's own camera mount blocks.
+
+    Occluded beams become ``inf``, which is what the driver reports for them and
+    what :func:`~sim2edge.preprocess.bin_lidar` maps to ``INVALID_FILL`` -- the
+    same absence a genuine no-return produces. That agreement is the point.
+
+    This is **geometry, not noise**, and it is deliberately not in
+    :func:`~sim2edge.noise.corrupt_lidar` and not scaled by that function's
+    ``scale``. A noise scale of 0 is supposed to be a genuinely clean baseline,
+    and it still is -- but a robot's standoffs do not retract when you evaluate
+    it noiselessly, so this applies at every tier. Evaluations run before
+    2026-08-04 had no occlusion at all and their absolute rates are therefore
+    not comparable across this change.
+    """
+    if ranges.shape[-1] != angles.shape[-1]:
+        raise ValueError(
+            f"ranges and angles disagree on beam count: "
+            f"{ranges.shape[-1]} vs {angles.shape[-1]}")
+    return torch.where(occlusion_mask(angles), torch.inf, ranges)
 
 
 def sweep_scan(ranges_history: torch.Tensor, phase: torch.Tensor,
@@ -203,14 +242,14 @@ def deskew(ranges: torch.Tensor, angles: torch.Tensor, ages: torch.Tensor,
     A feature seen at body bearing ``phi`` when the robot had yaw ``theta_acq``
     sits at ``phi - (theta_now - theta_acq)`` now. With a constant-rate
     assumption over the beam's age that correction is ``-yaw_rate * age``, which
-    is exact to the extent the rate was constant over 182 ms and the gyro was
+    is exact to the extent the rate was constant over 137 ms and the gyro was
     right about it. Both assumptions fail gracefully: the residual is small and
     unbiased, where the uncorrected error is large and action-correlated.
 
     Translation is corrected only if ``forward_speed`` is given, and only from
     the *commanded* speed, because that is all the robot knows without the wheel
     odometry this design is removing. It is the weaker of the two corrections --
-    at 0.46 m/s and a 182 ms age the displacement is 8 cm, against a 2 cm range
+    at 0.46 m/s and a 137 ms age the displacement is 6 cm, against a 2 cm range
     noise -- but it is worth making because it is free and it removes a bias
     rather than a variance.
     """
@@ -244,7 +283,7 @@ def deskew_history(ranges: torch.Tensor, angles: torch.Tensor,
     ending at stored scan ``s``. ``sweep_scan`` selects a stored scan by rounding
     each beam age to a control tick; this function integrates that exact same
     number of motion intervals instead of pretending the newest rate held for
-    the entire 182 ms revolution.
+    the entire 137 ms revolution.
 
     Translation uses commands, not achieved motion, so this remains odometry
     free. Gyro supplies rotation. The residual is precisely the slip the motion

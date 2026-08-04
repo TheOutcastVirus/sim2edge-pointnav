@@ -27,7 +27,7 @@ import torch
 from . import noise as noise_mod
 from .preprocess import (bin_lidar, build_observation, goal_features,
                          rasterize_lidar, wrap_angle)
-from .sensors import deskew_history, sweep_scan
+from .sensors import apply_mount_occlusion, deskew_history, sweep_scan
 
 #: Reconstruct each sweep at sub-tick resolution rather than rounding every
 #: beam's acquisition time to the nearest stored scan. Sensor contract v2 makes
@@ -240,7 +240,7 @@ class Shard:
 
         This is where the spinning lidar actually gets simulated. For every
         output timestep the sweep is stitched from :data:`SPIN_TICKS` stored
-        instantaneous scans, so a single observation contains beams up to 182 ms
+        instantaneous scans, so a single observation contains beams up to 137 ms
         old -- which is what the hardware delivers and what the old
         instantaneous model never showed the policy.
         """
@@ -316,6 +316,10 @@ class Shard:
         noisy, angles = noise_mod.corrupt_lidar(
             ranges.reshape(n * width, beams), self.angles, noise_scale,
             generator, bearing_bias=bias.repeat_interleave(width, dim=0))
+        # Geometry, after the sensor's own error: the camera mount blocks fixed
+        # bearings in base_link, and a beam it blocks is reported at whatever
+        # bearing the (possibly mis-mounted) sensor claims for it.
+        noisy = apply_mount_occlusion(noisy, angles)
         noisy = noisy.reshape(n, width, beams)
         angles = angles.reshape(n, width, beams)
         # A clamped episode-boundary frame is one physical scan repeated in the
@@ -529,6 +533,7 @@ class Shard:
             ranges.reshape(n * width, beams), self.angles, noise_scale,
             generator,
             bearing_bias=bearing_bias.repeat_interleave(width, dim=0))
+        noisy = apply_mount_occlusion(noisy, angles)
         noisy = noisy.reshape(n, width, beams)
         angles = angles.reshape(n, width, beams)
         repeated = raw[:, 1:] == raw[:, :-1]
