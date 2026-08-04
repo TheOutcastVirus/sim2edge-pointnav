@@ -1,0 +1,30 @@
+{
+  "checkpoint": "/home/vkommera/Documents/Qualcomm/sim2edge-ventuno/runs/body_v2_actor_prod/best.pt",
+  "latency": {
+    "control_period_ms": 50.0,
+    "max_ms": 0.30675099696964025,
+    "median_ms": 0.1909440034069121,
+    "p95_ms": 0.22458599414676428
+  },
+  "motion_prior_source": "create3-ekf",
+  "observation_fingerprint": "1ec0c65912173121",
+  "operators": {
+    "add.Tensor": 1,
+    "cat.default": 2,
+    "conv1d.default": 3,
+    "flatten.using_ints": 1,
+    "linear.default": 6,
+    "mul.Tensor": 2,
+    "pad.default": 3,
+    "relu.default": 8,
+    "reshape.default": 1,
+    "slice.Tensor": 5,
+    "tanh.default": 1
+  },
+  "parameter_count": 290610,
+  "parity": {
+    "max_abs_difference": 0.0,
+    "tolerance": 1e-06
+  },
+  "sensor_contract_version": "body-frame-v2"
+}

@@ -1,0 +1,424 @@
+{
+  "digest": "e9ba1a4e3a86d6a9",
+  "root": "/home/vkommera/Documents/Qualcomm/sim2edge-ventuno/data/body_frame_v2_prod",
+  "seed": 0,
+  "sensor_contract_version": "body-frame-v2",
+  "spec_fingerprint": "ccbc8969019cefb4",
+  "split": "layout",
+  "train": [
+    {
+      "bytes": 186212242,
+      "path": "train/bc_000.npz",
+      "samples": 200116
+    },
+    {
+      "bytes": 185148845,
+      "path": "train/bc_001.npz",
+      "samples": 200032
+    },
+    {
+      "bytes": 183620926,
+      "path": "train/bc_002.npz",
+      "samples": 200003
+    },
+    {
+      "bytes": 183831299,
+      "path": "train/bc_003.npz",
+      "samples": 200023
+    },
+    {
+      "bytes": 183614080,
+      "path": "train/bc_004.npz",
+      "samples": 200030
+    },
+    {
+      "bytes": 183141801,
+      "path": "train/bc_005.npz",
+      "samples": 200045
+    },
+    {
+      "bytes": 183128898,
+      "path": "train/bc_006.npz",
+      "samples": 200178
+    },
+    {
+      "bytes": 183040329,
+      "path": "train/bc_007.npz",
+      "samples": 200037
+    },
+    {
+      "bytes": 182381422,
+      "path": "train/bc_008.npz",
+      "samples": 200035
+    },
+    {
+      "bytes": 182326602,
+      "path": "train/bc_009.npz",
+      "samples": 200133
+    },
+    {
+      "bytes": 182377149,
+      "path": "train/bc_010.npz",
+      "samples": 200227
+    },
+    {
+      "bytes": 182757409,
+      "path": "train/bc_011.npz",
+      "samples": 200000
+    },
+    {
+      "bytes": 182337373,
+      "path": "train/bc_012.npz",
+      "samples": 200271
+    },
+    {
+      "bytes": 182855856,
+      "path": "train/bc_013.npz",
+      "samples": 200292
+    },
+    {
+      "bytes": 182411100,
+      "path": "train/bc_014.npz",
+      "samples": 200118
+    },
+    {
+      "bytes": 182854303,
+      "path": "train/bc_015.npz",
+      "samples": 200333
+    },
+    {
+      "bytes": 182980986,
+      "path": "train/bc_016.npz",
+      "samples": 200306
+    },
+    {
+      "bytes": 182752784,
+      "path": "train/bc_017.npz",
+      "samples": 200111
+    },
+    {
+      "bytes": 182523788,
+      "path": "train/bc_018.npz",
+      "samples": 200188
+    },
+    {
+      "bytes": 182446148,
+      "path": "train/bc_019.npz",
+      "samples": 200206
+    },
+    {
+      "bytes": 182442023,
+      "path": "train/bc_020.npz",
+      "samples": 200055
+    },
+    {
+      "bytes": 182881936,
+      "path": "train/bc_021.npz",
+      "samples": 200015
+    },
+    {
+      "bytes": 182199975,
+      "path": "train/bc_022.npz",
+      "samples": 200180
+    },
+    {
+      "bytes": 182641824,
+      "path": "train/bc_023.npz",
+      "samples": 200441
+    },
+    {
+      "bytes": 182125441,
+      "path": "train/bc_024.npz",
+      "samples": 200276
+    },
+    {
+      "bytes": 182251658,
+      "path": "train/bc_025.npz",
+      "samples": 200227
+    },
+    {
+      "bytes": 183109151,
+      "path": "train/bc_026.npz",
+      "samples": 200233
+    },
+    {
+      "bytes": 182067587,
+      "path": "train/bc_027.npz",
+      "samples": 200001
+    },
+    {
+      "bytes": 182209775,
+      "path": "train/bc_028.npz",
+      "samples": 200230
+    },
+    {
+      "bytes": 182813099,
+      "path": "train/bc_029.npz",
+      "samples": 200197
+    },
+    {
+      "bytes": 181921907,
+      "path": "train/bc_030.npz",
+      "samples": 200025
+    },
+    {
+      "bytes": 182574688,
+      "path": "train/bc_031.npz",
+      "samples": 200265
+    },
+    {
+      "bytes": 183047825,
+      "path": "train/bc_032.npz",
+      "samples": 200144
+    },
+    {
+      "bytes": 182742671,
+      "path": "train/bc_033.npz",
+      "samples": 200033
+    },
+    {
+      "bytes": 182066843,
+      "path": "train/bc_034.npz",
+      "samples": 200113
+    },
+    {
+      "bytes": 182797987,
+      "path": "train/bc_035.npz",
+      "samples": 200201
+    },
+    {
+      "bytes": 182866977,
+      "path": "train/bc_036.npz",
+      "samples": 200386
+    },
+    {
+      "bytes": 181841234,
+      "path": "train/bc_037.npz",
+      "samples": 200039
+    },
+    {
+      "bytes": 182739580,
+      "path": "train/bc_038.npz",
+      "samples": 200144
+    },
+    {
+      "bytes": 182749830,
+      "path": "train/bc_039.npz",
+      "samples": 200327
+    },
+    {
+      "bytes": 182732038,
+      "path": "train/bc_040.npz",
+      "samples": 200039
+    },
+    {
+      "bytes": 182555323,
+      "path": "train/bc_041.npz",
+      "samples": 200065
+    },
+    {
+      "bytes": 181708087,
+      "path": "train/bc_042.npz",
+      "samples": 200041
+    },
+    {
+      "bytes": 183035229,
+      "path": "train/bc_043.npz",
+      "samples": 200404
+    },
+    {
+      "bytes": 182217530,
+      "path": "train/bc_044.npz",
+      "samples": 200178
+    },
+    {
+      "bytes": 182698445,
+      "path": "train/bc_045.npz",
+      "samples": 200228
+    },
+    {
+      "bytes": 182517785,
+      "path": "train/bc_046.npz",
+      "samples": 200232
+    },
+    {
+      "bytes": 182129574,
+      "path": "train/bc_047.npz",
+      "samples": 200000
+    },
+    {
+      "bytes": 182369739,
+      "path": "train/bc_048.npz",
+      "samples": 200082
+    },
+    {
+      "bytes": 182296365,
+      "path": "train/bc_049.npz",
+      "samples": 200142
+    },
+    {
+      "bytes": 182591089,
+      "path": "train/bc_050.npz",
+      "samples": 200120
+    },
+    {
+      "bytes": 182841132,
+      "path": "train/bc_051.npz",
+      "samples": 200207
+    },
+    {
+      "bytes": 182574511,
+      "path": "train/bc_052.npz",
+      "samples": 200141
+    },
+    {
+      "bytes": 182039078,
+      "path": "train/bc_053.npz",
+      "samples": 200125
+    },
+    {
+      "bytes": 182612929,
+      "path": "train/bc_054.npz",
+      "samples": 200168
+    },
+    {
+      "bytes": 182051611,
+      "path": "train/bc_055.npz",
+      "samples": 200256
+    },
+    {
+      "bytes": 182167944,
+      "path": "train/bc_056.npz",
+      "samples": 200013
+    },
+    {
+      "bytes": 183162427,
+      "path": "train/bc_057.npz",
+      "samples": 200239
+    },
+    {
+      "bytes": 182779747,
+      "path": "train/bc_058.npz",
+      "samples": 200140
+    },
+    {
+      "bytes": 182256671,
+      "path": "train/bc_059.npz",
+      "samples": 200291
+    },
+    {
+      "bytes": 181977857,
+      "path": "train/bc_060.npz",
+      "samples": 200117
+    },
+    {
+      "bytes": 182015190,
+      "path": "train/bc_061.npz",
+      "samples": 200069
+    },
+    {
+      "bytes": 182607635,
+      "path": "train/bc_062.npz",
+      "samples": 200082
+    },
+    {
+      "bytes": 182806900,
+      "path": "train/bc_063.npz",
+      "samples": 200164
+    },
+    {
+      "bytes": 183127244,
+      "path": "train/bc_064.npz",
+      "samples": 200057
+    },
+    {
+      "bytes": 182537964,
+      "path": "train/bc_065.npz",
+      "samples": 200163
+    },
+    {
+      "bytes": 182627812,
+      "path": "train/bc_066.npz",
+      "samples": 200091
+    },
+    {
+      "bytes": 182050893,
+      "path": "train/bc_067.npz",
+      "samples": 200073
+    },
+    {
+      "bytes": 182143949,
+      "path": "train/bc_068.npz",
+      "samples": 200085
+    },
+    {
+      "bytes": 182298098,
+      "path": "train/bc_069.npz",
+      "samples": 200130
+    },
+    {
+      "bytes": 182075754,
+      "path": "train/bc_070.npz",
+      "samples": 200123
+    },
+    {
+      "bytes": 182386176,
+      "path": "train/bc_071.npz",
+      "samples": 200329
+    },
+    {
+      "bytes": 182661738,
+      "path": "train/bc_072.npz",
+      "samples": 200211
+    },
+    {
+      "bytes": 182889505,
+      "path": "train/bc_073.npz",
+      "samples": 200335
+    },
+    {
+      "bytes": 182767249,
+      "path": "train/bc_074.npz",
+      "samples": 200561
+    },
+    {
+      "bytes": 182060026,
+      "path": "train/bc_075.npz",
+      "samples": 200271
+    },
+    {
+      "bytes": 40529738,
+      "path": "train/bc_076.npz",
+      "samples": 44782
+    }
+  ],
+  "train_samples": 15256970,
+  "validation": [
+    {
+      "bytes": 183091190,
+      "path": "validation/bc_000.npz",
+      "samples": 200069
+    },
+    {
+      "bytes": 182928988,
+      "path": "validation/bc_001.npz",
+      "samples": 200268
+    },
+    {
+      "bytes": 182390707,
+      "path": "validation/bc_002.npz",
+      "samples": 200302
+    },
+    {
+      "bytes": 182611753,
+      "path": "validation/bc_003.npz",
+      "samples": 200031
+    },
+    {
+      "bytes": 35469612,
+      "path": "validation/bc_004.npz",
+      "samples": 38741
+    }
+  ],
+  "validation_samples": 839411
+}

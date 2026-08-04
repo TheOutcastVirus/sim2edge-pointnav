@@ -1,0 +1,48 @@
+{
+  "checkpoint": "/home/vkommera/Documents/Qualcomm/sim2edge-ventuno/runs/body_v2_actor_prod/best.pt",
+  "sensor_contract_version": "body-frame-v2",
+  "motion_prior_source": "create3-translation-gyro",
+  "correction_gain": 0.1,
+  "yaw_correction_gain": 0.05,
+  "arrival_radius_m": 0.2,
+  "episodes": 32,
+  "layout_seed": 21000000,
+  "tiers": [
+    {
+      "noise_scale": 1.0,
+      "correct_declared_arrival_rate": 0.90625,
+      "false_arrival_rate": 0.0,
+      "collision_rate": 0.09375,
+      "timeout_rate": 0.0,
+      "truth_reached_rate": 0.90625,
+      "mean_final_belief_error_m": 0.0987515306861943,
+      "p95_final_belief_error_m": 0.17736500573249445,
+      "mean_final_truth_distance_m": 0.44658652727957815,
+      "mean_final_belief_distance_m": 0.41527881659567356,
+      "mean_final_sigma_m": 0.04699354214874321,
+      "timeout_mean_truth_distance_m": NaN,
+      "timeout_mean_belief_distance_m": NaN,
+      "timeout_mean_sigma_m": NaN,
+      "observable_update_rate": 0.9325096319914973,
+      "mean_actor_inference_ms": 2.013498042691937
+    },
+    {
+      "noise_scale": 2.0,
+      "correct_declared_arrival_rate": 0.65625,
+      "false_arrival_rate": 0.1875,
+      "collision_rate": 0.125,
+      "timeout_rate": 0.03125,
+      "truth_reached_rate": 0.75,
+      "mean_final_belief_error_m": 0.19088405385301388,
+      "p95_final_belief_error_m": 0.48873539362325136,
+      "mean_final_truth_distance_m": 0.5168630153639242,
+      "mean_final_belief_distance_m": 0.4339156375499442,
+      "mean_final_sigma_m": 0.048353226565289335,
+      "timeout_mean_truth_distance_m": 0.42935118079185486,
+      "timeout_mean_belief_distance_m": 0.286029577255249,
+      "timeout_mean_sigma_m": 0.06793205255409138,
+      "observable_update_rate": 0.9358431182665536,
+      "mean_actor_inference_ms": 1.9015368370001289
+    }
+  ]
+}

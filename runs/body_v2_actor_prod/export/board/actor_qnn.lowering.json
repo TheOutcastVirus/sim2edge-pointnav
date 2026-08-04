@@ -1,0 +1,65 @@
+{
+  "activation_observer": "min_max",
+  "calibration": {
+    "driver": [
+      "oracle"
+    ],
+    "noise_scale": 1.0,
+    "observation_dim": 731,
+    "observation_fingerprint": "1ec0c65912173121",
+    "samples": 1024,
+    "seed": 20260804,
+    "sensor_contract_version": [
+      "body-frame-v2"
+    ],
+    "shards": [
+      "bc_000.npz",
+      "bc_001.npz",
+      "bc_002.npz",
+      "bc_003.npz",
+      "bc_004.npz",
+      "bc_005.npz",
+      "bc_006.npz",
+      "bc_007.npz"
+    ],
+    "source": "/home/vkommera/Documents/Qualcomm/sim2edge-ventuno/data/body_frame_v2_prod",
+    "spec_fingerprint": "ccbc8969019cefb4"
+  },
+  "checkpoint": "/home/ubuntu/sim2edge-deploy/best.pt",
+  "circular_padding_rewritten": true,
+  "circular_rewrite_max_abs_difference": 0.0,
+  "delegation": {
+    "delegate_calls": 1,
+    "fallback_operators": {},
+    "fully_delegated": true
+  },
+  "lowering_seconds": 11.486873809946701,
+  "observation_fingerprint": "1ec0c65912173121",
+  "per_channel": true,
+  "precision": "use_16a8w",
+  "pte": "/home/ubuntu/sim2edge-deploy/out/actor_qnn.pte",
+  "pte_bytes": 381576,
+  "quantization_error": {
+    "max_abs": 0.03288392722606659,
+    "mean_abs": 0.004397612996399403,
+    "per_axis": {
+      "omega": {
+        "limit": 1.9,
+        "max_abs": 0.03288392722606659,
+        "max_fraction_of_limit": 0.017307330118982417,
+        "mean_abs": 0.007895821705460548,
+        "mean_fraction_of_limit": 0.004155695634452921
+      },
+      "v": {
+        "limit": 0.46,
+        "max_abs": 0.011204518377780914,
+        "max_fraction_of_limit": 0.024357648647349812,
+        "mean_abs": 0.0008994045783765614,
+        "mean_fraction_of_limit": 0.0019552273442968726
+      }
+    },
+    "reference_abs_mean": 0.3807181417942047
+  },
+  "sensor_contract_version": "body-frame-v2",
+  "soc_model": "QCS8300"
+}

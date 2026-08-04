@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/home/vkommera/Documents/Qualcomm/sim2edge-ventuno/runs/body_v2_actor_prod/best.pt",
+  "sensor_contract_version": "body-frame-v2",
+  "motion_prior_source": "command-gyro",
+  "correction_gain": 0.2,
+  "yaw_correction_gain": 0.2,
+  "episodes": 32,
+  "layout_seed": 20000000,
+  "tiers": [
+    {
+      "noise_scale": 0.0,
+      "correct_declared_arrival_rate": 0.78125,
+      "false_arrival_rate": 0.0,
+      "collision_rate": 0.0625,
+      "timeout_rate": 0.15625,
+      "mean_final_belief_error_m": 0.030595213817606805,
+      "p95_final_belief_error_m": 0.06965414542952574,
+      "observable_update_rate": 0.7331496605333071,
+      "mean_actor_inference_ms": 2.162123863601513
+    },
+    {
+      "noise_scale": 2.0,
+      "correct_declared_arrival_rate": 0.78125,
+      "false_arrival_rate": 0.03125,
+      "collision_rate": 0.09375,
+      "timeout_rate": 0.09375,
+      "mean_final_belief_error_m": 0.09648563763798874,
+      "p95_final_belief_error_m": 0.22551590247730108,
+      "observable_update_rate": 0.7822327044025157,
+      "mean_actor_inference_ms": 1.8081457562483545
+    }
+  ]
+}

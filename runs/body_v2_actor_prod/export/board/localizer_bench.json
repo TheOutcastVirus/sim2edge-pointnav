@@ -1,0 +1,22 @@
+{
+  "all_ticks": {
+    "max_ms": 28.458487940952182,
+    "median_ms": 14.175415504723787,
+    "p95_ms": 26.82897999184206
+  },
+  "control_period_ms": 50.0,
+  "max_submap_scans": 128,
+  "mean_valid_returns": 720.0,
+  "point_stride": 2,
+  "scans": "scans.npz",
+  "steady_state": {
+    "fraction_of_control_period": 0.5322347907349467,
+    "max_ms": 28.458487940952182,
+    "median_ms": 26.611739536747336,
+    "p95_ms": 27.748989406973124,
+    "ticks": 156
+  },
+  "submap_filled_at_tick": 127,
+  "threads": 1,
+  "ticks": 1680
+}

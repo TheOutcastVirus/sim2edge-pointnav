@@ -1,0 +1,26 @@
+{
+  "checkpoint": "/home/vkommera/Documents/Qualcomm/sim2edge-ventuno/runs/body_v2_actor_prod/best.pt",
+  "episodes": 32,
+  "layout_seed": 20000000,
+  "motion_prior_source": "command-gyro",
+  "num_layouts": 512,
+  "observation_fingerprint": "1ec0c65912173121",
+  "paired_layouts_across_tiers": true,
+  "sensor_contract_version": "body-frame-v2",
+  "spec_fingerprint": "ccbc8969019cefb4",
+  "speed_cap_full_m": null,
+  "speed_cap_stop_m": null,
+  "tiers": [
+    {
+      "collision_rate": 0.0625,
+      "mean_inference_ms": 1.0149986568570097,
+      "mean_jerk": 0.42386481165885925,
+      "mean_time_to_goal_s": 10.305001258850098,
+      "noise_scale": 0.0,
+      "speed_cap_activation_rate": 0.0,
+      "spl": 0.926480233669281,
+      "success_rate": 0.9375,
+      "timeout_rate": 0.0
+    }
+  ]
+}
