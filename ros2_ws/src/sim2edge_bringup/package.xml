@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sim2edge_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Launch files, DDS configuration and board scripts for the sim2edge stack on
+    the Ventuno Q.
+  </description>
+  <maintainer email="vkommera@ucsd.edu">Vikram Kommera</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>sim2edge_nodes</exec_depend>
+  <exec_depend>sim2edge_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!-- Both are optional at runtime: the replay test needs neither, and the
+       board can build the workspace without an OAK-D attached. -->
+  <exec_depend>sllidar_ros2</exec_depend>
+  <exec_depend>oak_imu</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

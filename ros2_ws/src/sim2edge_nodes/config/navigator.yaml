@@ -1,0 +1,48 @@
+# Production navigator configuration.
+#
+# The localizer numbers are the ones measured in docs/daily/2026_08_04_log.md;
+# submap 128 / stride 2 is what the accuracy evaluations were run at. Cost is
+# near-linear in submap size and in 1/point_stride, so there is headroom if it
+# is ever needed -- but point_stride 4 has NOT been evaluated for accuracy, only
+# for latency, and must not be adopted on the strength of the timing table.
+/**:
+  ros__parameters:
+    control_period_s: 0.05
+
+    model_path: ""            # set by the launch file
+    backend: "qnn"            # "qnn" | "cpu"
+    qnn_lib_dir: ""           # set from QNN_SDK_ROOT by the launch file
+
+    # A stale scan is worse than a slightly old one, but holding is worse than
+    # both unless it is really stale. One revolution is 182 ms, so 250 ms
+    # tolerates a single dropped message and no more.
+    scan_max_age_s: 0.25
+    imu_max_age_s: 0.15
+    odom_max_age_s: 0.25
+    require_odom: true
+
+    # Goals arrive as a body-frame offset. Set false to interpret them in the
+    # odom frame instead, which requires odometry to already be flowing.
+    goal_is_body_frame: true
+
+    # false is the self-contained arm: lidar, gyro, and the base's velocity.
+    # true adds the Create 3's own odometry increment as the motion prior --
+    # stronger, but no longer lidar/IMU-only. The localizer stamps which one
+    # was used so the distinction survives into the log.
+    use_odometry_prior: false
+
+    localizer:
+      max_submap_scans: 128
+      point_stride: 2
+      correction_gain: 0.10
+      yaw_correction_gain: 0.05
+      max_correction_m: 0.12
+      max_correction_yaw_deg: 4.0
+      motion_scale_update_rate: 0.02
+      min_points: 60
+      max_iterations: 6
+
+    arrival:
+      radius_m: 0.15
+      ticks: 3
+      travel_sigma_per_m: 0.01

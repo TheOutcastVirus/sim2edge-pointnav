@@ -1,0 +1,38 @@
+# Re-find ExecuTorch on behalf of anything that links sim2edge_core.
+#
+# ament runs this automatically from `find_package(sim2edge_core)`.
+#
+# It has to exist because sim2edge_core is a *static* library. A static archive
+# records the names of the libraries it needs but carries none of their objects,
+# so a consumer linking it must resolve `executorch`, `portable_ops_lib` and the
+# rest itself. Without this the consumer fails with a wall of
+# `cannot find -lexecutorch_core`, which is an accurate message about a
+# confusing situation.
+#
+# The install prefix is baked in at build time rather than re-derived, so a
+# consumer does not have to be told the same -DEXECUTORCH_INSTALL_DIR that the
+# core was built with -- and cannot accidentally be told a different one.
+
+set(SIM2EDGE_HAVE_EXECUTORCH @SIM2EDGE_HAVE_EXECUTORCH@)
+set(SIM2EDGE_EXECUTORCH_INSTALL_DIR "@EXECUTORCH_INSTALL_DIR@")
+
+if(SIM2EDGE_HAVE_EXECUTORCH)
+  list(APPEND CMAKE_PREFIX_PATH "${SIM2EDGE_EXECUTORCH_INSTALL_DIR}")
+
+  # The native Qualcomm ExecuTorch build exports optional LLM/tokenizer targets
+  # even when a consumer only touches the runtime module API. Predefining them
+  # lets its package config load without the whole tokenizer dependency graph.
+  foreach(_tokenizer_target
+    tokenizers::regex_lookahead
+    tokenizers::pcre2-8-static
+    tokenizers::tokenizers
+    tokenizers::re2
+    tokenizers::sentencepiece-static
+  )
+    if(NOT TARGET ${_tokenizer_target})
+      add_library(${_tokenizer_target} INTERFACE IMPORTED)
+    endif()
+  endforeach()
+
+  find_package(executorch REQUIRED)
+endif()

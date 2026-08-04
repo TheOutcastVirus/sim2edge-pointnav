@@ -1,0 +1,25 @@
+# The safety layer's limits.
+#
+# stop_distance_m is larger than the Create 3's 16.4 cm body radius on purpose:
+# the bumper should not be the thing that discovers the wall. It is deliberately
+# NOT tied to the policy's ROBOT_RADIUS_M planning inflation -- these answer
+# different questions and conflating them has been a real bug in this project.
+/**:
+  ros__parameters:
+    period_s: 0.05
+    command_timeout_s: 0.30
+    scan_timeout_s: 0.50
+    require_scan: true
+
+    stop_distance_m: 0.25
+    slow_distance_m: 0.55
+    forward_half_angle_deg: 35.0
+
+    # The Create 3's real envelope, from sim2edge/spec.py. An oracle allowed to
+    # exceed these produces a policy that faithfully imitates commands the base
+    # cannot track, and the resulting error looks like perception while
+    # actually being dynamics.
+    v_max: 0.46
+    omega_max: 1.90
+    accel_max: 0.90
+    alpha_max: 3.00

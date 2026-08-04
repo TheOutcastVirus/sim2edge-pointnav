@@ -17,3 +17,9 @@ runs/
 # Nested Isaac Lab checkout, if you move it in here
 /IsaacLab/
 old/
+
+# colcon build trees
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+ros2_ws/replays/

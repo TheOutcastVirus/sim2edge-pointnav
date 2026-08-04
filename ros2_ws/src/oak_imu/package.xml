@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>oak_imu</name>
+  <version>0.1.0</version>
+  <description>
+    The OAK-D's rate gyro, published as sensor_msgs/Imu at the sensor's own
+    rate. This is the robot's only source of rotation, and it feeds both the
+    localizer's motion prior and the lidar deskew.
+  </description>
+  <maintainer email="vkommera@ucsd.edu">Vikram Kommera</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>depthai_v3</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

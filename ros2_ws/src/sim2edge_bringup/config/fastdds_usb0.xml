@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pin Fast DDS discovery to the Create 3 USB gadget link.
+
+  The board has several NICs and Wi-Fi holds the default route, so Fast DDS
+  joins discovery multicast on Wi-Fi and never hears the base -- even though
+  tcpdump plainly shows the base's SPDP arriving on usb0. Whitelisting the
+  interfaces here is the fix.
+
+  Loopback is included so that nodes on the board still find each other; drop
+  it and the navigator and safety layer stop seeing one another, which is a
+  confusing way to discover this file exists.
+
+  ROS_DISCOVERY_SERVER must stay unset: this base uses simple/multicast
+  discovery, and a discovery server on our side silently talks to nobody.
+
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    export FASTRTPS_DEFAULT_PROFILES_FILE=<this file>
+    export ROS_DOMAIN_ID=0
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>usb0_transport</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList>
+        <address>127.0.0.1</address>
+        <address>192.168.186.3</address>
+      </interfaceWhiteList>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <participant profile_name="usb0_participant" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>usb0_transport</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

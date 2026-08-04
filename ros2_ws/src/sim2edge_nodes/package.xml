@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sim2edge_nodes</name>
+  <version>0.1.0</version>
+  <description>
+    The ROS 2 layer of the sim2edge navigation stack: the navigator (one node
+    owning deskew, localization and inference), the safety layer that owns
+    /cmd_vel, and a replay publisher for on-board testing without hardware.
+  </description>
+  <maintainer email="vkommera@ucsd.edu">Vikram Kommera</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>sim2edge_core</depend>
+  <depend>sim2edge_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

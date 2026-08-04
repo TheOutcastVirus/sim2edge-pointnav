@@ -974,11 +974,7 @@ Cost is near-linear in submap size and in `1/point_stride`; the full table is in
 `docs/daily/2026_08_04_log.md`. `point_stride 4` halves the dominant cost in the
 loop and has **not** been evaluated for accuracy.
 
-## 4. Still to build
-
-The quantization gate itself, the C++ node, and the preprocessing parity test.
-`archive/v1-numpy-pipeline` holds a working version of the last two —
-`tools/parity_check.py`, `ros_ws/src/nav_policy_node/src/preprocess_parity.cpp`.
+## 4. The quantization gate is still to run
 
 The gate is a **sim success-rate drop under 2 points**, not an action MSE: a
 small action error can still cost success at exactly the moments that matter.
@@ -987,6 +983,116 @@ escalate in order — calibration data first. `data/body_frame_v2_prod` is
 `driver = "oracle"`, so the deployed policy's own state distribution is the
 stronger source, and `dump_calibration.py` warns whenever the corpus is not
 policy-driven.
+
+The action half of it has now been measured twice, independently, and the two
+agree: 0.42% mean / 1.71–1.73% max of the omega limit, once from `lower_qnn.py`
+in Python and once from the C++ node path on the board. That is necessary and
+not sufficient.
+
+---
+
+# Phase 6 — The ROS 2 stack
+
+`ros2_ws/` is the deployed robot. It builds from this same repository on the
+training host and on the Ventuno; `docs/daily/2026_08_04_ros2_log.md` records
+how it was measured.
+
+## Build
+
+On the board:
+
+```bash
+cd ~/sim2edge-ventuno/ros2_ws
+source src/sim2edge_bringup/scripts/ventuno_env.sh   # QNN + ExecuTorch paths
+source /opt/ros/jazzy/setup.bash
+colcon build --cmake-args -DEXECUTORCH_INSTALL_DIR=/opt/executorch/build-x86
+```
+
+On the training host the same `colcon build` works with no arguments. Without
+ExecuTorch the preprocessing, deskew and localizer paths still build, which is
+everything the parity gate compares.
+
+`ventuno_env.sh` carries the facts that are not guessable — the
+`aarch64-oe-linux-gcc11.2` ordering, `ADSP_LIBRARY_PATH`, `PYTHONPATH=/opt`, and
+the ExecuTorch shared-library directory. Read its comments before changing any
+of them.
+
+## Pin the navigator to a big core. This is not tuning.
+
+The QCS8275 is 4× Cortex-A78C (`cpu0-3`) plus 4× Cortex-A55 (`cpu4-7`). The
+localizer costs **6.98 ms on `cpu2` and 53.57 ms on `cpu6`** — 7.7×, against a
+clock ratio of 1.2×, because scan-to-submap matching is memory-bound
+nearest-neighbour work and an in-order A55 is close to its worst case. On an A55
+the localizer alone exceeds the entire 50 ms control period.
+
+Both launch files default `nav_cpus:=2,3` and apply it with `taskset`. Unpinned,
+35 of ~2,200 ticks missed the period; pinned, 0 of 2,114 did.
+
+## Test it without a robot
+
+```bash
+# On the host: record held-out episodes plus what Python produced from them.
+.venv/bin/python tools/export_replay.py \
+    --data data/body_frame_v2_prod/validation --episodes 12 \
+    --checkpoint runs/body_v2_actor_prod/best.pt \
+    --out ros2_ws/replays/validation_12.s2e
+
+# On the board: numeric agreement, per stage, plus latency.
+./build/sim2edge_core/sim2edge_parity \
+    --replay replays/validation_12.s2e --model models/actor_qnn.pte \
+    --backend qnn --qnn-lib-dir $QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2
+
+# The localizer knobs, swept.
+./build/sim2edge_core/sim2edge_bench --replay replays/validation_12.s2e
+
+# The real node graph, driven from the same recording.
+ros2 launch sim2edge_bringup replay_test.launch.py \
+    replay:=$PWD/replays/validation_12.s2e model:=$PWD/models/actor_qnn.pte \
+    qnn_lib_dir:=$QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2
+```
+
+`--checkpoint` matters. Without it the replay records the corpus's stored oracle
+command as its reference, and the parity report's action row then measures how
+far the policy is from its teacher rather than quantization error. The file
+records which reference it holds and the report says which.
+
+**The two tools answer different questions.** `sim2edge_parity` answers "do the
+numbers agree" and runs on a laptop. The launch answers "does the graph come up,
+hold 20 Hz under real DDS load, and deliver a command inside the period".
+Neither answers whether the robot navigates: the corpus was oracle-driven, so
+the recorded pose does not respond to what the policy commands.
+
+## Run the robot
+
+```bash
+ros2 launch sim2edge_bringup robot.launch.py \
+    model:=$PWD/models/actor_qnn.pte \
+    qnn_lib_dir:=$QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2
+```
+
+Three inputs reach the policy and no others: the lidar sweep, the OAK-D gyro,
+and the Create 3's velocity. Point at a goal once with `/goal_pose` as a
+body-frame offset; nothing else consults an external frame.
+
+`sim2edge_safety` owns `/cmd_vel` and is a separate process on purpose, so that
+it keeps stopping the robot when the navigator crashes. The navigator publishes
+a proposal on `nav/command` and never touches the motors.
+
+**No hardware has been attached to any of this.** The board has no device on
+`/dev/ttyUSB*` and no OAK-D connected, so `serial_port`, the A1's real spin rate
+and the gyro's sign are all unverified.
+
+## Regenerate the C++ spec header after touching `spec.py`
+
+```bash
+.venv/bin/python tools/gen_spec_header.py            # rewrite
+.venv/bin/python tools/gen_spec_header.py --check    # fail if stale
+```
+
+The generated header carries the observation fingerprint, and the actor loader,
+the parity harness and the replay node all compare against it. A graph exported
+under a different preprocessing contract returns plausible-looking garbage
+rather than an error, which is why that comparison is load-bearing.
 
 ---
 
@@ -1081,6 +1187,8 @@ hardware; `--speed 0` runs free.
 ```
 sim2edge/        simulator-free core: spec, grids, rooms, oracle,
                  preprocess, noise, dataset, localization
+ros2_ws/         the deployed robot: C++ ROS 2 workspace, builds on the
+                 training host and on the Ventuno from this same tree
 isaaclab_env/    Isaac Lab adapter -- owns no task definition;
                  nav_task.py (batch) and interactive.py (viewer)
 scripts/         collect_bc.py, verify_shard.py, train_bc.py,

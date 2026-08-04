@@ -1,0 +1,24 @@
+/**:
+  ros__parameters:
+    frame_id: "oak_imu_frame"
+
+    # 200 Hz gives ten samples per 50 ms control period and about thirty-six
+    # across one 182 ms lidar revolution. That density is what lets the
+    # navigator build the deskew rotation as a measured integral rather than
+    # extrapolating from one sampled rate -- which matters most during a hard
+    # avoidance turn, exactly when the skew is largest.
+    gyro_hz: 200
+    accel_hz: 200
+
+    # The stack uses only angular_velocity.z. The accelerometer is published
+    # anyway because it costs nothing here and its absence is the kind of thing
+    # that is discovered at 2am while debugging something else.
+    publish_accel: true
+
+    batch_report_threshold: 1
+    max_batch_reports: 10
+
+    # Device timestamps, not arrival time: the consumer integrates these over
+    # precise intervals and USB scheduling jitter would land directly in the
+    # deskew correction.
+    use_device_time: true
