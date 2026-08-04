@@ -50,6 +50,7 @@ def generate_launch_description() -> LaunchDescription:
     use_lidar = LaunchConfiguration("use_lidar")
     use_imu = LaunchConfiguration("use_imu")
     use_odometry_prior = LaunchConfiguration("use_odometry_prior")
+    require_odom = LaunchConfiguration("require_odom")
     nav_cpus = LaunchConfiguration("nav_cpus")
 
     navigator_config = PathJoinSubstitution(
@@ -82,6 +83,15 @@ def generate_launch_description() -> LaunchDescription:
                         "worst case. Left to the scheduler, the loop misses "
                         "its 50 ms period whenever it migrates. cpu2-3 are the "
                         "fastest pair at 2.36 GHz. Empty disables pinning"),
+        DeclareLaunchArgument("require_odom", default_value="true",
+            description="hold the control loop until the base's /odom is "
+                        "flowing. true is right for the robot: without the "
+                        "base there is no velocity for the motion prior and "
+                        "nothing to drive. Set false to bring the stack up on "
+                        "the lidar and gyro alone -- the loop then runs and "
+                        "can be timed, but the prior loses its speed term, so "
+                        "such a run is a latency and numerics result and NOT "
+                        "evidence about navigation"),
         DeclareLaunchArgument("use_odometry_prior", default_value="false",
             description="false keeps the motion prior to gyro + velocity, "
                         "which is the self-contained arm. true uses the "
@@ -142,6 +152,7 @@ def generate_launch_description() -> LaunchDescription:
                 "backend": backend,
                 "qnn_lib_dir": qnn_lib_dir,
                 "use_odometry_prior": use_odometry_prior,
+                "require_odom": require_odom,
             }],
             # /odom and /cmd_vel are at the root namespace because that is
             # where this Create 3's Iron firmware publishes and subscribes.
