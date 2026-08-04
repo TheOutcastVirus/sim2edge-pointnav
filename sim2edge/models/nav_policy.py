@@ -18,6 +18,7 @@ compatibility is tested now rather than discovered after training.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -26,8 +27,9 @@ from torch import nn
 
 from ..spec import HISTORY_FRAMES, LIDAR_BINS, OMEGA_MAX, V_MAX
 
-__all__ = ["NavPolicy", "NavPolicyConfig", "build_encoder", "encode",
-           "initialize_layer", "physical_action"]
+__all__ = ["CircularPadConv1d", "NavPolicy", "NavPolicyConfig",
+           "build_encoder", "encode", "initialize_layer", "physical_action",
+           "rewrite_circular_convolutions"]
 
 
 @dataclass(frozen=True)
@@ -188,6 +190,60 @@ class NavPolicy(nn.Module):
 
     def example_input(self, batch_size: int = 1, device=None) -> torch.Tensor:
         return torch.zeros(batch_size, self.config.observation_dim, device=device)
+
+
+class CircularPadConv1d(nn.Module):
+    """A circular-padded ``Conv1d`` written as an explicit wrap-around concat.
+
+    Numerically this is what ``padding_mode="circular"`` already does: torch
+    applies ``F.pad(x, (p, p), mode="circular")`` and then convolves with zero
+    padding, and that pad *is* a concatenation of the two wrapped edges.
+
+    It exists because the two spellings lower differently. Exported through
+    ExecuTorch, the built-in form becomes a scatter into an uninitialized
+    buffer -- ``dim_order_ops._empty_dim_order`` plus a chain of ``slice_copy``
+    and ``slice_scatter`` -- which the QNN partitioner has no visitor for, so
+    it raises ``KeyError`` instead of declining the node. The concat form uses
+    only ``cat`` and ``convolution``, both of which QNN delegates.
+
+    Wrapping is the correct boundary here regardless of lowering: bin 0 and bin
+    ``LIDAR_BINS - 1`` are adjacent bearings on one revolution, so zero padding
+    would teach the filters a discontinuity that the sensor does not have.
+    """
+
+    def __init__(self, conv: nn.Conv1d):
+        super().__init__()
+        if conv.padding_mode != "circular":
+            raise ValueError("expected a circular-padded Conv1d")
+        (self.pad,) = set(conv.padding)
+        # Same weights, same object identity for the parameters: only the
+        # padding responsibility moves out of the convolution.
+        self.conv = nn.Conv1d(
+            conv.in_channels, conv.out_channels, conv.kernel_size,
+            stride=conv.stride, padding=0, dilation=conv.dilation,
+            groups=conv.groups, bias=conv.bias is not None)
+        self.conv.weight = conv.weight
+        self.conv.bias = conv.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pad:
+            x = torch.cat((x[..., -self.pad:], x, x[..., :self.pad]), dim=-1)
+        return self.conv(x)
+
+
+def rewrite_circular_convolutions(module: nn.Module) -> nn.Module:
+    """Deep-copy ``module`` with every circular ``Conv1d`` rewritten for export.
+
+    The copy is deliberate: training, Isaac evaluation and every checkpoint keep
+    the original module and its parameter names untouched, and only the exported
+    graph sees the rewrite.
+    """
+    deployable = copy.deepcopy(module)
+    for parent in deployable.modules():
+        for name, child in list(parent.named_children()):
+            if isinstance(child, nn.Conv1d) and child.padding_mode == "circular":
+                setattr(parent, name, CircularPadConv1d(child))
+    return deployable
 
 
 def initialize_layer(module: nn.Module) -> None:

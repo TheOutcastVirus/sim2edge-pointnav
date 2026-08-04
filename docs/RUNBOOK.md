@@ -31,7 +31,7 @@ instead.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-307 pass, 3 skipped without Isaac. No GPU or simulator required — keep it that way.
+311 pass, 3 skipped without Isaac. No GPU or simulator required — keep it that way.
 
 ---
 
@@ -872,17 +872,121 @@ inline. A divergence there would appear only as an unexplained sim-to-real gap.
 
 The vote itself costs 0.42 ms single-threaded at 21 bins and 0.86 ms at 31.
 
-## 2. Still to build
+## 2. Lower to the NPU, on the board
 
-INT8 calibration from the final policy's own state distribution, the QNN
-lowering on the board, the C++ node, and the preprocessing parity test against
-it. `archive/v1-numpy-pipeline` holds a working version of all four —
-`tools/export_qnn.py`, `tools/parity_check.py`,
-`ros_ws/src/nav_policy_node/src/preprocess_parity.cpp` — and
-`docs/deployment.md` on that branch carries the board-specific facts (QNN SDK
-2.48, the two load-bearing ExecuTorch patches, `--soc-model QCS8300`, the
-semicolon-separated `ADSP_LIBRARY_PATH`). The quantization gate there is a
-**sim success-rate drop under 2 points**, not an action MSE.
+The AOT pybind only exists on the board, so lowering runs there. `ssh
+ubuntu@ventuno`; the working copy is `~/sim2edge-deploy`.
+
+```bash
+rsync -az --exclude __pycache__ sim2edge/ ubuntu@ventuno:~/sim2edge-deploy/sim2edge/
+rsync -az scripts/lower_qnn.py scripts/dump_calibration.py \
+    runs/body_v2_actor_prod/best.pt ubuntu@ventuno:~/sim2edge-deploy/
+```
+
+Build the calibration set on the host, where the corpus lives:
+
+```bash
+.venv/bin/python scripts/dump_calibration.py \
+    --data data/body_frame_v2_prod --samples 1024 --noise-scale 1.0 \
+    --out runs/body_v2_actor_prod/export/calibration.npz
+```
+
+Then on the board — **all four exports are required**:
+
+```bash
+export PYTHONPATH=/opt:$HOME/sim2edge-deploy
+export QNN_SDK_ROOT=/opt/qcom/aistack/qairt/2.48.0.260626
+export LD_LIBRARY_PATH=$QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2:$QNN_SDK_ROOT/lib/aarch64-ubuntu-gcc9.4
+export ADSP_LIBRARY_PATH="$QNN_SDK_ROOT/lib/hexagon-v75/unsigned;/usr/lib/rfsa/adsp;/dsp"
+
+~/.venv/executorch/bin/python lower_qnn.py best.pt \
+    --calibration calibration.npz --quant-dtype use_16a8w --per-channel \
+    --out out/actor_qnn.pte
+```
+
+Measured: 373 KiB, **one delegate call and no CPU fallback**, 11.5 s to lower,
+and quantization error of 0.42%/1.73% (mean/max of limit) on omega and
+0.20%/2.44% on v.
+
+### The environment is the whole difficulty — four facts
+
+| | |
+|---|---|
+| `PYTHONPATH=/opt` | ExecuTorch is built at `/opt/executorch` but not installed into `~/.venv/executorch`. Nothing needs rebuilding. |
+| `aarch64-oe-linux-gcc11.2` **first** | The obvious `aarch64-ubuntu-gcc9.4` does not support this SoC and ships no V75 stub. Symptom: `Unsupported SoC model (SnapdragonModel): 82`, then `Invalid dsp arch. Cannot determine stub`. The `82` is hardware auto-detection — changing `--soc-model` does not change it. |
+| `ADSP_LIBRARY_PATH` | Semicolon-separated, and unset by default on this board. |
+| `--soc-model QCS8300` | The default, and not a typo. The chip is a QCS8275 (`soc_id` 675); QNN has no QCS8275 entry and the patched QCS8300 enum maps to HTP V75, which is what the board reports. |
+
+Validate the runtime before trusting any number — an HTP architecture mismatch
+produces garbage output, not an error:
+
+```bash
+$QNN_SDK_ROOT/bin/aarch64-ubuntu-gcc9.4/qnn-platform-validator \
+    --backend dsp --coreVersion --testBackend
+```
+
+Expect `Hexagon Architecture V75` and `Unit Test ... Passed`. The trailing
+`Error in saving the results` is only a CSV write into a read-only directory.
+
+### Circular padding is rewritten for export, and must stay that way
+
+`padding_mode="circular"` lowers to a scatter into an uninitialized buffer, and
+`QnnPartitioner` raises `KeyError: dim_order_ops._empty_dim_order.default`
+rather than declining the node. `rewrite_circular_convolutions` writes the same
+padding as a wrap-around `cat` — bit-identical, deep-copied so training is
+untouched, and asserted in `tests/test_model.py` and by the lowering script
+itself. `--keep-circular-padding` reproduces the crash on purpose.
+
+### Use the true min/max activation observer
+
+The default moving-average observer averages per-batch extremes and clips the
+pre-tanh logit, collapsing every saturated turn onto one command: 37% of the
+omega limit in worst-case error, and **it does not improve with more bits**.
+`MinMaxObserver` is the default here and takes that to 1.7%.
+`--moving-average-observer` restores the old behaviour for comparison.
+
+## 3. Run and benchmark on the board
+
+```bash
+/opt/executorch/build-x86/executor_runner --model_path out/actor_qnn.pte \
+    --num_executions 1000 --print_output none
+```
+
+`build-x86` is a native aarch64 build; the name is misleading. Measured on the
+Ventuno against a 50 ms control period:
+
+| | latency | share of period |
+|---|---:|---:|
+| actor, INT8 on HTP V75 | 0.15–0.18 ms | 0.4% |
+| actor, portable CPU kernels | 5.15 ms | 10.3% |
+| CPU localizer, 128 scans / stride 2 | 21–27 ms | 42–53% |
+
+Model load is a one-time ~200 ms. **The NPU is not the constraint and never
+was** — the CPU scan-to-submap localizer costs about 150× the actor. Benchmark
+it with real scans, at production settings, single-threaded:
+
+```bash
+.venv/bin/python scripts/bench_localizer.py --scans scans.npz \
+    --max-submap-scans 128 --point-stride 2
+```
+
+Cost is near-linear in submap size and in `1/point_stride`; the full table is in
+`docs/daily/2026_08_04_log.md`. `point_stride 4` halves the dominant cost in the
+loop and has **not** been evaluated for accuracy.
+
+## 4. Still to build
+
+The quantization gate itself, the C++ node, and the preprocessing parity test.
+`archive/v1-numpy-pipeline` holds a working version of the last two —
+`tools/parity_check.py`, `ros_ws/src/nav_policy_node/src/preprocess_parity.cpp`.
+
+The gate is a **sim success-rate drop under 2 points**, not an action MSE: a
+small action error can still cost success at exactly the moments that matter.
+Nothing should be built on the current `.pte` before it passes. If it fails,
+escalate in order — calibration data first. `data/body_frame_v2_prod` is
+`driver = "oracle"`, so the deployed policy's own state distribution is the
+stronger source, and `dump_calibration.py` warns whenever the corpus is not
+policy-driven.
 
 ---
 
@@ -984,7 +1088,7 @@ scripts/         collect_bc.py, verify_shard.py, train_bc.py,
                  train_belief_ppo.py, eval_belief.py,
                  eval_localized.py, interactive_nav.py
 tools/           convert_tb4.py
-tests/           307 passing tests, no GPU or simulator required
+tests/           311 passing tests, no GPU or simulator required
 docs/daily/      engineering log
 assets/, data/   generated; not in git
 ```
