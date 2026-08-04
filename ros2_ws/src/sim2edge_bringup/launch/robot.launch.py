@@ -136,6 +136,15 @@ def generate_launch_description() -> LaunchDescription:
                 name="oak_imu",
                 output="screen",
                 parameters=[imu_config],
+                # NOT /imu. The Create 3 runs Iron at the root namespace and
+                # publishes its OWN /imu from `robot_state`, so leaving this at
+                # the default gives that topic two publishers and the navigator
+                # a subscription that interleaves two different sensors --
+                # different mounting, different axis convention, different
+                # clock. It does not fail; it silently feeds deskew a blend,
+                # with gyro_yaw_axis "y" (measured for the OAK-D) reading a
+                # pitch/roll channel on every Create 3 message that arrives.
+                remappings=[("imu", "/oak/imu")],
             ),
         ]),
 
@@ -156,7 +165,9 @@ def generate_launch_description() -> LaunchDescription:
             }],
             # /odom and /cmd_vel are at the root namespace because that is
             # where this Create 3's Iron firmware publishes and subscribes.
-            remappings=[("odom", "/odom")],
+            # The gyro comes from /oak/imu and NOT /imu, which belongs to the
+            # base -- see the oak_imu node above.
+            remappings=[("odom", "/odom"), ("imu", "/oak/imu")],
         ),
 
         # A separate process on purpose. It owns /cmd_vel, and it keeps

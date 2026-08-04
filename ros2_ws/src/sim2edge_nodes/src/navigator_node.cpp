@@ -206,7 +206,24 @@ void NavigatorNode::onOdom(nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
   odom_ = std::move(msg);
-  odom_stamp_ = odom_->header.stamp;
+  // Arrival time, NOT odom_->header.stamp, and this one is deliberate.
+  //
+  // The Create 3 has no RTC and does not sync, so it stamps its messages from
+  // its own unanchored clock -- measured 3.73 years behind this board, which
+  // makes every stamp look 1.2e8 seconds old and pins the loop on "odometry
+  // stale" forever.
+  //
+  // Substituting arrival time costs nothing real here, because the base's
+  // clock never enters the arithmetic: the tick reads twist.linear.x, a
+  // scalar, and the optional pose prior is a difference of consecutive poses.
+  // Neither is a function of time. The freshness check is therefore the only
+  // consumer of the stamp, and what it is actually asking -- "is the base
+  // still talking to me" -- is answered at least as well by arrival.
+  //
+  // It is still a weaker check than the scan's and the IMU's, which do use
+  // device stamps: a message delayed in transport reads as fresh here. If the
+  // base is ever clock-synced, revert this to the header stamp.
+  odom_stamp_ = now();
 }
 
 void NavigatorNode::onGoal(geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
