@@ -1138,11 +1138,18 @@ Two failure modes, and they chain — fix them in this order:
    gadget's TX endpoint has wedged; the link is one-way. No amount of DDS
    configuration helps, because discovery needs both directions. Re-bind the
    UDC: `sudo ~/Documents/ventuno-object-tracking/scripts/create3_usb_gadget.sh`
-2. **Base pingable and its web UI answers, but no SPDP.** Re-binding the gadget
-   bounced the base's USB and its ROS app went quiet. Restart *only* the app —
-   **never the Reboot button**, which re-wedges the gadget and restarts the
-   loop:
+2. **Base pingable and its web UI answers, but no SPDP.** Its ROS app has gone
+   quiet. Restart *only* the app — **never the Reboot button**, which re-wedges
+   the gadget and restarts the loop:
    `curl -X POST http://192.168.186.2/api/restart-app`, then allow ~30 s.
+
+   Re-binding the gadget causes this, and so does **rebooting the board** —
+   which is the common case, because the board is the USB *device*, so its
+   reboot yanks the base's USB peer out from under it. The link itself comes
+   back clean on its own (the `create3-usb-gadget` service is enabled, and
+   `ping` shows 0% loss), which is what makes this confusing: everything at the
+   network layer looks healthy and there are simply no ROS topics. **After any
+   board reboot, expect to restart the base's app.**
 
 ### Give it a goal
 
