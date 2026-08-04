@@ -41,6 +41,11 @@ ament_target_dependencies(oak_imu_node rclcpp sensor_msgs)
 
 install(TARGETS oak_imu_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
-install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+# config only. This package ships no launch files -- sim2edge_bringup owns
+# launching, and this node is only ever started as part of the robot. The
+# directory was listed here for a `launch/` that existed but was empty, which
+# git does not track, so the build worked on a copied tree and failed on the
+# first clean clone.
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 ament_package()
