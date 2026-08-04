@@ -1,11 +1,11 @@
-# 2026-08-04 (third) — Real sensors, and three bugs that could only appear here
+# 2026-08-04 (third) — Real sensors, and five bugs that could only appear here
 
 The ROS 2 log from earlier today ended with a list whose items 2 and 3 were
 "attach the A1" and "attach the OAK-D". Both are attached. The stack now runs
 end to end on real sensor data, and it did not do so on the first attempt:
-three defects were sitting in code that passed every replay test, because the
-replay could not express the conditions that trigger them. One of the three
-would not have shown up as a failure at all — it would have looked like the
+five defects were sitting in code that passed every replay test, because the
+replay could not express the conditions that trigger them. Two of the five
+would not have shown up as failures at all — they would have looked like the
 localizer being bad.
 
 ## Outcome
@@ -218,6 +218,53 @@ The verification the operator should insist on is the out-and-back cancelling.
 A single turn tells you which channel moved; only the return leg distinguishes
 rotation from drift.
 
+## The Create 3, connected late in the day — two more contract bugs
+
+The base was attached after the above and produced two more of the same
+species: disagreements about what a field means.
+
+**`/imu` had two publishers.** The Create 3 runs Iron at the root namespace and
+publishes its own `/imu` from `robot_state`. `oak_imu` published there too, so
+the navigator's single subscription interleaved two sensors with different
+mountings, different axis conventions and different clocks. It does not fail —
+it feeds deskew a blend, and applies `gyro_yaw_axis: "y"` (measured for the
+OAK-D) to Create 3 messages, where it reads a pitch/roll channel. The OAK-D now
+publishes `/oak/imu`.
+
+**The Create 3's clock is 3.73 years behind the board** — no RTC, no sync.
+Board 2026-08-04 20:12 UTC against the base's 2022-11-11 06:19 UTC, so every
+stamp it writes looks 1.2e8 s old and `/odom` could never pass its freshness
+check. With `require_odom: true` the loop held forever.
+
+`odom_stamp_` is now arrival time. That costs nothing real: the base's clock
+never enters the arithmetic — the tick reads `twist.linear.x`, a scalar, and
+the optional pose prior differences consecutive poses. Neither is a function of
+time, so the stamp had exactly one consumer, and what the check actually asks
+is answered by arrival. It is weaker than the scan's and IMU's checks, which
+still use device stamps, and it should be reverted if the base is ever synced.
+
+With both fixed, the full stack runs against the real base: 703 ticks, 0 over
+the period, `odom` age 0.043 s, `/imu` down to one publisher and zero
+subscribers. One `scan stale` hold at 0.373 s in ~700 ticks — a genuinely
+dropped scan, which is the 0.35 s threshold doing its job rather than a
+regression.
+
+### The gadget link, which cost more time than the bugs
+
+`docs/create3_connection.md` in the sibling `ventuno-object-tracking` project
+is the authority and reading it earlier would have saved an hour. Two failure
+modes that chain:
+
+1. The base's multicast arrives while `ping` fails and `ip neigh` reads
+   `FAILED`. This is a **wedged gadget TX endpoint** — the link is one-way.
+   Discovery needs both directions, so nothing at the DDS layer can fix it.
+   Diagnosing it as a multicast-delivery problem is the trap, and it is the one
+   that was fallen into here: inbound multicast was the half that worked.
+2. Re-binding the gadget bounces the base's USB and silences its ROS app —
+   still pingable, web UI answering, no SPDP. Fixed with
+   `curl -X POST http://192.168.186.2/api/restart-app`, never the Reboot
+   button, which re-wedges the gadget.
+
 ## Also done
 
 `ubuntu` was not in `dialout`, so `/dev/ttyUSB0` (`crw-rw---- root:dialout`)
@@ -261,6 +308,8 @@ Three bugs, all in code that passed `sim2edge_parity` and
 | IMU epoch | `replay_node` synthesizes stamps from `now()`, so the wrong line never ran |
 | `scan_max_age_s` | the replay publishes on its own schedule, with no sweep-start stamping |
 | gyro yaw axis | the corpus stores a scalar yaw rate; there are no axes to get wrong |
+| `/imu` collision | there is no second publisher in a replay, only the one the harness starts |
+| Create 3 clock | the replay stamps every topic from one machine's clock |
 
 The pattern is that a replay proves the arithmetic and cannot prove the
 *contract with the hardware* — every one of these was a disagreement about what
