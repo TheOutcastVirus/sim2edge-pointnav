@@ -6,11 +6,17 @@
 //
 //   1. It supplies the yaw increment the localizer's motion prior integrates.
 //   2. It supplies the rotation that **deskews the lidar sweep**. One A1
-//      revolution spans 182 ms, so the beams in a scan were acquired across
-//      three or four control periods, and undoing that smear needs the
-//      rotation over each of those intervals -- not a single rate sampled once
-//      per tick. That is why this node publishes at the sensor's own rate and
-//      lets the consumer integrate, rather than decimating to 20 Hz here.
+//      revolution measures 137 ms on this unit (7.3 Hz, not the 5.5 Hz nominal
+//      in spec.py), so the beams in a scan were acquired across roughly three
+//      control periods, and undoing that smear needs the rotation over each of
+//      those intervals -- not a single rate sampled once per tick. That is why
+//      this node publishes at the sensor's own rate and lets the consumer
+//      integrate, rather than decimating to 20 Hz here.
+//
+// UNRESOLVED: which gyro axis is yaw. The accelerometer at rest puts gravity on
+// +y, which says the vertical axis is y, but the stack consumes
+// angular_velocity.z. Confirm by turning the robot and watching which channel
+// responds before any driving trial.
 //
 // A camera driver is deliberately not part of this package. The navigation
 // policy is lidar-only; the OAK-D is present for its IMU and, in the sibling

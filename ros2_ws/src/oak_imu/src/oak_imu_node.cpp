@@ -100,6 +100,12 @@ void OakImuNode::pollLoop()
     return;
   }
 
+  // What to add to a steady-clock timestamp to express it in the ROS epoch.
+  // Read once per poll so every report in this drain shares one offset and
+  // their relative spacing stays exactly the device's.
+  const rclcpp::Time ros_epoch_offset =
+    now() - rclcpp::Duration(std::chrono::steady_clock::now().time_since_epoch());
+
   // Drain everything waiting. Each IMU packet carries several reports and the
   // publisher emits one message per report, so no sample is merged away.
   for (;;) {
@@ -120,11 +126,26 @@ void OakImuNode::pollLoop()
       message.header.frame_id = frame_id_;
 
       if (use_device_time_) {
-        const auto device_time = report.gyroscope.getTimestampDevice();
-        const auto since_epoch = device_time.time_since_epoch();
-        const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-          since_epoch).count();
-        message.header.stamp = rclcpp::Time(nanos, RCL_ROS_TIME);
+        // `getTimestamp()` is the device's own capture time already translated
+        // into the host's steady clock by depthai's clock sync -- so intervals
+        // between samples stay the device's, free of USB arrival jitter, which
+        // is the whole reason this node exists.
+        //
+        // It is NOT `getTimestampDevice()`. That one counts from the device's
+        // boot, and writing it into a header as if it were an epoch time is how
+        // this node spent its first hardware run publishing stamps around 241
+        // while every consumer compared them against 1.79e9. The navigator's
+        // freshness check then read the age as 56 years and held on "imu stale"
+        // forever: no tick was ever served, and nothing failed loudly.
+        //
+        // steady_clock and the ROS clock run at the same nominal rate but from
+        // different epochs, so the offset is sampled here, once per poll, and
+        // shared by every report in the batch. Sampling it per poll rather than
+        // once at startup keeps the two clocks' relative drift out of the
+        // stamps; both reads are cheap and neither touches USB, so this adds no
+        // jitter of the kind the device clock is here to avoid.
+        message.header.stamp = ros_epoch_offset +
+          rclcpp::Duration(report.gyroscope.getTimestamp().time_since_epoch());
       } else {
         message.header.stamp = now();
       }

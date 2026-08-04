@@ -1,10 +1,14 @@
 # Production navigator configuration.
 #
-# The localizer numbers are the ones measured in docs/daily/2026_08_04_log.md;
-# submap 128 / stride 2 is what the accuracy evaluations were run at. Cost is
-# near-linear in submap size and in 1/point_stride, so there is headroom if it
-# is ever needed -- but point_stride 4 has NOT been evaluated for accuracy, only
-# for latency, and must not be adopted on the strength of the timing table.
+# The localizer latency figures that matter are the ones measured against the
+# physical A1 in docs/daily/2026_08_04_hardware_log.md, NOT the replay figures
+# in docs/daily/2026_08_04_ros2_log.md. The replay corpus is simulated sweeps of
+# a moving robot and it understates the real cost by about 2.6x; both submap 128
+# and submap 64 were evaluated for accuracy at 32 episodes, so this is one of
+# the few knobs with evidence on both axes.
+#
+# point_stride 4 still has NOT been evaluated for accuracy, only for latency,
+# and must not be adopted on the strength of a timing table.
 /**:
   ros__parameters:
     control_period_s: 0.05
@@ -13,10 +17,50 @@
     backend: "qnn"            # "qnn" | "cpu"
     qnn_lib_dir: ""           # set from QNN_SDK_ROOT by the launch file
 
+    # Which gyro component is this robot's yaw rate.
+    #
+    # 'y', not 'z'. The code read angular_velocity.z from the day it was written
+    # until the OAK-D was first turned on a robot, and z is not the yaw channel
+    # on this mount. Turning the robot a quarter turn left and back:
+    #
+    #   burst    dx        dy        dz
+    #     1    -1.18   +34.93     +1.25     left, first part
+    #     2    -2.13   +65.62     +3.15     left, second part   (+100.55 total)
+    #     3    +2.94  -100.90     -3.32     back to the right
+    #
+    # y carries 100.9 deg against z's 3.3 -- a factor of 30 -- and out-and-back
+    # closes to 0.35 deg over 100. It agrees with the accelerometer, which puts
+    # gravity on +y (+9.58 m/s^2) and therefore the vertical axis on y.
+    #
+    # Left/counter-clockwise came out POSITIVE, so the sign already matches the
+    # REP-103 convention the stack assumes and gyro_yaw_sign stays +1. Only the
+    # channel was wrong.
+    #
+    # This is a mount fact, not a preference: re-mount the OAK-D in a different
+    # orientation and it must be re-measured with tools/probe_yaw_axis.py. The
+    # failure mode if it is wrong is silent -- deskew is fed a pitch or roll
+    # channel, and the result reads as a localization failure.
+    gyro_yaw_axis: "y"
+    gyro_yaw_sign: 1.0
+
     # A stale scan is worse than a slightly old one, but holding is worse than
-    # both unless it is really stale. One revolution is 182 ms, so 250 ms
-    # tolerates a single dropped message and no more.
-    scan_max_age_s: 0.25
+    # both unless it is really stale.
+    #
+    # 0.25 was derived from a 182 ms nominal revolution and the assumption that
+    # a scan's age at arrival is ~0. Both are wrong against the hardware:
+    #
+    #   - the A1 measures 7.3 Hz, not the nominal 5.5, so a revolution is 137 ms
+    #   - sllidar stamps the scan at the START of the sweep and publishes at the
+    #     END, so a scan is already one full revolution old when it arrives
+    #
+    # Age therefore sweeps 137 -> 274 ms between messages, and 250 ms put the
+    # top ~24 ms of every cycle over the line: the loop held on "scan stale"
+    # roughly one tick in six while the sensor was behaving perfectly.
+    #
+    # 0.35 clears the 274 ms normal worst case with margin and still holds on a
+    # genuinely dropped message (3 revolutions = 411 ms). Holding there is the
+    # wanted behaviour, not a regression -- a hold publishes zero.
+    scan_max_age_s: 0.35
     imu_max_age_s: 0.15
     odom_max_age_s: 0.25
     require_odom: true
@@ -32,7 +76,32 @@
     use_odometry_prior: false
 
     localizer:
-      max_submap_scans: 128
+      # 64, not the 128 the replay was tuned at. Against the real lidar 128 does
+      # not fit the control period:
+      #
+      #   submap  median   p95    max   ticks over 50 ms
+      #     128   18.1 ms  68 ms  79 ms   245 of 1107  (22%)
+      #      64    8.5 ms  34 ms  38 ms     0 observed
+      #      32    5.2 ms  15 ms  18 ms     0 observed
+      #
+      # Two things the corpus never showed. The A1 returns ~855 valid points per
+      # revolution against the sim's 720, so the submap is 1.35x bigger; and the
+      # submap has no keyframe gate, so a slow or stopped robot packs 128
+      # near-identical scans into the same 0.20 m grid cells and the bucket grid
+      # stops pruning -- cost per submap point is 1.94x the replay's. Measured
+      # cost is then linear in submap size with no pruning benefit at all, which
+      # is what makes halving the submap halve the time almost exactly.
+      #
+      # The accuracy case for 64 is not an assumption: eval_localized_submap64_2x_32
+      # and eval_localized_submap128_2x_32 report the SAME success rate (0.84375),
+      # the same false-arrival rate (0.0) and the same collision rate, with 64
+      # costing 2.6 mm of mean final belief error and 1.1 cm at p95.
+      #
+      # These were measured with the robot stationary, which is the worst case
+      # for submap density -- driving spreads the scans and should cost less.
+      # That makes 64 conservative rather than marginal, and the standing issue
+      # is the missing keyframe gate, not this number.
+      max_submap_scans: 64
       point_stride: 2
       correction_gain: 0.10
       yaw_correction_gain: 0.05

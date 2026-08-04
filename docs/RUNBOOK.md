@@ -1062,6 +1062,27 @@ hold 20 Hz under real DDS load, and deliver a command inside the period".
 Neither answers whether the robot navigates: the corpus was oracle-driven, so
 the recorded pose does not respond to what the policy commands.
 
+## Attach the sensors
+
+One-time, or the lidar node dies on open with a permission error that names no
+permission:
+
+```bash
+sudo usermod -aG dialout ubuntu     # then open a NEW login shell
+```
+
+`/dev/ttyUSB0` is `root:dialout`, and the board's `ubuntu` user was not in the
+group. The A1 shows up as a `10c4:ea60 CP210x`; the OAK-D as a
+`03e7:2485 Movidius MyriadX` — check with `lsusb` before blaming software.
+
+What the physical A1 measures on this unit, all of it different from `spec.py`
+and from what the driver reports about itself: **7.32 Hz** (not 5.5 nominal, and
+not the 10.0 the driver logs for the Sensitivity mode), **1080 bins**
+per revolution of which **~855 carry a return** (the sim's sweep was 720, all
+valid). `time_increment` is nonzero, so deskew uses real per-beam timing and
+`LIDAR_SPIN_HZ` is inert at runtime — it still matters to training data.
+See `docs/daily/2026_08_04_hardware_log.md`.
+
 ## Run the robot
 
 ```bash
@@ -1069,6 +1090,30 @@ ros2 launch sim2edge_bringup robot.launch.py \
     model:=$PWD/models/actor_qnn.pte \
     qnn_lib_dir:=$QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2
 ```
+
+Without a Create 3 attached the navigator holds on `no odometry yet` forever, by
+design. To exercise the stack on sensors alone, add
+`-p require_odom:=false` — and note that the motion prior then has no velocity
+term, so the run is a latency and numerics result and nothing more.
+
+### Confirm the gyro's yaw axis whenever the OAK-D is re-mounted
+
+```bash
+python3 tools/probe_yaw_axis.py --seconds 120     # on the board, /imu running
+```
+
+Turn the robot a quarter turn **left** (counter-clockwise from above), pause,
+then turn it back **right**. Flat — don't tilt or lift it. No timing to hit: the
+script segments on gyro magnitude and integrates each burst separately.
+
+On the current mount the answer is **y**, not `z`: 100.9° on y against 3.3° on
+z, with the out-and-back closing to 0.35° over 100°. Set `gyro_yaw_axis` and
+`gyro_yaw_sign` in `navigator.yaml` from what it reports; the navigator logs
+which channel it is using at startup.
+
+Insist on the out-and-back cancelling. One turn shows which channel moved; only
+the return leg separates rotation from drift. Getting this wrong does not fail
+— it under-corrects deskew and presents as a localization failure.
 
 Three inputs reach the policy and no others: the lidar sweep, the OAK-D gyro,
 and the Create 3's velocity. Point at a goal once with `/goal_pose` as a

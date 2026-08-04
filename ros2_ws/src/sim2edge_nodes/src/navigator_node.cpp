@@ -59,6 +59,18 @@ NavigatorNode::NavigatorNode(const rclcpp::NodeOptions & options)
 
   navigator_ = sim2edge::Navigator(config);
 
+  // Which component of angular_velocity is this robot's yaw rate, and with
+  // what sign. See gyro_yaw_axis in navigator.yaml -- on this build it is 'y',
+  // measured, not 'z' as the code assumed for its whole life before hardware.
+  gyro_yaw_axis_ = declare_parameter("gyro_yaw_axis", std::string("y"));
+  gyro_yaw_sign_ = declare_parameter("gyro_yaw_sign", 1.0);
+  if (gyro_yaw_axis_ != "x" && gyro_yaw_axis_ != "y" && gyro_yaw_axis_ != "z") {
+    throw std::runtime_error(
+      "gyro_yaw_axis must be one of x, y, z -- got '" + gyro_yaw_axis_ + "'");
+  }
+  RCLCPP_INFO(get_logger(), "gyro yaw rate = %sangular_velocity.%s",
+              gyro_yaw_sign_ < 0 ? "-" : "", gyro_yaw_axis_.c_str());
+
   scan_max_age_ = declare_parameter("scan_max_age_s", 0.25);
   imu_max_age_ = declare_parameter("imu_max_age_s", 0.15);
   odom_max_age_ = declare_parameter("odom_max_age_s", 0.25);
@@ -162,6 +174,15 @@ void NavigatorNode::onScan(sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
   scan_stamp_ = scan_->header.stamp;
 }
 
+double NavigatorNode::yawRateOf(const sensor_msgs::msg::Imu & msg) const
+{
+  const auto & w = msg.angular_velocity;
+  const double raw = gyro_yaw_axis_ == "x" ? w.x
+                   : gyro_yaw_axis_ == "y" ? w.y
+                                           : w.z;
+  return gyro_yaw_sign_ * raw;
+}
+
 void NavigatorNode::onImu(sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -173,7 +194,7 @@ void NavigatorNode::onImu(sensor_msgs::msg::Imu::ConstSharedPtr msg)
     // hard turn is exactly when they differ.
     const double dt = (stamp - last_imu_stamp_).seconds();
     if (dt > 0.0 && dt < 0.5) {
-      gyro_accumulator_ += msg->angular_velocity.z * dt;
+      gyro_accumulator_ += yawRateOf(*msg) * dt;
     }
   }
   last_imu_stamp_ = stamp;

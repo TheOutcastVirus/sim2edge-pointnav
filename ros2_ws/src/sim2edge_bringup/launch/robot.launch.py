@@ -18,9 +18,20 @@ base -- see ``config/fastdds_usb0.xml`` and the reference project's
 this base runs Iron at the root namespace and subscribes to ``/cmd_vel``
 directly.
 
-Nothing here has been run against the physical robot. The board currently has
-no lidar and no serial device attached, so ``serial_port`` and the A1's actual
-spin rate are both unverified.
+The lidar and the OAK-D have both been run on this board -- see
+``docs/daily/2026_08_04_hardware_log.md`` for what that changed. The A1 measures
+**7.3 Hz**, not the 5.5 Hz nominal in ``spec.py``, and delivers 1080 bins of
+which ~855 carry a return. Deskew reads ``time_increment`` from the message and
+is unaffected; the constant matters to training data, not to this launch.
+
+The gyro's yaw axis is **y** on this mount, not the ``z`` the code read for its
+whole life before hardware — measured by turning the robot, 100.9 deg on y
+against 3.3 on z. It is ``gyro_yaw_axis`` in ``navigator.yaml``; re-mount the
+OAK-D and re-measure it with ``tools/probe_yaw_axis.py``.
+
+Still untested against hardware: the Create 3. No base has ever been connected,
+so ``/odom`` and ``/cmd_vel`` are unverified, and without one the navigator
+holds on ``no odometry yet`` by design.
 """
 
 from launch import LaunchDescription
@@ -92,13 +103,17 @@ def generate_launch_description() -> LaunchDescription:
                     "frame_id": "laser_frame",
                     "inverted": False,
                     "angle_compensate": True,
-                    # Sensitivity gives the A1 its full return rate. The
-                    # deskew path reads time_increment from the message and
-                    # falls back to the nominal spin rate if the driver
-                    # reports zero, so a mode change degrades the correction
-                    # rather than breaking it -- but LIDAR_SPIN_HZ = 5.5 in
-                    # spec.py is nominal and has never been checked against
-                    # this unit.
+                    # Sensitivity, measured on this unit: 8 kHz sampling, 1080
+                    # bins per revolution at 0.334 deg, ~79% of them carrying a
+                    # return, at 7.32 Hz. The driver *reports* "scan frequency:
+                    # 10.0 Hz" for the mode and that figure is not what the
+                    # motor does -- 8000 samples/s over 1080 bins is 7.4 rev/s,
+                    # which is what arrives.
+                    #
+                    # It reports time_increment as 121 us (nonzero), so deskew
+                    # uses real per-beam timing and never reaches its
+                    # LIDAR_SPIN_HZ fallback. That is why this whole path is
+                    # indifferent to the 5.5 Hz constant being wrong.
                     "scan_mode": "Sensitivity",
                 }],
             ),

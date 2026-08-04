@@ -61,6 +61,9 @@ private:
   void loadActor();
   double ageOf(const rclcpp::Time & stamp) const;
 
+  /// This robot's yaw rate, pulled out of whichever gyro component carries it.
+  double yawRateOf(const sensor_msgs::msg::Imu & msg) const;
+
   // ── The stack ─────────────────────────────────────────────────────────────
   sim2edge::Navigator navigator_;
   std::shared_ptr<sim2edge::Actor> actor_;
@@ -73,6 +76,10 @@ private:
   bool require_odom_{};
   bool goal_is_body_frame_{};
   double control_period_{};
+  /// Which angular_velocity component is yaw, and its sign. Measured on the
+  /// hardware, not assumed -- the OAK-D's IMU has its vertical axis on y.
+  std::string gyro_yaw_axis_{"y"};
+  double gyro_yaw_sign_{1.0};
 
   // ── Cached sensor state, latest message only ──────────────────────────────
   std::mutex mutex_;
