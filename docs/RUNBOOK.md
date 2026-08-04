@@ -1108,16 +1108,41 @@ Brings up `sllidar`, `oak_imu`, `sim2edge_navigator` (pinned to `cpu2,3`) and
 motion prior has no velocity term without `/odom`, so this is a latency and
 numerics run and **not** evidence about navigation.
 
-### With the Create 3 — never yet run
+### With the Create 3
 
-Drop `require_odom:=false`, and first uncomment the DDS block at the bottom of
-`ventuno_env.sh`. The board has several NICs and Wi-Fi holds the default route,
-so without the `usb0` profile Fast DDS joins discovery multicast on Wi-Fi and
-never hears the base.
+Just drop `require_odom:=false`. The DDS environment is already exported from
+the board's `~/.bashrc` by the sibling `ventuno-object-tracking` project —
+domain 0, `rmw_fastrtps_cpp`, and a `usb0` profile byte-identical to the one
+this repo ships. The commented block at the bottom of `ventuno_env.sh` is the
+self-contained equivalent; uncomment it if you would rather not depend on
+another project's path.
 
-**That same profile restricts discovery to loopback and `usb0`, which will cut
-off `ros2` commands issued over ssh from another machine.** Run them in a shell
-on the board itself.
+The profile whitelists loopback *and* `192.168.186.3`, so `ros2` commands run
+fine in an ssh shell **on the board**. What it does cut off is `ros2` on a
+*different* machine reaching the board over Wi-Fi.
+
+Verify the link before launching — `docs/create3_connection.md` in
+`ventuno-object-tracking` is the authority, and the gadget is fragile across USB
+bounces:
+
+```bash
+cat /sys/class/udc/*/state          # want: configured
+ping -c3 192.168.186.2              # want: 0% loss
+ros2 node list                      # want: /motion_control, /_internal/mobility, ...
+ros2 topic info /cmd_vel            # want: Subscription count >= 1
+```
+
+Two failure modes, and they chain — fix them in this order:
+
+1. **Base's multicast arrives but `ping` fails and `ip neigh` is `FAILED`.** The
+   gadget's TX endpoint has wedged; the link is one-way. No amount of DDS
+   configuration helps, because discovery needs both directions. Re-bind the
+   UDC: `sudo ~/Documents/ventuno-object-tracking/scripts/create3_usb_gadget.sh`
+2. **Base pingable and its web UI answers, but no SPDP.** Re-binding the gadget
+   bounced the base's USB and its ROS app went quiet. Restart *only* the app —
+   **never the Reboot button**, which re-wedges the gadget and restarts the
+   loop:
+   `curl -X POST http://192.168.186.2/api/restart-app`, then allow ~30 s.
 
 ### Give it a goal
 
