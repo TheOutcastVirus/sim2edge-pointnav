@@ -1085,16 +1085,66 @@ See `docs/daily/2026_08_04_hardware_log.md`.
 
 ## Run the robot
 
+Every shell that talks to the stack needs all three of these first:
+
+```bash
+cd ~/sim2edge-ventuno/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source src/sim2edge_bringup/scripts/ventuno_env.sh
+source install/setup.bash
+```
+
+### Sensors only, no base — this is what has actually been run
+
 ```bash
 ros2 launch sim2edge_bringup robot.launch.py \
     model:=$PWD/models/actor_qnn.pte \
-    qnn_lib_dir:=$QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2
+    qnn_lib_dir:=$QNN_SDK_ROOT/lib/aarch64-oe-linux-gcc11.2 \
+    require_odom:=false
 ```
 
-Without a Create 3 attached the navigator holds on `no odometry yet` forever, by
-design. To exercise the stack on sensors alone, add
-`-p require_odom:=false` — and note that the motion prior then has no velocity
-term, so the run is a latency and numerics result and nothing more.
+Brings up `sllidar`, `oak_imu`, `sim2edge_navigator` (pinned to `cpu2,3`) and
+`sim2edge_safety`. Nothing moves: no base is subscribed to `/cmd_vel`. The
+motion prior has no velocity term without `/odom`, so this is a latency and
+numerics run and **not** evidence about navigation.
+
+### With the Create 3 — never yet run
+
+Drop `require_odom:=false`, and first uncomment the DDS block at the bottom of
+`ventuno_env.sh`. The board has several NICs and Wi-Fi holds the default route,
+so without the `usb0` profile Fast DDS joins discovery multicast on Wi-Fi and
+never hears the base.
+
+**That same profile restricts discovery to loopback and `usb0`, which will cut
+off `ros2` commands issued over ssh from another machine.** Run them in a shell
+on the board itself.
+
+### Give it a goal
+
+```bash
+ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
+    '{header: {frame_id: "base_link"}, pose: {position: {x: 2.0, y: 0.0}}}'
+```
+
+A body-frame offset, consumed once. **The policy commands close to `V_MAX` the
+moment a goal lands** — a bench run reached 0.44 m/s of a 0.46 limit on the
+first tick after the goal. Set a goal only when the robot is somewhere it can
+safely move, or with the wheels off the ground.
+
+### Watch it
+
+```bash
+ros2 topic echo /nav/status        # per-stage cost, belief, hold reason
+ros2 topic echo /safety/reason     # why the safety layer is limiting
+```
+
+### Stop it
+
+`Ctrl-C` on the launch. `sim2edge_safety` is a separate process holding
+`/cmd_vel` with a 0.30 s watchdog, so if the navigator dies the base is
+commanded zero rather than continuing on its last command — but the safety node
+dies with the launch too, so **`Ctrl-C` is not an e-stop**. Keep the base's own
+button reachable.
 
 ### Confirm the gyro's yaw axis whenever the OAK-D is re-mounted
 
