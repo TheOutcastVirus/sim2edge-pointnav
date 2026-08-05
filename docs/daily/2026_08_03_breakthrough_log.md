@@ -2,9 +2,9 @@
 
 ## Outcome
 
-The lidar contract was the binding defect. It is repaired, a fresh production
+The lidar contract was the binding defect. It's repaired, a fresh production
 corpus and actor were built, and the selected full stack now clears the
-navigation gates at every simulated noise tier. The usable configuration is:
+navigation gates at every simulated noise tier. The usable configuration:
 
 - sensor contract: `body-frame-v2`;
 - actor: `runs/body_v2_actor_prod/best.pt`;
@@ -110,6 +110,5 @@ board.
 ## Decision
 
 Stop exploratory training here. Preserve `body-frame-v2` plus the
-Create3/EKF-assisted localizer as the selected candidate, and make the next
-work hardware integration and validation rather than another simulator tuning
-cycle.
+Create3/EKF-assisted localizer as the selected candidate; the next work is
+hardware integration and validation, not another simulator tuning cycle.
