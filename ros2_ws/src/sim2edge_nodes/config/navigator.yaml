@@ -68,6 +68,9 @@
     # Goals arrive as a body-frame offset. Set false to interpret them in the
     # odom frame instead, which requires odometry to already be flowing.
     goal_is_body_frame: true
+    # Set to 1.0 for objectnav, whose high-level planner publishes a heartbeat.
+    # Zero retains the manual point-goal interface's one-shot behavior.
+    goal_max_age_s: 0.0
 
     # false is the self-contained arm: lidar, gyro, and the base's velocity.
     # true adds the Create 3's own odometry increment as the motion prior --

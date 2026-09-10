@@ -49,8 +49,10 @@ def generate_launch_description() -> LaunchDescription:
     serial_port = LaunchConfiguration("serial_port")
     use_lidar = LaunchConfiguration("use_lidar")
     use_imu = LaunchConfiguration("use_imu")
+    imu_topic = LaunchConfiguration("imu_topic")
     use_odometry_prior = LaunchConfiguration("use_odometry_prior")
     require_odom = LaunchConfiguration("require_odom")
+    goal_max_age_s = LaunchConfiguration("goal_max_age_s")
     nav_cpus = LaunchConfiguration("nav_cpus")
 
     navigator_config = PathJoinSubstitution(
@@ -71,6 +73,9 @@ def generate_launch_description() -> LaunchDescription:
             description="the RPLIDAR A1's serial device"),
         DeclareLaunchArgument("use_lidar", default_value="true"),
         DeclareLaunchArgument("use_imu", default_value="true"),
+        DeclareLaunchArgument("imu_topic", default_value="/oak/imu",
+            description="navigator IMU input; set /oak/imu/data when the "
+                        "DepthAI RGB-D pipeline owns the camera"),
         DeclareLaunchArgument("nav_cpus", default_value="2,3",
             description="CPU affinity for the navigator, as a taskset list. "
                         "This is NOT tuning -- it decides whether the control "
@@ -92,6 +97,9 @@ def generate_launch_description() -> LaunchDescription:
                         "can be timed, but the prior loses its speed term, so "
                         "such a run is a latency and numerics result and NOT "
                         "evidence about navigation"),
+        DeclareLaunchArgument("goal_max_age_s", default_value="0.0",
+            description="high-level goal heartbeat timeout; objectnav uses 1.0, "
+                        "zero preserves one-shot point goals"),
         DeclareLaunchArgument("use_odometry_prior", default_value="false",
             description="false keeps the motion prior to gyro + velocity, "
                         "which is the self-contained arm. true uses the "
@@ -162,12 +170,13 @@ def generate_launch_description() -> LaunchDescription:
                 "qnn_lib_dir": qnn_lib_dir,
                 "use_odometry_prior": use_odometry_prior,
                 "require_odom": require_odom,
+                "goal_max_age_s": goal_max_age_s,
             }],
             # /odom and /cmd_vel are at the root namespace because that is
             # where this Create 3's Iron firmware publishes and subscribes.
             # The gyro comes from /oak/imu and NOT /imu, which belongs to the
             # base -- see the oak_imu node above.
-            remappings=[("odom", "/odom"), ("imu", "/oak/imu")],
+            remappings=[("odom", "/odom"), ("imu", imu_topic)],
         ),
 
         # A separate process on purpose. It owns /cmd_vel, and it keeps

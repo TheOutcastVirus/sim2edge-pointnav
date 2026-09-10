@@ -1,6 +1,6 @@
 # Source this before building or running the stack on the Ventuno Q.
 #
-#     source src/sim2edge_bringup/scripts/ventuno_env.sh
+#     source src/sim2edge_bringup/scripts/ventuno_env.sh [--base]
 #
 # Every line here is load-bearing and none of them is guessable. The reasoning
 # is in docs/daily/2026_08_04_log.md; the short version is below.
@@ -49,13 +49,20 @@ export PYTHONPATH=/opt${PYTHONPATH:+:$PYTHONPATH}
 # tcpdump shows the base's SPDP arriving on usb0. ROS_DISCOVERY_SERVER must stay
 # unset: this base uses simple/multicast discovery.
 #
-# Commented out by default because it also restricts discovery to loopback and
-# usb0, which is not what you want while testing over ssh from another machine.
-# Uncomment when driving the real base.
-#
-# export ROS_DOMAIN_ID=0
-# export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-# export FASTRTPS_DEFAULT_PROFILES_FILE=$(ros2 pkg prefix sim2edge_bringup)/share/sim2edge_bringup/config/fastdds_usb0.xml
+# Disabled by default because it also restricts discovery to loopback and usb0,
+# which is not what you want while testing over ssh from another machine. Pass
+# ``--base`` when driving the real base. Resolve the profile relative to this
+# file so this works both from src/ and install/ before an overlay is sourced.
+if [ "${1:-}" = "--base" ]; then
+    _VENTUNO_ENV_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    export ROS_DOMAIN_ID=0
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    export FASTRTPS_DEFAULT_PROFILES_FILE="$_VENTUNO_ENV_DIR/../config/fastdds_usb0.xml"
+    unset ROS_DISCOVERY_SERVER
+elif [ -n "${1:-}" ]; then
+    echo "ventuno_env.sh: unknown argument: $1" >&2
+    return 2 2>/dev/null || exit 2
+fi
 
 echo "ventuno env: QNN $QNN_SDK_ROOT"
 echo "             ExecuTorch $EXECUTORCH_INSTALL_DIR"
@@ -63,3 +70,6 @@ echo "             validate the runtime before trusting any number:"
 echo "               \$QNN_SDK_ROOT/bin/aarch64-ubuntu-gcc9.4/qnn-platform-validator --backend dsp --coreVersion --testBackend"
 echo "             expect 'Hexagon Architecture V75' and 'Unit Test ... Passed'."
 echo "             An HTP mismatch returns garbage, not an error."
+if [ "${1:-}" = "--base" ]; then
+    echo "             Create 3 DDS pinned to usb0: $FASTRTPS_DEFAULT_PROFILES_FILE"
+fi

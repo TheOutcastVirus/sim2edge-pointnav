@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -76,6 +77,9 @@ private:
   bool require_odom_{};
   bool goal_is_body_frame_{};
   double control_period_{};
+  /// Optional heartbeat timeout for a continuously refreshed high-level goal.
+  /// Zero preserves the point-goal node's historical one-shot behavior.
+  double goal_max_age_{};
   /// Which angular_velocity component is yaw, and its sign. Measured on the
   /// hardware, not assumed -- the OAK-D's IMU has its vertical axis on y.
   std::string gyro_yaw_axis_{"y"};
@@ -102,6 +106,8 @@ private:
   double previous_odom_x_{0.0};
   double previous_odom_y_{0.0};
   double previous_odom_yaw_{0.0};
+  bool have_goal_update_{false};
+  std::chrono::steady_clock::time_point last_goal_update_{};
 
   // ── Scratch, reused so a 20 Hz loop allocates nothing in steady state ─────
   std::vector<float> bearings_;

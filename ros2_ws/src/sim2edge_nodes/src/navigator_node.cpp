@@ -76,6 +76,7 @@ NavigatorNode::NavigatorNode(const rclcpp::NodeOptions & options)
   odom_max_age_ = declare_parameter("odom_max_age_s", 0.25);
   require_odom_ = declare_parameter("require_odom", true);
   goal_is_body_frame_ = declare_parameter("goal_is_body_frame", true);
+  goal_max_age_ = declare_parameter("goal_max_age_s", 0.0);
   control_period_ = declare_parameter("control_period_s",
                                       static_cast<double>(sim2edge::spec::kDt));
   latency_us_.assign(kLatencyWindow, 0.0);
@@ -110,6 +111,7 @@ NavigatorNode::NavigatorNode(const rclcpp::NodeOptions & options)
            std_srvs::srv::Trigger::Response::SharedPtr response) {
       std::lock_guard<std::mutex> lock(mutex_);
       navigator_.reset();
+      have_goal_update_ = false;
       have_previous_odom_ = false;
       have_imu_ = false;
       gyro_accumulator_ = 0.0;
@@ -248,8 +250,10 @@ void NavigatorNode::onGoal(geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
   }
 
   navigator_.setGoalBody(x, y);
-  RCLCPP_INFO(get_logger(), "goal set: (%+.2f, %+.2f) m in the body frame, "
-              "%.2f m away", x, y, std::sqrt(x * x + y * y));
+  have_goal_update_ = true;
+  last_goal_update_ = std::chrono::steady_clock::now();
+  RCLCPP_DEBUG(get_logger(), "goal set: (%+.2f, %+.2f) m in the body frame, "
+               "%.2f m away", x, y, std::sqrt(x * x + y * y));
 }
 
 double NavigatorNode::ageOf(const rclcpp::Time & stamp) const
@@ -268,6 +272,8 @@ void NavigatorNode::onControlTimer()
   double scan_age = 0.0;
   double imu_age = 0.0;
   double odom_age = 0.0;
+  double goal_age = 0.0;
+  bool have_goal_update = false;
   std::string hold;
 
   {
@@ -277,6 +283,11 @@ void NavigatorNode::onControlTimer()
     scan_age = ageOf(scan_stamp_);
     imu_age = ageOf(imu_stamp_);
     odom_age = ageOf(odom_stamp_);
+    have_goal_update = have_goal_update_;
+    goal_age = have_goal_update
+      ? std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - last_goal_update_).count()
+      : 0.0;
 
     // Consume the integral: whatever rotation accumulated since the last tick
     // is this tick's increment, and it must not be counted twice.
@@ -292,6 +303,10 @@ void NavigatorNode::onControlTimer()
     hold = "imu stale";
   } else if (require_odom_ && (!odom || odom_age > odom_max_age_)) {
     hold = odom ? "odometry stale" : "no odometry yet";
+  } else if (goal_max_age_ > 0.0 && !have_goal_update) {
+    hold = "no goal yet";
+  } else if (goal_max_age_ > 0.0 && goal_age > goal_max_age_) {
+    hold = "goal stale";
   }
 
   if (!hold.empty()) {
