@@ -99,6 +99,21 @@ TEST(BinLidar, BinsByBearingNotIndex)
   EXPECT_EQ(forward, reversed);
 }
 
+TEST(RasterizeLidar, PreservesMetricMinimumAndInvalidBins)
+{
+  PolarSweep sweep;
+  sweep.ranges = {3.0f, 0.7f, 2.0f, 1.0f};
+  sweep.bearings = {0.001f, 0.002f, static_cast<float>(M_PI_2), -1.0f};
+  sweep.ages = {0.0f, 0.01f, 0.02f, 0.03f};
+  sweep.valid = {1, 1, 1, 0};
+  std::vector<float> out;
+  rasterizeLidar(sweep, 360, out);
+  ASSERT_EQ(out.size(), 360u);
+  EXPECT_FLOAT_EQ(out[180], 0.7f);
+  EXPECT_FLOAT_EQ(out[270], 2.0f);
+  EXPECT_TRUE(std::isinf(out[122]));
+}
+
 TEST(GoalFeatures, StandingOnTheGoalIsFiniteNotNaN)
 {
   float out[3];

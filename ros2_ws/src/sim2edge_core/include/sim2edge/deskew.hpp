@@ -1,6 +1,6 @@
 // Motion deskew: undo the smear a spinning lidar bakes into every revolution.
 //
-// The A1 turns at about 5.5 Hz, so one revolution takes 182 ms -- 3.6 control
+// The measured A1 turns at 7.32 Hz, so one revolution takes 137 ms -- 2.7 control
 // periods at 20 Hz. The beams in one "scan" were therefore acquired at three or
 // four different robot poses, and presenting them all at their nominal body
 // bearing is exactly the error the hardware makes. The smear is a function of

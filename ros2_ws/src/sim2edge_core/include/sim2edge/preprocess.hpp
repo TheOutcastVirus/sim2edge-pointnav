@@ -55,6 +55,15 @@ void binLidar(const float * ranges, const float * bearings, std::size_t count,
 /// Same reduction over a PolarSweep, honouring its validity flags.
 void binLidar(const PolarSweep & sweep, std::vector<float> & out);
 
+/// Re-bin a deskewed sweep to a uniform metric LaserScan layout.
+///
+/// LaserScan cannot carry a distinct corrected bearing for each return. This
+/// conservative minimum reduction preserves thin obstacles while allowing the
+/// high-level mapper to consume the navigator's exact deskew result over ROS.
+/// Empty bins remain +infinity. Bin zero begins at -pi in base_link.
+void rasterizeLidar(const PolarSweep & sweep, std::size_t bins,
+                    std::vector<float> & out);
+
 /// Goal offset already in the robot frame -> (distance/kGoalMaxM, sin, cos).
 ///
 /// sin/cos rather than a raw angle: an angle is discontinuous at +/-pi, exactly

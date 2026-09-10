@@ -104,6 +104,8 @@ NavigatorNode::NavigatorNode(const rclcpp::NodeOptions & options)
   status_pub_ = create_publisher<sim2edge_msgs::msg::NavStatus>("nav/status", 10);
   localizer_pub_ = create_publisher<sim2edge_msgs::msg::LocalizerState>(
     "localizer/state", 10);
+  deskewed_scan_pub_ = create_publisher<sensor_msgs::msg::LaserScan>(
+    "nav/deskewed_scan", sensor_qos);
 
   reset_srv_ = create_service<std_srvs::srv::Trigger>(
     "nav/reset",
@@ -440,6 +442,31 @@ void NavigatorNode::onControlTimer()
   state.icp_us = timings.icp_us;
   state.total_us = timings.total_us;
   localizer_pub_->publish(state);
+
+  // Publish the exact deskew result consumed by the actor and localizer. A
+  // LaserScan has one uniform angle increment, so rasterize the corrected
+  // per-return bearings at the raw scan's angular resolution with a minimum
+  // reduction; a thin obstacle must survive if two returns share a bin. Give
+  // it the localizer stamp and publish after the pose so the object mapper can
+  // associate the two without treating an old pose as current geometry.
+  sim2edge::rasterizeLidar(
+    navigator_.sweep(), scan->ranges.size(), deskewed_ranges_);
+  if (!deskewed_ranges_.empty()) {
+    sensor_msgs::msg::LaserScan deskewed;
+    deskewed.header.stamp = state.header.stamp;
+    deskewed.header.frame_id = "base_link";
+    deskewed.angle_min = static_cast<float>(-M_PI);
+    deskewed.angle_increment = static_cast<float>(
+      2.0 * M_PI / static_cast<double>(deskewed_ranges_.size()));
+    deskewed.angle_max = deskewed.angle_min + deskewed.angle_increment *
+      static_cast<float>(deskewed_ranges_.size() - 1);
+    deskewed.time_increment = 0.0f;  // every return refers to header.stamp
+    deskewed.scan_time = static_cast<float>(control_period_);
+    deskewed.range_min = sim2edge::spec::kLidarMinM;
+    deskewed.range_max = sim2edge::spec::kLidarMaxM;
+    deskewed.ranges = deskewed_ranges_;
+    deskewed_scan_pub_->publish(deskewed);
+  }
 
   latency_us_[latency_head_] = result->total_us;
   latency_head_ = (latency_head_ + 1) % kLatencyWindow;

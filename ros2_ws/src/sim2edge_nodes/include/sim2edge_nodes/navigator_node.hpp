@@ -8,7 +8,9 @@
 // while another is waiting. sim2edge::Navigator already owns the tick as one
 // code path -- the same one the parity harness runs -- so this node is a thin
 // adapter around it, and the whole chain stays in one address space with no
-// serialization at all.
+// serialization inside that path. The one deliberate output is the fully
+// deskewed sweep used by the object-level mapper; publishing raw /scan there
+// would make simulation and physical mapping geometrically differ.
 //
 // **What is deliberately a separate node.** The safety layer, which owns
 // /cmd_vel. This node publishes a *proposal*. If it crashes, stalls, or is
@@ -112,6 +114,7 @@ private:
   // ── Scratch, reused so a 20 Hz loop allocates nothing in steady state ─────
   std::vector<float> bearings_;
   std::vector<float> ages_;
+  std::vector<float> deskewed_ranges_;
 
   std::size_t tick_count_{0};
   std::size_t hold_count_{0};
@@ -136,6 +139,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr command_pub_;
   rclcpp::Publisher<sim2edge_msgs::msg::NavStatus>::SharedPtr status_pub_;
   rclcpp::Publisher<sim2edge_msgs::msg::LocalizerState>::SharedPtr localizer_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr deskewed_scan_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace sim2edge
 {
@@ -88,6 +89,30 @@ void binLidar(const PolarSweep & sweep, std::vector<float> & out)
     if (norm < slot) {
       slot = norm;
     }
+  }
+}
+
+void rasterizeLidar(const PolarSweep & sweep, std::size_t bins,
+                    std::vector<float> & out)
+{
+  if (bins == 0) {
+    out.clear();
+    return;
+  }
+  out.assign(bins, std::numeric_limits<float>::infinity());
+  const double width = kTwoPi / static_cast<double>(bins);
+  for (std::size_t i = 0; i < sweep.size(); ++i) {
+    const float range = sweep.ranges[i];
+    if (!sweep.valid[i] || !std::isfinite(range) ||
+        range < spec::kLidarMinM || range > spec::kLidarMaxM)
+    {
+      continue;
+    }
+    const double bearing = wrapAngle(static_cast<double>(sweep.bearings[i]));
+    int index = static_cast<int>(std::floor((bearing + kPi) / width));
+    index = std::clamp(index, 0, static_cast<int>(bins) - 1);
+    float & slot = out[static_cast<std::size_t>(index)];
+    slot = std::min(slot, range);
   }
 }
 
