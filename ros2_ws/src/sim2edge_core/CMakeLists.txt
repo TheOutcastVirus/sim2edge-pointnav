@@ -200,6 +200,7 @@ if(BUILD_TESTING)
       test/test_preprocess.cpp
       test/test_point_grid.cpp
       test/test_deskew.cpp
+      test/test_async_actor.cpp
     )
     if(TARGET test_sim2edge_core)
       target_link_libraries(test_sim2edge_core sim2edge_core)

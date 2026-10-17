@@ -7,6 +7,8 @@
 #include <sim2edge/preprocess.hpp>
 #include <sim2edge/spec_generated.hpp>
 
+#include <rclcpp/executors/multi_threaded_executor.hpp>
+
 namespace sim2edge_nodes
 {
 namespace
@@ -87,15 +89,22 @@ NavigatorNode::NavigatorNode(const rclcpp::NodeOptions & options)
   // Depth 1, best effort on the sensors: a queued scan is a stale scan, and the
   // control loop wants the newest one or none.
   const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(1);
+  sensor_callback_group_ = create_callback_group(
+    rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions sensor_options;
+  sensor_options.callback_group = sensor_callback_group_;
   scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
     "scan", sensor_qos,
-    std::bind(&NavigatorNode::onScan, this, std::placeholders::_1));
+    std::bind(&NavigatorNode::onScan, this, std::placeholders::_1),
+    sensor_options);
   imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
     "imu", sensor_qos,
-    std::bind(&NavigatorNode::onImu, this, std::placeholders::_1));
+    std::bind(&NavigatorNode::onImu, this, std::placeholders::_1),
+    sensor_options);
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     "odom", sensor_qos,
-    std::bind(&NavigatorNode::onOdom, this, std::placeholders::_1));
+    std::bind(&NavigatorNode::onOdom, this, std::placeholders::_1),
+    sensor_options);
   goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
     "goal_pose", 1,
     std::bind(&NavigatorNode::onGoal, this, std::placeholders::_1));
@@ -113,6 +122,7 @@ NavigatorNode::NavigatorNode(const rclcpp::NodeOptions & options)
            std_srvs::srv::Trigger::Response::SharedPtr response) {
       std::lock_guard<std::mutex> lock(mutex_);
       navigator_.reset();
+      if (async_actor_) async_actor_->invalidate();
       have_goal_update_ = false;
       have_previous_odom_ = false;
       have_imu_ = false;
@@ -168,7 +178,10 @@ void NavigatorNode::loadActor()
               path.c_str(), backend.c_str(), loaded->info().load_ms);
   backend_name_ = backend;
   actor_ = std::move(loaded);
-  navigator_.setActor(actor_);
+  const double max_age = declare_parameter("actor_max_age_s", 0.5);
+  if (max_age <= 0.0) throw std::runtime_error("actor_max_age_s must be positive");
+  async_actor_ = std::make_shared<sim2edge::AsyncActor>(actor_, max_age);
+  navigator_.setActor(async_actor_);
 }
 
 void NavigatorNode::onScan(sensor_msgs::msg::LaserScan::ConstSharedPtr msg)
@@ -202,7 +215,14 @@ void NavigatorNode::onImu(sensor_msgs::msg::Imu::ConstSharedPtr msg)
     }
   }
   last_imu_stamp_ = stamp;
-  imu_stamp_ = stamp;
+  // Freshness asks whether the sensor is still delivering, so use receipt
+  // time rather than the DepthAI-converted header clock.  The RGB-D driver
+  // has been measured continuously delivering 100+ Hz while its converted
+  // stamps wander 0.25-0.7 s behind ROS time, which otherwise pins the
+  // navigator on "imu stale" despite a live gyro.  Keep `stamp` above for the
+  // integration interval: capture-time deltas, unlike the absolute epoch,
+  // remain the right clock for deskew.
+  imu_stamp_ = now();
   have_imu_ = true;
 }
 
@@ -251,7 +271,12 @@ void NavigatorNode::onGoal(geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
     sim2edge::toBodyFrame(x - rx, y - ry, ryaw, x, y);
   }
 
-  navigator_.setGoalBody(x, y);
+  if (std::hypot(x, y) < 1e-6) {
+    navigator_.clearGoal();
+    if (async_actor_) async_actor_->invalidate();
+  } else {
+    navigator_.setGoalBody(x, y);
+  }
   have_goal_update_ = true;
   last_goal_update_ = std::chrono::steady_clock::now();
   RCLCPP_DEBUG(get_logger(), "goal set: (%+.2f, %+.2f) m in the body frame, "
@@ -277,6 +302,7 @@ void NavigatorNode::onControlTimer()
   double goal_age = 0.0;
   bool have_goal_update = false;
   std::string hold;
+  std::string goal_hold;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -305,13 +331,15 @@ void NavigatorNode::onControlTimer()
     hold = "imu stale";
   } else if (require_odom_ && (!odom || odom_age > odom_max_age_)) {
     hold = odom ? "odometry stale" : "no odometry yet";
-  } else if (goal_max_age_ > 0.0 && !have_goal_update) {
-    hold = "no goal yet";
+  }
+  if (goal_max_age_ > 0.0 && !have_goal_update) {
+    goal_hold = "no goal yet";
   } else if (goal_max_age_ > 0.0 && goal_age > goal_max_age_) {
-    hold = "goal stale";
+    goal_hold = "goal stale";
   }
 
   if (!hold.empty()) {
+    if (async_actor_) async_actor_->invalidate();
     // Hold means publish zero, every tick, on the same schedule. Publishing
     // nothing would let the safety node's watchdog decide the difference
     // between "stopped on purpose" and "the navigator died", and those want
@@ -337,6 +365,20 @@ void NavigatorNode::onControlTimer()
       "holding: %s (scan %.3f s, imu %.3f s, odom %.3f s)", hold.c_str(),
       scan_age, imu_age, odom_age);
     return;
+  }
+
+  // A missing goal is a command gate, not a sensor-processing gate.  Keep
+  // deskew and localization running while stopped so an object-goal planner
+  // can consume /localizer/state and /nav/deskewed_scan to create its first
+  // body-frame goal.  Returning above for "no goal" creates a bootstrap
+  // deadlock: the planner cannot publish a goal until these streams exist,
+  // while these streams would not exist until the planner published a goal.
+  if (!goal_hold.empty()) {
+    if (async_actor_) async_actor_->invalidate();
+    ++hold_count_;
+    if (goal_hold == "goal stale") {
+      navigator_.clearGoal();
+    }
   }
 
   const double speed = odom ? odom->twist.twist.linear.x : 0.0;
@@ -376,6 +418,7 @@ void NavigatorNode::onControlTimer()
                               speed, control_period_,
                               have_prior ? prior : nullptr);
   } catch (const std::exception & e) {
+    if (async_actor_) async_actor_->invalidate();
     RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
       "tick failed: %s -- commanding zero", e.what());
     geometry_msgs::msg::Twist stop;
@@ -383,6 +426,7 @@ void NavigatorNode::onControlTimer()
     return;
   }
   ++tick_count_;
+  if (result->arrived && async_actor_) async_actor_->invalidate();
 
   geometry_msgs::msg::Twist command;
   command.linear.x = result->command.v;
@@ -410,12 +454,23 @@ void NavigatorNode::onControlTimer()
   status.infer_us = result->infer_us;
   status.total_us = result->total_us;
   status.backend = backend_name_;
-  if (!result->has_goal) {
+  if (!goal_hold.empty()) {
+    status.hold_reason = goal_hold;
+  } else if (!result->has_goal) {
     status.hold_reason = "no goal";
   } else if (result->arrived) {
     status.hold_reason = "arrived";
   } else if (!actor_) {
     status.hold_reason = "no actor loaded";
+  } else if (async_actor_ && !async_actor_->stats().valid) {
+    status.hold_reason = "actor pending or stale";
+  }
+  if (async_actor_) {
+    const auto stats = async_actor_->stats();
+    status.infer_us = stats.latency_ms * 1000.0;
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      "actor worker: updates %lu, latency %.1f ms, input age %.3f s, valid %d",
+      stats.updates, stats.latency_ms, stats.age_s, stats.valid);
   }
   status_pub_->publish(status);
 
@@ -524,7 +579,15 @@ int main(int argc, char ** argv)
   // are reported and exited on rather than allowed to abort: an abort gives a
   // core dump where a message gives the reason.
   try {
-    rclcpp::spin(std::make_shared<sim2edge_nodes::NavigatorNode>());
+    auto node = std::make_shared<sim2edge_nodes::NavigatorNode>();
+    // Keep sensor receipt independent of localization. Accelerator inference
+    // runs in AsyncActor's worker and never owns the Navigator instance.
+    // The default group still serializes goal, reset, and control callbacks
+    // around the Navigator instance.
+    rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions(), 2);
+    executor.add_node(node);
+    executor.spin();
   } catch (const std::exception & e) {
     RCLCPP_FATAL(rclcpp::get_logger("navigator_node"), "%s", e.what());
     rclcpp::shutdown();

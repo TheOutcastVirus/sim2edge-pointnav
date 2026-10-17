@@ -3,14 +3,14 @@
 // **Why one node and not four.** Deskew, binning, localization and inference
 // are separate concerns and it is tempting to give each its own node. Doing so
 // would push a 720-point sweep and a 731-float observation through DDS twice
-// per control tick, and buy nothing: the stages are not independently useful,
-// nothing else subscribes to a half-processed sweep, and no stage can run
-// while another is waiting. sim2edge::Navigator already owns the tick as one
+// per control tick. sim2edge::Navigator already owns the sensor tick as one
 // code path -- the same one the parity harness runs -- so this node is a thin
 // adapter around it, and the whole chain stays in one address space with no
 // serialization inside that path. The one deliberate output is the fully
 // deskewed sweep used by the object-level mapper; publishing raw /scan there
 // would make simulation and physical mapping geometrically differ.
+// Actor execution uses an in-process worker with a replaceable observation
+// and an expiring result, so accelerator contention cannot block that tick.
 //
 // **What is deliberately a separate node.** The safety layer, which owns
 // /cmd_vel. This node publishes a *proposal*. If it crashes, stalls, or is
@@ -41,6 +41,7 @@
 #include <std_srvs/srv/trigger.hpp>
 
 #include <sim2edge/actor.hpp>
+#include <sim2edge/async_actor.hpp>
 #include <sim2edge/navigator.hpp>
 #include <sim2edge_msgs/msg/localizer_state.hpp>
 #include <sim2edge_msgs/msg/nav_status.hpp>
@@ -70,6 +71,7 @@ private:
   // ── The stack ─────────────────────────────────────────────────────────────
   sim2edge::Navigator navigator_;
   std::shared_ptr<sim2edge::Actor> actor_;
+  std::shared_ptr<sim2edge::AsyncActor> async_actor_;
   std::string backend_name_{"none"};
 
   // ── Configuration ─────────────────────────────────────────────────────────
@@ -132,6 +134,7 @@ private:
   std::size_t overrun_count_{0};
 
   // ── ROS interfaces ────────────────────────────────────────────────────────
+  rclcpp::CallbackGroup::SharedPtr sensor_callback_group_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;

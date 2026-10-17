@@ -54,6 +54,7 @@ def generate_launch_description() -> LaunchDescription:
     require_odom = LaunchConfiguration("require_odom")
     goal_max_age_s = LaunchConfiguration("goal_max_age_s")
     nav_cpus = LaunchConfiguration("nav_cpus")
+    command_topic = LaunchConfiguration("command_topic")
 
     navigator_config = PathJoinSubstitution(
         [FindPackageShare("sim2edge_nodes"), "config", "navigator.yaml"])
@@ -63,14 +64,22 @@ def generate_launch_description() -> LaunchDescription:
         [FindPackageShare("oak_imu"), "config", "oak_imu.yaml"])
 
     return LaunchDescription([
+        DeclareLaunchArgument("command_topic", default_value="/cmd_vel",
+            description="Safety output; use /stationary/cmd_vel for a non-driving check"),
         DeclareLaunchArgument("model", default_value="",
             description="actor .pte, lowered for this SoC"),
         DeclareLaunchArgument("backend", default_value="qnn"),
         DeclareLaunchArgument("qnn_lib_dir", default_value="",
             description="must be the aarch64-oe-linux-gcc11.2 QNN libraries; "
                         "the gcc9.4 set ships no V75 stub for this silicon"),
-        DeclareLaunchArgument("serial_port", default_value="/dev/ttyUSB0",
-            description="the RPLIDAR A1's serial device"),
+        DeclareLaunchArgument(
+            "serial_port",
+            default_value=(
+                "/dev/serial/by-id/"
+                "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_"
+                "0001-if00-port0"
+            ),
+            description="the RPLIDAR A1's stable serial device identity"),
         DeclareLaunchArgument("use_lidar", default_value="true"),
         DeclareLaunchArgument("use_imu", default_value="true"),
         DeclareLaunchArgument("imu_topic", default_value="/oak/imu",
@@ -189,6 +198,6 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             emulate_tty=True,
             parameters=[safety_config],
-            remappings=[("cmd_vel", "/cmd_vel")],
+            remappings=[("cmd_vel", command_topic)],
         ),
     ])
